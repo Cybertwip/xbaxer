@@ -1,0 +1,5 @@
+requests 
+opencv-python 
+numpy 
+pygame 
+websocket-client
