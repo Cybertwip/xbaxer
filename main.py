@@ -143,17 +143,18 @@ class IntegratedTerminal:
         self.sock = None
         self.ssh_client = None 
         self.connected = False
+        self.intentional_disconnect = False # Flag to control Auto-Reconnect
         self.lock = threading.Lock()
         
         self.focused = False
         self.scroll_offset = 0
         self.needs_pin_prompt = False
         self.ip = None
+        self.pin = None
 
     def add_line(self, text):
         clean_text = text.replace('\t', '    ')
         clean_text = ANSI_ESCAPE.sub('', clean_text)
-        
         clean_text = clean_text.replace('\r\n', '\n')
 
         with self.lock:
@@ -236,7 +237,7 @@ class IntegratedTerminal:
 
     def upload_file(self, filepath):
         if not self.ssh_client or not self.ssh_client.get_transport().is_active():
-            self.add_line("[-] SSH disconnected. Please reconnect Dev Shell.")
+            self.add_line("[-] SSH disconnected. Please wait for auto-reconnect.")
             return
             
         filename = os.path.basename(filepath)
@@ -255,9 +256,12 @@ class IntegratedTerminal:
         except Exception as e:
             self.add_line(f"[-] Upload failed: {e}")
 
-    def start_telnet(self, ip, ssh_client, port=24):
+    def start_telnet(self, ip, pin, ssh_client, port=24):
         self.ip = ip
+        self.pin = pin
         self.ssh_client = ssh_client 
+        self.intentional_disconnect = False
+        
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -295,15 +299,18 @@ class IntegratedTerminal:
                         if data:
                             self.write(data)
                         else:
-                            self.add_line("[-] Connection closed")
-                            self.connected = False
-                            break
-                    except:
-                        self.add_line("[-] Telnet error / Disconnected")
+                            raise ConnectionError("Empty data received")
+                    except Exception as e:
                         self.connected = False
+                        if not self.intentional_disconnect and self.ip and self.pin:
+                            self.add_line("[-] Connection dropped (Xbox likely killed the process).")
+                            self.add_line("[*] Auto-reconnecting in 3 seconds...")
+                            time.sleep(3)
+                            threading.Thread(target=connect_ssh, args=(self.ip, self.pin, self, False), daemon=True).start()
+                        else:
+                            self.add_line("[-] Telnet disconnected cleanly.")
                         break
 
-            # Active SSH Heartbeat to completely bypass Xbox idle killing
             def ssh_keepalive():
                 while self.connected and self.ssh_client:
                     time.sleep(45)
@@ -320,6 +327,7 @@ class IntegratedTerminal:
             return False
 
     def close(self):
+        self.intentional_disconnect = True
         self.connected = False
         if self.sock:
             try: self.sock.close()
@@ -462,10 +470,8 @@ def connect_ssh(ip, pin, terminal, save_on_success=False):
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
 
-        # Base TCP Keepalive
         ssh.get_transport().set_keepalive(30)
         
-        # Check if the process is already running to avoid saturating sockets
         terminal.add_line("[*] Checking for existing telnetd process...")
         stdin, stdout, stderr = ssh.exec_command('tasklist')
         tasks = stdout.read().decode('utf-8', errors='ignore')
@@ -480,14 +486,14 @@ def connect_ssh(ip, pin, terminal, save_on_success=False):
         if save_on_success:
             save_pin(ip, pin)
 
-        terminal.start_telnet(ip, ssh, 24)
+        terminal.start_telnet(ip, pin, ssh, 24)
     except paramiko.AuthenticationException:
         remove_pin(ip)
         terminal.add_line("[-] Error: Authentication failed. Stored PIN cleared.")
         terminal.needs_pin_prompt = True
     except Exception as e:
         remove_pin(ip)
-        terminal.add_line(f"[-] Error: {e}")
+        terminal.add_line(f"[-] Error: SSH connection failed: {e}")
         terminal.needs_pin_prompt = True
 
 # ================== MENU ==================

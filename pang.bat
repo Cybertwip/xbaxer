@@ -1,7 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
-mode con cols=40 lines=22
-title Batch PONG
+title Turn-Based PONG
 
 :: Initialize variables
 set /a ballX=20, ballY=10
@@ -58,15 +57,15 @@ for /L %%Y in (1,1,18) do (
     echo(!line!
 )
 echo ======================================
-echo Controls: [W] Up  [S] Down  (1 FPS)
+echo Controls: [W]+Enter = Up ^| [S]+Enter = Down ^| [Enter] = Wait
 
-:: Get Input (1 second timeout is the lowest standard batch allows)
-choice /c wsx /n /t 1 /d x >nul
-if errorlevel 3 goto skip_move
-if errorlevel 2 set /a paddle+=2
-if errorlevel 1 set /a paddle-=2
+:: Get Input (Native CMD fallback since 'choice' doesn't exist)
+set "move="
+set /p "move=> "
 
-:skip_move
+if /I "!move!"=="w" set /a paddle-=2
+if /I "!move!"=="s" set /a paddle+=2
+
 :: Keep paddle within screen bounds
 if !paddle! leq 1 set /a paddle=1
 if !paddle! geq 15 set /a paddle=15
@@ -81,5 +80,6 @@ echo              GAME OVER!
 echo            Your Score: !score!
 echo.
 echo ======================================
-pause
+echo Press Enter to exit...
+set /p "dummy="
 exit /b
