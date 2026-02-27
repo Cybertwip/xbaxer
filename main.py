@@ -23,7 +23,7 @@ MENU_SIZE = (1280, 720)
 STREAM_SIZE = (1280, 920)   # tall window for video + terminal
 FPS = 60
 
-# Regex to strip ANSI escape sequences (fixes raw telnet color codes)
+# Regex to strip ANSI escape sequences
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 # ================== KEY & MOUSE CONSTANTS ==================
@@ -108,9 +108,17 @@ class IntegratedTerminal:
         self.lock = threading.Lock()
 
     def add_line(self, text):
-        clean_text = ANSI_ESCAPE.sub('', text)
+        # 1. Convert tabs to spaces so we don't lose formatting
+        clean_text = text.replace('\t', '    ')
+        # 2. Strip ANSI escape codes
+        clean_text = ANSI_ESCAPE.sub('', clean_text)
+        # 3. Nuclear option: Strip ALL non-printable control characters (except newline)
+        # This completely destroys those weird Pygame boxes (NUL bytes, Telnet negotiations, etc.)
+        clean_text = re.sub(r'[^\x20-\x7E\n]', '', clean_text)
+
         with self.lock:
-            for line in clean_text.replace('\r', '').split('\n'):
+            # \r is already stripped by the regex above since it's outside the \x20-\x7E range
+            for line in clean_text.split('\n'): 
                 if line.strip() or not self.lines or self.lines[-1] != "":
                     self.lines.append(line)
             if len(self.lines) > 1200:
@@ -528,7 +536,6 @@ def run_stream(screen, clock, ip):
                 if shell_btn.clicked(pygame.mouse.get_pos()) and not terminal.connected:
                     prompting_pin = True
                     pin_buffer = ""
-                    # FIX: Release all currently held inputs so your character doesn't get stuck walking
                     for k in list(active_keys):
                         input_client.send_key(k, False)
                     active_keys.clear()
@@ -542,8 +549,6 @@ def run_stream(screen, clock, ip):
                     input_client.send_key(event.key, True)
             
             elif event.type == pygame.KEYUP:
-                # FIX: Only send a KEYUP event to the Xbox if we explicitly sent a KEYDOWN for it earlier.
-                # This drops the phantom "Enter key release" that happens right after the popup closes.
                 if event.key in active_keys:
                     active_keys.remove(event.key)
                     input_client.send_key(event.key, False)
