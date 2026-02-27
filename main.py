@@ -20,8 +20,9 @@ import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================== CONFIG ==================
+# These will be dynamically overwritten at launch to fill your screen
 MENU_SIZE = (1280, 720)
-STREAM_SIZE = (1280, 920)   # tall window for video + terminal
+STREAM_SIZE = (1280, 920)   
 FPS = 60
 CONFIG_FILE = "xbox_config.json"
 
@@ -330,12 +331,12 @@ class IntegratedTerminal:
         self.intentional_disconnect = True
         self.connected = False
         
-        # FIX: Cleanly murder the orphaned Telnet daemon on the Xbox before we exit
+        # Cleanly murder the orphaned Telnet daemon on the Xbox before we exit
         if self.ssh_client and self.ssh_client.get_transport() and self.ssh_client.get_transport().is_active():
             try:
                 print("[*] Terminating remote telnetd.exe to free Xbox resources...")
                 self.ssh_client.exec_command("taskkill /F /IM telnetd.exe /T")
-                time.sleep(0.2) # Give the Xbox a split second to process the kill order
+                time.sleep(0.2)
             except: 
                 pass
             try: 
@@ -774,15 +775,30 @@ def run_stream(screen, clock, ip):
 
         clock.tick(FPS if mode == "RTSP" else 30)
 
-    # Automatically kills the daemon on exit
     video.stop()
     terminal.close()
 
 # ================== MAIN ==================
 def main():
+    # Force the window to spawn dead center 
+    os.environ['SDL_VIDEO_CENTERED'] = '1'
     pygame.init()
-    screen = pygame.display.set_mode(MENU_SIZE, pygame.RESIZABLE)
+    
+    # Dynamically grab your monitor's resolution
+    info = pygame.display.Info()
+    
+    # Start maximized (leaving a little margin so it doesn't get hidden behind Mac Dock/Top Menu)
+    start_w = info.current_w - 40
+    start_h = info.current_h - 100
+    
+    screen = pygame.display.set_mode((start_w, start_h), pygame.RESIZABLE)
     pygame.display.set_caption("Xbox Devkit Launcher")
+    
+    # Overwrite the global sizes so all UI math stretches natively
+    global MENU_SIZE, STREAM_SIZE
+    MENU_SIZE = screen.get_size()
+    STREAM_SIZE = screen.get_size()
+    
     clock = pygame.time.Clock()
 
     ip = run_menu(screen, clock)
