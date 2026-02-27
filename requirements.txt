@@ -1,5 +1,6 @@
-requests 
-opencv-python 
-numpy 
 pygame 
-websocket-client
+opencv-python-headless 
+numpy 
+websocket-client 
+requests 
+paramiko

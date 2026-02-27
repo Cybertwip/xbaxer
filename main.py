@@ -12,112 +12,202 @@ import requests
 import socket
 import concurrent.futures
 import urllib3
+import paramiko
 import io
+import re
 
-# Suppress insecure request warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- Configuration & Constants ---
-WIN_SIZE = (1280, 720)
+# ================== CONFIG ==================
+MENU_SIZE = (1280, 720)
+STREAM_SIZE = (1280, 920)   # tall window for video + terminal
 FPS = 60
 
+# Regex to strip ANSI escape sequences (fixes raw telnet color codes)
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+# ================== KEY & MOUSE CONSTANTS ==================
 VK_MAP = {
     pygame.K_BACKSPACE: 0x08, pygame.K_TAB: 0x09, pygame.K_RETURN: 0x0D,
-    pygame.K_ESCAPE: 0x1B, pygame.K_SPACE: 0x20, pygame.K_UP: 0x26,
-    pygame.K_DOWN: 0x28, pygame.K_LEFT: 0x25, pygame.K_RIGHT: 0x27,
-    pygame.K_z: 0xC3, pygame.K_x: 0xC4, # A, B
+    pygame.K_ESCAPE: 0x1B, pygame.K_SPACE: 0x20,
+    pygame.K_UP: 0x26, pygame.K_DOWN: 0x28, pygame.K_LEFT: 0x25, pygame.K_RIGHT: 0x27,
+    pygame.K_z: 0xC3, pygame.K_x: 0xC4,
 }
 
-MOUSE_MOVE = 0x0001; L_DOWN = 0x0002; L_UP = 0x0004; R_DOWN = 0x0008
-R_UP = 0x0010; M_DOWN = 0x0020; M_UP = 0x0040; WHEEL_V = 0x0800
+MOUSE_MOVE = 0x0001
+L_DOWN = 0x0002; L_UP = 0x0004; R_DOWN = 0x0008; R_UP = 0x0010
+M_DOWN = 0x0020; M_UP = 0x0040; WHEEL_V = 0x0800
 
-# --- Network Scanner ---
+# ================== NETWORK SCANNER ==================
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('10.255.255.255', 1))
         ip = s.getsockname()[0]
-    except Exception:
+    except:
         ip = '192.168.0.1'
     finally:
         s.close()
     return ip
 
 def check_xbox(ip):
-    url = f"https://{ip}:11443/ext/screenshot"
     try:
-        res = requests.get(url, params={'download': 'false'}, verify=False, timeout=0.5)
+        res = requests.get(f"https://{ip}:11443/ext/screenshot", 
+                          params={'download': 'false'}, 
+                          verify=False, timeout=0.6)
         if res.status_code == 200:
-            return ip
-    except requests.exceptions.RequestException:
+            try:
+                hostname = socket.gethostbyaddr(ip)[0].split('.')[0]
+            except:
+                hostname = "Xbox Devkit"
+            return (ip, hostname)
+    except:
         pass
     return None
 
 def scan_network_async(result_list, callback):
     local_ip = get_local_ip()
-    base_ip = '.'.join(local_ip.split('.')[:-1])
-    ips_to_check = [f"{base_ip}.{i}" for i in range(1, 255)]
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        results = executor.map(check_xbox, ips_to_check)
-        for res in results:
+    base = '.'.join(local_ip.split('.')[:-1])
+    ips = [f"{base}.{i}" for i in range(1, 255)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as exe:
+        for res in exe.map(check_xbox, ips):
             if res:
                 result_list.append(res)
     callback()
 
-# --- UI Components ---
+# ================== UI ==================
 class Button:
-    def __init__(self, x, y, w, h, text, color, hover_color, text_color=(255, 255, 255)):
+    def __init__(self, x, y, w, h, text, color=(0, 120, 215), hover=(0, 160, 255)):
         self.rect = pygame.Rect(x, y, w, h)
         self.text = text
         self.color = color
-        self.hover_color = hover_color
-        self.text_color = text_color
-        self.font = pygame.font.SysFont(None, 36)
+        self.hover = hover
+        self.font = pygame.font.SysFont("consolas", 24, bold=True)
 
-    def draw(self, surface):
-        mouse_pos = pygame.mouse.get_pos()
-        current_color = self.hover_color if self.rect.collidepoint(mouse_pos) else self.color
-        pygame.draw.rect(surface, current_color, self.rect, border_radius=5)
-        
-        text_surf = self.font.render(self.text, True, self.text_color)
-        text_rect = text_surf.get_rect(center=self.rect.center)
-        surface.blit(text_surf, text_rect)
+    def draw(self, surf):
+        txt = self.font.render(self.text, True, (255, 255, 255))
+        if txt.get_width() > self.rect.w - 20:
+            self.rect.w = txt.get_width() + 20
+            
+        col = self.hover if self.rect.collidepoint(pygame.mouse.get_pos()) else self.color
+        pygame.draw.rect(surf, col, self.rect, border_radius=8)
+        surf.blit(txt, txt.get_rect(center=self.rect.center))
 
-    def is_clicked(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                return True
+    def clicked(self, pos):
+        return self.rect.collidepoint(pos)
+
+class IntegratedTerminal:
+    def __init__(self, x, y, w, h):
+        self.rect = pygame.Rect(x, y, w, h)
+        self.font = pygame.font.SysFont("consolas", 17)
+        self.lines = ["[INFO] Xbox Devkit Terminal ready", "Click 'Connect Dev Shell' to get full SYSTEM cmd.exe"]
+        self.input_buffer = ""
+        self.max_lines = (h - 50) // 19
+        self.sock = None
+        self.connected = False
+        self.lock = threading.Lock()
+
+    def add_line(self, text):
+        clean_text = ANSI_ESCAPE.sub('', text)
+        with self.lock:
+            for line in clean_text.replace('\r', '').split('\n'):
+                if line.strip() or not self.lines or self.lines[-1] != "":
+                    self.lines.append(line)
+            if len(self.lines) > 1200:
+                self.lines = self.lines[-900:]
+
+    def write(self, data):
+        self.add_line(data.decode('utf-8', errors='ignore'))
+
+    def handle_key(self, event):
+        if not self.connected or event.type != pygame.KEYDOWN: return False
+        if event.key == pygame.K_RETURN:
+            cmd = (self.input_buffer + "\r\n").encode('utf-8')
+            try:
+                self.sock.send(cmd)
+                self.add_line(f"> {self.input_buffer}")
+            except:
+                self.add_line("[-] Send failed")
+            self.input_buffer = ""
+            return True
+        elif event.key == pygame.K_BACKSPACE:
+            self.input_buffer = self.input_buffer[:-1]
+            return True
+        elif event.unicode and event.unicode.isprintable():
+            self.input_buffer += event.unicode
+            return True
         return False
 
-# --- Core Streaming Classes (Video & Input) ---
+    def draw(self, screen):
+        pygame.draw.rect(screen, (15, 15, 25), self.rect)
+        pygame.draw.rect(screen, (0, 220, 80), self.rect, 3)
+        y = self.rect.y + 10
+        start = max(0, len(self.lines) - self.max_lines)
+        for line in self.lines[start:]:
+            surf = self.font.render(line, True, (0, 255, 120))
+            screen.blit(surf, (self.rect.x + 12, y))
+            y += 19
+        
+        cursor = "_" if time.time() % 1 > 0.5 else ""
+        prompt = "> " + self.input_buffer + cursor
+        ps = self.font.render(prompt, True, (0, 255, 200))
+        screen.blit(ps, (self.rect.x + 12, self.rect.bottom - 30))
+
+    def start_telnet(self, ip, port=24):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(15)
+            self.sock.connect((ip, port))
+            self.connected = True
+            self.add_line(f"[+] Full SYSTEM shell via raw Telnet ({ip}:{port})")
+            def reader():
+                while self.connected:
+                    try:
+                        data = self.sock.recv(4096)
+                        if data:
+                            self.write(data)
+                        else:
+                            self.add_line("[-] Connection closed")
+                            self.connected = False
+                            break
+                    except:
+                        self.add_line("[-] Telnet error")
+                        self.connected = False
+                        break
+            threading.Thread(target=reader, daemon=True).start()
+            return True
+        except Exception as e:
+            self.add_line(f"[-] Connection failed: {e}")
+            return False
+
+    def close(self):
+        self.connected = False
+        if self.sock:
+            try: self.sock.close()
+            except: pass
+
+# ================== VIDEO & INPUT ==================
 class FastVideoStream:
-    """Handles RTSP H264 Streaming via OpenCV"""
     def __init__(self, ip):
-        rtsp_url = f"rtsp://{ip}:11442/video/live"
+        self.url = f"rtsp://{ip}:11442/video/live"
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-        self.stream = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        self.stream = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
         self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        (self.grabbed, self.frame) = self.stream.read()
+        self.grabbed, self.frame = self.stream.read()
         self.stopped = False
         self.lock = threading.Lock()
-        self.thread = None
 
     def start(self):
-        self.thread = threading.Thread(target=self.update, args=(), daemon=True)
-        self.thread.start()
+        threading.Thread(target=self.update, daemon=True).start()
         return self
 
     def update(self):
         while not self.stopped:
-            if not self.stream.isOpened():
-                time.sleep(0.1)
-                continue
-            grabbed, frame = self.stream.read()
+            g, f = self.stream.read()
             with self.lock:
-                if grabbed:
-                    self.frame = frame
-                    self.grabbed = grabbed
+                if g:
+                    self.frame = f
+                    self.grabbed = g
 
     def read(self):
         with self.lock:
@@ -128,317 +218,375 @@ class FastVideoStream:
         self.stream.release()
 
 class IMGVideoStream:
-    """Handles HTTP Polling fallback in a separate thread to prevent input lag"""
     def __init__(self, ip):
         self.url = f"https://{ip}:11443/ext/screenshot"
         self.session = requests.Session()
         self.stopped = False
-        self.frame_surface = None
+        self.frame_surf = None
         self.lock = threading.Lock()
-        self.grabbed = True
-        self.thread = None
 
     def start(self):
-        self.thread = threading.Thread(target=self.update, daemon=True)
-        self.thread.start()
+        threading.Thread(target=self.update, daemon=True).start()
         return self
 
     def update(self):
         while not self.stopped:
             try:
-                params = {'download': 'false', 'hdr': 'false', '_': int(time.time() * 1000)}
-                res = self.session.get(self.url, params=params, verify=False, timeout=1.0)
-                if res.status_code == 200:
-                    image_bytes = io.BytesIO(res.content)
-                    surf = pygame.image.load(image_bytes)
+                r = self.session.get(self.url, params={'download':'false','hdr':'false','_':int(time.time()*1000)}, 
+                                   verify=False, timeout=1.2)
+                if r.status_code == 200:
+                    surf = pygame.image.load(io.BytesIO(r.content))
                     with self.lock:
-                        self.frame_surface = surf
-            except Exception:
+                        self.frame_surf = surf
+            except:
                 pass
-            time.sleep(0.03) # Cap HTTP requests to ~30 FPS to prevent console overload
+            time.sleep(0.033)
 
     def read(self):
         with self.lock:
-            return self.frame_surface is not None, self.frame_surface
+            return self.frame_surf is not None, self.frame_surf
 
     def stop(self):
         self.stopped = True
-
 
 class XboxInputClient:
     def __init__(self, ip):
         self.url = f"wss://{ip}:11443/ext/remoteinput"
         self.ws = None
         self.connected = False
-        self.input_queue = queue.Queue()
-        self.latest_mouse_pos = None
-        self.last_sent_mouse_pos = None
-        
-        threading.Thread(target=self._run_forever, daemon=True).start()
-        threading.Thread(target=self._process_queue, daemon=True).start()
+        self.queue = queue.Queue()
+        self.mouse_pos = None
+        self.last_mouse = None
+        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._process, daemon=True).start()
 
-    def _run_forever(self):
-        ssl_opt = {"cert_reqs": ssl.CERT_NONE}
+    def _run(self):
         while True:
             try:
-                self.ws = websocket.WebSocketApp(self.url, on_open=self._on_open, on_error=lambda ws, e: None)
-                self.ws.run_forever(sslopt=ssl_opt)
+                self.ws = websocket.WebSocketApp(self.url, on_open=self._open, on_error=lambda w,e: None)
+                self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
             except:
                 time.sleep(2)
 
-    def _on_open(self, ws):
+    def _open(self, ws):
         self.connected = True
 
-    def _process_queue(self):
+    def _process(self):
         while True:
-            while not self.input_queue.empty():
-                payload = self.input_queue.get()
+            while not self.queue.empty():
+                p = self.queue.get()
                 if self.connected and self.ws:
-                    try: self.ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
+                    try: self.ws.send(p, opcode=websocket.ABNF.OPCODE_BINARY)
                     except: pass
-                self.input_queue.task_done()
-            
-            if self.latest_mouse_pos and self.latest_mouse_pos != self.last_sent_mouse_pos:
+                self.queue.task_done()
+
+            if self.mouse_pos and self.mouse_pos != self.last_mouse:
                 if self.connected and self.ws:
-                    x, y = self.latest_mouse_pos
-                    payload = struct.pack('!B H I I', 0x03, MOUSE_MOVE, x, y)
+                    x, y = self.mouse_pos
+                    p = struct.pack('!B H I I', 0x03, MOUSE_MOVE, x, y)
                     try:
-                        self.ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
-                        self.last_sent_mouse_pos = self.latest_mouse_pos
+                        self.ws.send(p, opcode=websocket.ABNF.OPCODE_BINARY)
+                        self.last_mouse = self.mouse_pos
                     except: pass
             time.sleep(0.008)
 
-    def send_key(self, key_code, is_down):
-        vk = VK_MAP.get(key_code)
+    def send_key(self, key, down):
+        vk = VK_MAP.get(key)
         if vk is None:
-            if 97 <= key_code <= 122: vk = key_code - 32
-            elif 48 <= key_code <= 57: vk = key_code
+            if 97 <= key <= 122: vk = key - 32
+            elif 48 <= key <= 57: vk = key
             else: return
-        self.input_queue.put(bytearray([0x01, vk, 0x01 if is_down else 0x00]))
+        self.queue.put(bytearray([0x01, vk, 1 if down else 0]))
 
-    def send_mouse_click(self, action, x, y, wheel_delta=0):
-        payload = struct.pack('!B H I I', 0x03, action, x, y)
+    def send_mouse(self, action, x, y, wheel=0):
+        p = struct.pack('!B H I I', 0x03, action, x, y)
         if action == WHEEL_V:
-            payload += struct.pack('!I', wheel_delta & 0xFFFFFFFF)
-        self.input_queue.put(payload)
+            p += struct.pack('!I', wheel & 0xFFFFFFFF)
+        self.queue.put(p)
 
-    def update_mouse_pos(self, x, y):
-        self.latest_mouse_pos = (x, y)
+    def update_mouse(self, x, y):
+        self.mouse_pos = (x, y)
 
-def get_xbox_mouse_coords(mx, my, vid_rect):
-    vx, vy, vw, vh = vid_rect
+def get_xbox_coords(mx, my, active_rect):
+    vx, vy, vw, vh = active_rect
     if vw == 0 or vh == 0: return 0, 0
-    rel_x = max(0, min(mx - vx, vw))
-    rel_y = max(0, min(my - vy, vh))
-    return int((rel_x / vw) * 65535), int((rel_y / vh) * 65535)
+    rx = max(0, min(mx - vx, vw))
+    ry = max(0, min(my - vy, vh))
+    return int((rx / vw) * 65535), int((ry / vh) * 65535)
 
-# --- Application States ---
+def connect_ssh(ip, pin, terminal):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
 
+        terminal.add_line("[+] SSH OK. Launching telnetd...")
+        ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
+        time.sleep(2.8)
+        ssh.close()
+
+        terminal.start_telnet(ip, 24)
+    except paramiko.AuthenticationException:
+        terminal.add_line("[-] Error: Authentication failed. Double check your PIN.")
+    except Exception as e:
+        terminal.add_line(f"[-] Error: {e}")
+
+# ================== MENU ==================
 def run_menu(screen, clock):
-    font_large = pygame.font.SysFont(None, 64)
+    font_big = pygame.font.SysFont(None, 64)
     font_small = pygame.font.SysFont(None, 24)
-    
-    found_consoles = []
-    is_scanning = True
-    
-    def on_scan_complete():
-        nonlocal is_scanning
-        is_scanning = False
-        
-    threading.Thread(target=scan_network_async, args=(found_consoles, on_scan_complete), daemon=True).start()
-    refresh_btn = Button(WIN_SIZE[0]//2 - 150, WIN_SIZE[1] - 100, 300, 50, "Refresh Network", (0, 120, 200), (0, 150, 255))
-    console_buttons = []
+    consoles = []
+    scanning = True
+
+    def done():
+        nonlocal scanning
+        scanning = False
+
+    threading.Thread(target=scan_network_async, args=(consoles, done), daemon=True).start()
+
+    refresh_btn = Button(MENU_SIZE[0]//2 - 150, MENU_SIZE[1] - 110, 300, 55, "Refresh Network")
 
     running = True
     while running:
-        screen.fill((30, 30, 30))
-        
-        title = font_large.render("Xbox Dev Portal Launcher", True, (255, 255, 255))
-        screen.blit(title, (WIN_SIZE[0]//2 - title.get_width()//2, 50))
+        screen.fill((28, 28, 35))
+        title = font_big.render("Xbox Devkit Launcher", True, (255, 255, 255))
+        screen.blit(title, (MENU_SIZE[0]//2 - title.get_width()//2, 60))
 
-        if is_scanning:
-            status = font_small.render("Scanning local network for Dev Portals...", True, (200, 200, 0))
-            screen.blit(status, (WIN_SIZE[0]//2 - status.get_width()//2, 120))
-            console_buttons.clear()
+        if scanning:
+            txt = font_small.render("Scanning network for Dev Mode consoles...", True, (255, 220, 60))
+            screen.blit(txt, (MENU_SIZE[0]//2 - txt.get_width()//2, 180))
         else:
-            if not found_consoles:
-                status = font_small.render("No consoles found. Ensure Dev Mode is running.", True, (255, 100, 100))
-                screen.blit(status, (WIN_SIZE[0]//2 - status.get_width()//2, 120))
+            if not consoles:
+                txt = font_small.render("No consoles found. Make sure Dev Mode is enabled.", True, (255, 80, 80))
+                screen.blit(txt, (MENU_SIZE[0]//2 - txt.get_width()//2, 180))
             else:
-                status = font_small.render("Select a console to connect:", True, (100, 255, 100))
-                screen.blit(status, (WIN_SIZE[0]//2 - status.get_width()//2, 120))
-                
-                console_buttons.clear()
-                start_y = 180
-                for i, ip in enumerate(found_consoles):
-                    btn = Button(WIN_SIZE[0]//2 - 150, start_y + (i * 60), 300, 50, ip, (40, 160, 60), (60, 200, 80))
-                    console_buttons.append((ip, btn))
+                txt = font_small.render("Select your Xbox:", True, (100, 255, 100))
+                screen.blit(txt, (MENU_SIZE[0]//2 - txt.get_width()//2, 160))
 
-        if not is_scanning:
-            refresh_btn.draw(screen)
-            for _, btn in console_buttons:
-                btn.draw(screen)
+                for i, (ip, name) in enumerate(consoles):
+                    btn = Button(MENU_SIZE[0]//2 - 220, 220 + i*65, 440, 58, 
+                                 f"{name}   ({ip})", (40, 160, 70), (70, 210, 100))
+                    btn.draw(screen)
+
+        refresh_btn.draw(screen)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return None
-            if not is_scanning:
-                if refresh_btn.is_clicked(event):
-                    is_scanning = True
-                    found_consoles.clear()
-                    threading.Thread(target=scan_network_async, args=(found_consoles, on_scan_complete), daemon=True).start()
-                for ip, btn in console_buttons:
-                    if btn.is_clicked(event):
-                        return ip
+
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if not scanning:
+                    if refresh_btn.clicked(pygame.mouse.get_pos()):
+                        scanning = True
+                        consoles.clear()
+                        threading.Thread(target=scan_network_async, args=(consoles, done), daemon=True).start()
+                    else:
+                        for i, (ip, name) in enumerate(consoles):
+                            btn = Button(MENU_SIZE[0]//2 - 220, 220 + i*65, 440, 58, 
+                                         f"{name}   ({ip})", (40, 160, 70), (70, 210, 100))
+                            if btn.clicked(pygame.mouse.get_pos()):
+                                return ip
 
         pygame.display.flip()
         clock.tick(30)
+    return None
 
-
+# ================== STREAM + TERMINAL ==================
 def run_stream(screen, clock, ip):
+    global STREAM_SIZE
+    pygame.display.set_mode(STREAM_SIZE, pygame.RESIZABLE)
+    pygame.display.set_caption(f"Xbox Devkit • {ip} • Live + Full Shell")
+
     input_client = XboxInputClient(ip)
-    
-    # 1. Fallback Logic: Try RTSP first
-    print("Attempting RTSP Connection...")
-    video_stream = FastVideoStream(ip)
-    
-    if video_stream.grabbed:
-        current_mode = "RTSP"
-        video_stream.start()
+
+    video = FastVideoStream(ip)
+    if video.grabbed:
+        mode = "RTSP"
+        video.start()
     else:
-        print("RTSP Failed. Falling back to IMG polling.")
-        video_stream.stop()
-        current_mode = "IMG"
-        video_stream = IMGVideoStream(ip).start()
+        video.stop()
+        mode = "IMG"
+        video = IMGVideoStream(ip).start()
 
-    def update_caption():
-        pygame.display.set_caption(f"Xbox Stream: {ip} | Mode: {current_mode} | Press [F8] to toggle mode")
-    
-    update_caption()
+    shell_btn = Button(STREAM_SIZE[0] - 260, 18, 240, 52, "Connect Dev Shell", (0, 120, 215), (0, 160, 255))
+    terminal = IntegratedTerminal(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
 
+    vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
+    target_size = (vid_rect[2], vid_rect[3])
+    active_vid_rect = vid_rect 
     active_keys = set()
     running = True
-    force_recalc = True
-    last_screen_size = screen.get_size()
-    vid_rect = (0, 0, WIN_SIZE[0], WIN_SIZE[1])
-    target_size = WIN_SIZE
+    force_resize = True
+    
+    prompting_pin = False
+    pin_buffer = ""
+
+    print(f"[*] Connected to {ip} | Press F8 to toggle RTSP <-> Screenshot mode")
 
     while running:
-        current_screen_size = screen.get_size()
-        if current_screen_size != last_screen_size or force_recalc:
-            last_screen_size = current_screen_size
-            screen.fill((0,0,0)) 
-            pygame.display.flip()
+        cur_size = screen.get_size()
+        if cur_size != STREAM_SIZE or force_resize:
+            STREAM_SIZE = cur_size
+            vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
+            target_size = (vid_rect[2], vid_rect[3])
+            terminal.rect = pygame.Rect(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
+            shell_btn.rect.x = STREAM_SIZE[0] - shell_btn.rect.w - 20 
+            force_resize = False
+            screen.fill((0,0,0))
 
-        frame_surface = None
-
-        # --- GET & RENDER FRAME ---
-        ret, frame_data = video_stream.read()
-        if ret and frame_data is not None:
-            if current_mode == "RTSP":
-                img_h, img_w = frame_data.shape[:2]
-                if force_recalc:
-                    scale = min(current_screen_size[0] / img_w, current_screen_size[1] / img_h)
-                    new_w, new_h = int(img_w * scale), int(img_h * scale)
-                    vid_rect = ((current_screen_size[0] - new_w) // 2, (current_screen_size[1] - new_h) // 2, new_w, new_h)
-                    target_size = (new_w, new_h)
-                    force_recalc = False
-
-                # Hardware OpenCV resize
-                frame = cv2.resize(frame_data, target_size, interpolation=cv2.INTER_LINEAR)
+        ret, data = video.read()
+        frame_surf = None
+        if ret and data is not None:
+            if mode == "RTSP":
+                h, w = data.shape[:2]
+                scale = min(target_size[0] / w, target_size[1] / h)
+                nw, nh = int(w * scale), int(h * scale)
+                frame = cv2.resize(data, (nw, nh), interpolation=cv2.INTER_LINEAR)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame = np.transpose(frame, (1, 0, 2))
-                frame_surface = pygame.surfarray.make_surface(frame)
+                frame_surf = pygame.surfarray.make_surface(frame)
+            else:
+                w, h = data.get_width(), data.get_height()
+                scale = min(target_size[0] / w, target_size[1] / h)
+                nw, nh = int(w * scale), int(h * scale)
+                frame_surf = pygame.transform.scale(data, (nw, nh))
 
-            elif current_mode == "IMG":
-                img_w, img_h = frame_data.get_size()
-                if force_recalc:
-                    scale = min(current_screen_size[0] / img_w, current_screen_size[1] / img_h)
-                    new_w, new_h = int(img_w * scale), int(img_h * scale)
-                    vid_rect = ((current_screen_size[0] - new_w) // 2, (current_screen_size[1] - new_h) // 2, new_w, new_h)
-                    target_size = (new_w, new_h)
-                    force_recalc = False
+            if frame_surf:
+                ox = vid_rect[0] + (target_size[0] - nw) // 2
+                oy = vid_rect[1] + (target_size[1] - nh) // 2
+                active_vid_rect = (ox, oy, nw, nh)
                 
-                # Pygame resize
-                frame_surface = pygame.transform.scale(frame_data, target_size)
+                pygame.draw.rect(screen, (0, 0, 0), vid_rect)
+                screen.blit(frame_surf, (ox, oy))
 
-        if frame_surface:
-            screen.blit(frame_surface, (vid_rect[0], vid_rect[1]))
-            pygame.display.update(vid_rect)
+        pygame.draw.rect(screen, (28, 28, 35), (0, 0, STREAM_SIZE[0], 80))
+        header = pygame.font.SysFont("consolas", 26, bold=True).render(f"Xbox Devkit • {ip} • {mode} mode", True, (0, 200, 255))
+        screen.blit(header, (20, 20))
 
-        # --- EVENT HANDLING ---
+        shell_btn.draw(screen)
+        terminal.draw(screen)
+
+        if prompting_pin:
+            overlay_w, overlay_h = 400, 150
+            overlay_x, overlay_y = (STREAM_SIZE[0] - overlay_w) // 2, (STREAM_SIZE[1] - overlay_h) // 2
+            pygame.draw.rect(screen, (40, 40, 50), (overlay_x, overlay_y, overlay_w, overlay_h), border_radius=10)
+            pygame.draw.rect(screen, (0, 120, 215), (overlay_x, overlay_y, overlay_w, overlay_h), 3, border_radius=10)
+            
+            p_font = pygame.font.SysFont("consolas", 20)
+            txt1 = p_font.render("Enter Visual Studio PIN:", True, (255, 255, 255))
+            
+            cursor = "_" if time.time() % 1 > 0.5 else ""
+            txt2 = p_font.render(">" + pin_buffer + cursor, True, (0, 255, 120))
+            
+            screen.blit(txt1, (overlay_x + 20, overlay_y + 30))
+            screen.blit(txt2, (overlay_x + 20, overlay_y + 80))
+
+        pygame.display.flip()
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            
+
             elif event.type == pygame.VIDEORESIZE:
                 screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
-                force_recalc = True
-            
-            # Key Events
-            elif event.type == pygame.KEYDOWN:
-                # Dynamic Switching Hotkey (F8)
-                if event.key == pygame.K_F8:
-                    video_stream.stop()
-                    force_recalc = True
-                    screen.fill((0,0,0))
-                    
-                    if current_mode == "RTSP":
-                        current_mode = "IMG"
-                        video_stream = IMGVideoStream(ip).start()
+                force_resize = True
+                
+            if prompting_pin:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        prompting_pin = False
+                        terminal.add_line("[-] PIN entry cancelled.")
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        clean_pin = pin_buffer.strip()
+                        if clean_pin:
+                            prompting_pin = False
+                            terminal.add_line("[*] Connecting via SSH...")
+                            threading.Thread(target=connect_ssh, args=(ip, clean_pin, terminal), daemon=True).start()
+                            pin_buffer = ""
+                        else:
+                            terminal.add_line("[-] PIN required.")
+                            prompting_pin = False
+                    elif event.key == pygame.K_BACKSPACE:
+                        pin_buffer = pin_buffer[:-1]
                     else:
-                        current_mode = "RTSP"
-                        video_stream = FastVideoStream(ip).start()
-                    
-                    update_caption()
-                    continue # Skip sending F8 to the Xbox
+                        if event.unicode.isalnum() and len(pin_buffer) < 12:
+                            pin_buffer += event.unicode
+                continue 
 
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_F8:
+                video.stop()
+                force_resize = True
+                if mode == "RTSP":
+                    mode = "IMG"
+                    video = IMGVideoStream(ip).start()
+                else:
+                    mode = "RTSP"
+                    video = FastVideoStream(ip).start()
+                pygame.display.set_caption(f"Xbox Devkit • {ip} • {mode} mode")
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if shell_btn.clicked(pygame.mouse.get_pos()) and not terminal.connected:
+                    prompting_pin = True
+                    pin_buffer = ""
+                    # FIX: Release all currently held inputs so your character doesn't get stuck walking
+                    for k in list(active_keys):
+                        input_client.send_key(k, False)
+                    active_keys.clear()
+
+            if terminal.connected and terminal.handle_key(event):
+                continue
+
+            elif event.type == pygame.KEYDOWN:
                 if event.key not in active_keys:
                     active_keys.add(event.key)
                     input_client.send_key(event.key, True)
-
+            
             elif event.type == pygame.KEYUP:
-                if event.key == pygame.K_F8: continue
+                # FIX: Only send a KEYUP event to the Xbox if we explicitly sent a KEYDOWN for it earlier.
+                # This drops the phantom "Enter key release" that happens right after the popup closes.
                 if event.key in active_keys:
                     active_keys.remove(event.key)
-                input_client.send_key(event.key, False)
-                
-            # Mouse Events
-            elif event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL):
+                    input_client.send_key(event.key, False)
+
+            elif event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                mx, my = pygame.mouse.get_pos() 
+                if active_vid_rect[1] <= my <= active_vid_rect[1] + active_vid_rect[3]:
+                    xbox_x, xbox_y = get_xbox_coords(mx, my, active_vid_rect)
+                    if event.type == pygame.MOUSEMOTION:
+                        input_client.update_mouse(xbox_x, xbox_y)
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1: input_client.send_mouse(L_DOWN, xbox_x, xbox_y)
+                        elif event.button == 2: input_client.send_mouse(M_DOWN, xbox_x, xbox_y)
+                        elif event.button == 3: input_client.send_mouse(R_DOWN, xbox_x, xbox_y)
+                    elif event.type == pygame.MOUSEBUTTONUP:
+                        if event.button == 1: input_client.send_mouse(L_UP, xbox_x, xbox_y)
+                        elif event.button == 2: input_client.send_mouse(M_UP, xbox_x, xbox_y)
+                        elif event.button == 3: input_client.send_mouse(R_UP, xbox_x, xbox_y)
+
+            elif event.type == pygame.MOUSEWHEEL:
                 mx, my = pygame.mouse.get_pos()
-                xbox_x, xbox_y = get_xbox_mouse_coords(mx, my, vid_rect)
+                if active_vid_rect[1] <= my <= active_vid_rect[1] + active_vid_rect[3]:
+                    xbox_x, xbox_y = get_xbox_coords(mx, my, active_vid_rect)
+                    input_client.send_mouse(WHEEL_V, xbox_x, xbox_y, event.y * 120)
 
-                if event.type == pygame.MOUSEMOTION:
-                    input_client.update_mouse_pos(xbox_x, xbox_y)
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1: input_client.send_mouse_click(L_DOWN, xbox_x, xbox_y)
-                    elif event.button == 2: input_client.send_mouse_click(M_DOWN, xbox_x, xbox_y)
-                    elif event.button == 3: input_client.send_mouse_click(R_DOWN, xbox_x, xbox_y)
-                elif event.type == pygame.MOUSEBUTTONUP:
-                    if event.button == 1: input_client.send_mouse_click(L_UP, xbox_x, xbox_y)
-                    elif event.button == 2: input_client.send_mouse_click(M_UP, xbox_x, xbox_y)
-                    elif event.button == 3: input_client.send_mouse_click(R_UP, xbox_x, xbox_y)
-                elif event.type == pygame.MOUSEWHEEL:
-                    input_client.send_mouse_click(WHEEL_V, xbox_x, xbox_y, wheel_delta=(event.y * 120))
+        clock.tick(FPS if mode == "RTSP" else 30)
 
-        clock.tick(FPS if current_mode == "RTSP" else 30)
+    video.stop()
+    terminal.close()
 
-    if video_stream:
-        video_stream.stop()
-
-# --- Main Execution ---
+# ================== MAIN ==================
 def main():
     pygame.init()
-    screen = pygame.display.set_mode(WIN_SIZE, pygame.RESIZABLE)
-    pygame.display.set_caption("Xbox Dev Launcher")
+    screen = pygame.display.set_mode(MENU_SIZE, pygame.RESIZABLE)
+    pygame.display.set_caption("Xbox Devkit Launcher")
     clock = pygame.time.Clock()
 
-    target_ip = run_menu(screen, clock)
-    
-    if target_ip:
-        run_stream(screen, clock, target_ip)
+    ip = run_menu(screen, clock)
+    if ip:
+        run_stream(screen, clock, ip)
 
     pygame.quit()
 
 if __name__ == "__main__":
+    print("[INFO] Required: pip install pygame opencv-python numpy websocket-client requests paramiko")
     main()
