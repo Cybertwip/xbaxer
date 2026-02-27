@@ -20,7 +20,6 @@ import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================== CONFIG ==================
-# These will be dynamically overwritten at launch to fill your screen
 MENU_SIZE = (1280, 720)
 STREAM_SIZE = (1280, 920)   
 FPS = 60
@@ -112,35 +111,44 @@ def scan_network_async(result_list, callback):
 # ================== UI ==================
 class Button:
     def __init__(self, x, y, w, h, text, color=(0, 120, 215), hover=(0, 160, 255)):
-        self.rect = pygame.Rect(x, y, w, h)
+        self.font = pygame.font.SysFont("consolas", 20, bold=True)
         self.text = text
+        
+        # Pre-measure text to prevent overflow & overlapping
+        txt_width = self.font.render(text, True, (255, 255, 255)).get_width()
+        actual_w = max(w, txt_width + 40) 
+        
+        self.rect = pygame.Rect(x, y, actual_w, h)
         self.color = color
         self.hover = hover
-        self.font = pygame.font.SysFont("consolas", 24, bold=True)
 
     def draw(self, surf):
-        txt = self.font.render(self.text, True, (255, 255, 255))
-        if txt.get_width() > self.rect.w - 20:
-            self.rect.w = txt.get_width() + 20
-            
         col = self.hover if self.rect.collidepoint(pygame.mouse.get_pos()) else self.color
         pygame.draw.rect(surf, col, self.rect, border_radius=8)
+        txt = self.font.render(self.text, True, (255, 255, 255))
         surf.blit(txt, txt.get_rect(center=self.rect.center))
 
     def clicked(self, pos):
         return self.rect.collidepoint(pos)
 
+# ================== TRUE VT100 TERMINAL EMULATOR ==================
 class IntegratedTerminal:
     def __init__(self, x, y, w, h):
         self.rect = pygame.Rect(x, y, w, h)
         self.font = pygame.font.SysFont("consolas", 17)
-        self.lines = [
-            "[INFO] Xbox Devkit Terminal ready", 
-            "Click 'Connect Dev Shell' to get full SYSTEM cmd.exe",
+        
+        self.cols = 140
+        self.rows = 40
+        self.grid = [[' ' for _ in range(self.cols)] for _ in range(self.rows)]
+        self.history = [
+            "[INFO] Xbox Devkit VT100 Terminal Emulation Active",
             "[INFO] Drag and drop any file onto this window to upload to Sandbox."
         ]
+        
+        self.cx = 0
+        self.cy = 0
+        
         self.input_buffer = ""
-        self.max_lines = (h - 50) // 19
         self.sock = None
         self.ssh_client = None 
         self.connected = False
@@ -148,10 +156,48 @@ class IntegratedTerminal:
         self.lock = threading.Lock()
         
         self.focused = False
+        self.fullscreen_mode = False
+        self.raw_input_mode = False 
         self.scroll_offset = 0
         self.needs_pin_prompt = False
+        self.needs_reboot_prompt = False  # <-- NEW: triggers reboot popup
+        
+        self.retry_count = 0 
         self.ip = None
         self.pin = None
+
+    def resize_grid(self, new_rows):
+        if new_rows <= 0 or new_rows == self.rows: return
+        with self.lock:
+            new_grid = [[' ' for _ in range(self.cols)] for _ in range(new_rows)]
+            min_r = min(self.rows, new_rows)
+            for i in range(min_r):
+                new_grid[new_rows - 1 - i] = self.grid[self.rows - 1 - i]
+            self.grid = new_grid
+            self.cy = min(self.cy, new_rows - 1)
+            self.rows = new_rows
+            
+            if self.connected and self.sock:
+                try:
+                    naws = b'\xff\xfb\x1f\xff\xfa\x1f' + struct.pack('!HH', self.cols, self.rows) + b'\xff\xf0'
+                    self.sock.send(naws)
+                except: pass
+
+    def scroll_up(self):
+        top_line = ''.join(self.grid[0]).rstrip()
+        if top_line: 
+            self.history.append(top_line)
+        if len(self.history) > 2000:
+            self.history = self.history[-1500:]
+            
+        self.grid.pop(0)
+        self.grid.append([' ' for _ in range(self.cols)])
+        self.cy = max(0, self.cy - 1)
+
+    def clear_screen(self):
+        self.grid = [[' ' for _ in range(self.cols)] for _ in range(self.rows)]
+        self.cx = 0
+        self.cy = 0
 
     def add_line(self, text):
         clean_text = text.replace('\t', '    ')
@@ -173,39 +219,170 @@ class IntegratedTerminal:
                 line = line.rstrip()
 
                 if line or not self.lines or self.lines[-1] != "":
-                    self.lines.append(line)
+                    if not self.connected:
+                        self.history.append(line)
+                    else:
+                        self.write(line.encode('utf-8'))
                     
-            if len(self.lines) > 2000: 
-                self.lines = self.lines[-1500:]
+            if len(self.history) > 2000: 
+                self.history = self.history[-1500:]
 
     def write(self, data):
-        text = data.decode('utf-8', errors='ignore')
+        text = data.decode('utf-8', errors='replace')
         
-        if '\x1b[2J' in text or '\x0c' in text:
-            with self.lock:
-                self.lines.clear()
-            text = re.split(r'\x1b\[2J|\x0c', text)[-1]
-            
-        self.add_line(text)
+        text = re.sub(r'\xff[\xfb-\xfe].', '', text)
+        text = re.sub(r'\xff[\xf0-\xfa]', '', text)
+        
+        tokens = re.split(r'(\x1b\[[0-9;?]*[A-Za-z])', text)
+        
+        with self.lock:
+            for token in tokens:
+                if not token: continue
+                
+                if token.startswith('\x1b['):
+                    code = token[-1]
+                    args_str = token[2:-1].replace('?', '')
+                    args = args_str.split(';') if args_str else []
+                    
+                    if code == 'J': 
+                        arg = args[0] if args else '0'
+                        if arg == '2':
+                            self.clear_screen()
+                        elif arg == '0':
+                            for c in range(self.cx, self.cols): self.grid[self.cy][c] = ' '
+                            for r in range(self.cy + 1, self.rows): self.grid[r] = [' '] * self.cols
+                    elif code == 'K': 
+                        arg = args[0] if args else '0'
+                        if arg == '0':
+                            for c in range(self.cx, self.cols): self.grid[self.cy][c] = ' '
+                        elif arg == '2':
+                            self.grid[self.cy] = [' '] * self.cols
+                    elif code in ('H', 'f'): 
+                        r = int(args[0])-1 if len(args)>0 and args[0] else 0
+                        c = int(args[1])-1 if len(args)>1 and args[1] else 0
+                        self.cy = max(0, min(self.rows-1, r))
+                        self.cx = max(0, min(self.cols-1, c))
+                    elif code == 'A': self.cy = max(0, self.cy - (int(args[0]) if args and args[0] else 1))
+                    elif code == 'B': self.cy = min(self.rows-1, self.cy + (int(args[0]) if args and args[0] else 1))
+                    elif code == 'C': self.cx = min(self.cols-1, self.cx + (int(args[0]) if args and args[0] else 1))
+                    elif code == 'D': self.cx = max(0, self.cx - (int(args[0]) if args and args[0] else 1))
+                
+                else:
+                    for char in token:
+                        if char == '\n':
+                            self.cy += 1
+                            self.cx = 0 
+                            if self.cy >= self.rows:
+                                self.scroll_up()
+                                self.cy = self.rows - 1
+                        elif char == '\r':
+                            self.cx = 0
+                        elif char == '\x08' or char == '\b':
+                            self.cx = max(0, self.cx - 1)
+                        elif char == '\t':
+                            self.cx = min(self.cols - 1, (self.cx + 4) // 4 * 4)
+                        elif char == '\x0c': 
+                            self.clear_screen()
+                        elif ord(char) >= 32:
+                            if self.cx >= self.cols:
+                                self.cx = 0
+                                self.cy += 1
+                                if self.cy >= self.rows:
+                                    self.scroll_up()
+                                    self.cy = self.rows - 1
+                            self.grid[self.cy][self.cx] = char
+                            self.cx += 1
         
     def scroll(self, amount):
-        max_scroll = max(0, len(self.lines) - self.max_lines)
+        max_scroll = max(0, len(self.history))
         self.scroll_offset += amount
         if self.scroll_offset < 0: self.scroll_offset = 0
         if self.scroll_offset > max_scroll: self.scroll_offset = max_scroll
 
     def handle_key(self, event):
-        if not self.connected or event.type != pygame.KEYDOWN: return False
-        
+        if event.type != pygame.KEYDOWN: return False
         self.scroll_offset = 0 
         
+        # Offline Terminal Logic (Remote Reboot)
+        if not self.connected:
+            if event.key == pygame.K_RETURN:
+                if self.input_buffer.strip() == "REBOOT" and self.ip:
+                    try:
+                        self.add_line("[*] Sending remote reboot command...")
+                        requests.post(f"https://{self.ip}:11443/ext/power?action=reboot", verify=False, timeout=3)
+                        self.add_line("[+] Reboot command sent! Wait a few minutes for the console to restart.")
+                        self.retry_count = 0
+                    except Exception as e:
+                        self.add_line(f"[-] Reboot failed: {e}")
+                self.input_buffer = ""
+                return True
+            elif event.key == pygame.K_BACKSPACE:
+                self.input_buffer = self.input_buffer[:-1]
+                return True
+            elif event.unicode and event.unicode.isprintable():
+                self.input_buffer += event.unicode
+                return True
+            return False
+
+        # Toggle Raw Mode via TAB
+        if event.key == pygame.K_TAB:
+            self.raw_input_mode = not self.raw_input_mode
+            return True
+
+        # Process Control Keys (Ctrl+C, Ctrl+D, Ctrl+Z, ESC)
+        mods = pygame.key.get_mods()
+        ctrl_held = (mods & pygame.KMOD_CTRL) or (mods & pygame.KMOD_META)
+        
+        if ctrl_held:
+            try:
+                if event.key == pygame.K_c: self.sock.send(b"\x03")
+                elif event.key == pygame.K_d: self.sock.send(b"\x04")
+                elif event.key == pygame.K_z: self.sock.send(b"\x1a")
+                elif event.key == pygame.K_l: self.sock.send(b"\x0c") # Form feed/clear
+            except: pass
+            return True
+
+        if event.key == pygame.K_ESCAPE:
+            try: self.sock.send(b"\x1b")
+            except: pass
+            return True
+            
+        # ANSI Navigation Keys
+        if event.key == pygame.K_UP:
+            try: self.sock.send(b"\x1b[A")
+            except: pass
+            return True
+        elif event.key == pygame.K_DOWN:
+            try: self.sock.send(b"\x1b[B")
+            except: pass
+            return True
+        elif event.key == pygame.K_RIGHT:
+            try: self.sock.send(b"\x1b[C")
+            except: pass
+            return True
+        elif event.key == pygame.K_LEFT:
+            try: self.sock.send(b"\x1b[D")
+            except: pass
+            return True
+
+        # Raw Keystroke Transmission
+        if self.raw_input_mode:
+            try:
+                if event.key == pygame.K_RETURN:
+                    self.sock.send(b"\r\n")
+                elif event.key == pygame.K_BACKSPACE:
+                    self.sock.send(b"\x08")
+                elif event.unicode:
+                    self.sock.send(event.unicode.encode('utf-8'))
+            except: pass
+            return True
+            
+        # Buffered Keystroke Transmission (Wait for Enter)
         if event.key == pygame.K_RETURN:
             cmd = (self.input_buffer + "\r\n").encode('utf-8')
             try:
                 self.sock.send(cmd)
-                self.add_line(f"> {self.input_buffer}")
-            except:
-                self.add_line("[-] Send failed")
+            except: pass
             self.input_buffer = ""
             return True
         elif event.key == pygame.K_BACKSPACE:
@@ -217,24 +394,47 @@ class IntegratedTerminal:
         return False
 
     def draw(self, screen):
+        visible_rows = (self.rect.height - 50) // 19
+        if visible_rows != self.rows and visible_rows > 0:
+            self.resize_grid(visible_rows)
+            
         pygame.draw.rect(screen, (15, 15, 25), self.rect)
-        
         outline_color = (0, 255, 120) if self.focused else (50, 70, 80)
         pygame.draw.rect(screen, outline_color, self.rect, 3)
         
-        y = self.rect.y + 10
-        end_idx = len(self.lines) - self.scroll_offset
-        start_idx = max(0, end_idx - self.max_lines)
+        with self.lock:
+            active_lines = [''.join(r).rstrip() for r in self.grid]
+            all_lines = self.history + active_lines
+            
+        start_idx = max(0, len(all_lines) - self.rows - self.scroll_offset)
+        end_idx = start_idx + self.rows
+        visible_lines = all_lines[start_idx:end_idx]
         
-        for line in self.lines[start_idx:end_idx]:
-            surf = self.font.render(line, True, (0, 255, 120))
-            screen.blit(surf, (self.rect.x + 12, y))
+        y = self.rect.y + 10
+        for line in visible_lines:
+            if line:
+                surf = self.font.render(line, True, (0, 255, 120))
+                screen.blit(surf, (self.rect.x + 12, y))
             y += 19
         
-        cursor = "_" if (self.focused and time.time() % 1 > 0.5) else ""
-        prompt = "> " + self.input_buffer + cursor
-        ps = self.font.render(prompt, True, (0, 255, 200))
-        screen.blit(ps, (self.rect.x + 12, self.rect.bottom - 30))
+        footer_y = self.rect.bottom - 30
+        
+        if not self.connected:
+            prompt = "> " + self.input_buffer + ("_" if (self.focused and time.time() % 1 > 0.5) else "")
+            ps = self.font.render(prompt, True, (150, 150, 150))
+            screen.blit(ps, (self.rect.x + 12, footer_y))
+            return
+
+        mode_text = "[RAW INPUT ON]" if self.raw_input_mode else "[BUFFERED INPUT]"
+        mode_color = (255, 100, 100) if self.raw_input_mode else (100, 150, 255)
+        m_surf = self.font.render(mode_text, True, mode_color)
+        screen.blit(m_surf, (self.rect.right - m_surf.get_width() - 20, footer_y))
+        
+        if not self.raw_input_mode:
+            cursor = "_" if (self.focused and time.time() % 1 > 0.5) else ""
+            prompt = "> " + self.input_buffer + cursor
+            ps = self.font.render(prompt, True, (0, 255, 200))
+            screen.blit(ps, (self.rect.x + 12, footer_y))
 
     def upload_file(self, filepath):
         if not self.ssh_client or not self.ssh_client.get_transport().is_active():
@@ -270,7 +470,8 @@ class IntegratedTerminal:
             self.sock.connect((ip, port))
             
             try:
-                self.sock.send(b"\xff\xfb\x1f\xff\xfa\x1f\x00\xa0\x03\xe8\xff\xf0")
+                naws = b'\xff\xfb\x1f\xff\xfa\x1f' + struct.pack('!HH', self.cols, self.rows) + b'\xff\xf0'
+                self.sock.send(naws)
             except: pass
 
             self.connected = True
@@ -300,16 +501,15 @@ class IntegratedTerminal:
                         if data:
                             self.write(data)
                         else:
-                            raise ConnectionError("Empty data received")
+                            raise ConnectionError("Empty data")
                     except Exception as e:
                         self.connected = False
                         if not self.intentional_disconnect and self.ip and self.pin:
+                            self.retry_count += 1
                             self.add_line("[-] Connection dropped (Xbox likely killed the process).")
-                            self.add_line("[*] Auto-reconnecting in 3 seconds...")
+                            self.add_line(f"[*] Auto-reconnecting... (Attempt {self.retry_count}/5)")
                             time.sleep(3)
                             threading.Thread(target=connect_ssh, args=(self.ip, self.pin, self, False), daemon=True).start()
-                        else:
-                            self.add_line("[-] Telnet disconnected cleanly.")
                         break
 
             def ssh_keepalive():
@@ -331,22 +531,70 @@ class IntegratedTerminal:
         self.intentional_disconnect = True
         self.connected = False
         
-        # Cleanly murder the orphaned Telnet daemon on the Xbox before we exit
         if self.ssh_client and self.ssh_client.get_transport() and self.ssh_client.get_transport().is_active():
             try:
-                print("[*] Terminating remote telnetd.exe to free Xbox resources...")
                 self.ssh_client.exec_command("taskkill /F /IM telnetd.exe /T")
                 time.sleep(0.2)
-            except: 
-                pass
-            try: 
-                self.ssh_client.close()
-            except: 
-                pass
+            except: pass
+            try: self.ssh_client.close()
+            except: pass
 
         if self.sock:
             try: self.sock.close()
             except: pass
+
+
+def connect_ssh(ip, pin, terminal, save_on_success=False):
+    if terminal.retry_count >= 5:
+        try:
+            res = requests.get(f"https://{ip}:11443/ext/screenshot", params={'download': 'false'}, verify=False, timeout=1.5)
+            network_up = (res.status_code == 200)
+        except:
+            network_up = False
+            
+        if network_up:
+            terminal.add_line("[-] Max retries (5) reached. The Xbox Sandbox daemon is hung.")
+            terminal.needs_reboot_prompt = True  # <-- CHANGED: trigger popup instead of terminal text
+        else:
+            terminal.add_line("[-] Network connection is lost. Xbox is unreachable.")
+        return
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
+
+        ssh.get_transport().set_keepalive(30)
+        
+        terminal.add_line("[*] Checking for existing telnetd process...")
+            
+        stdin, stdout, stderr = ssh.exec_command('tasklist')
+        tasks = stdout.read().decode('utf-8', errors='ignore')
+        
+        if "telnetd.exe" not in tasks:
+            terminal.add_line("[+] Launching new telnetd instance...")
+            ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
+            time.sleep(2.8)
+        else:
+            terminal.add_line("[+] telnetd already running. Attaching to existing process...")
+        
+        if save_on_success:
+            save_pin(ip, pin)
+
+        terminal.retry_count = 0 
+        terminal.start_telnet(ip, pin, ssh, 24)
+        
+    except paramiko.AuthenticationException:
+        remove_pin(ip)
+        terminal.add_line("[-] Error: Authentication failed. Stored PIN cleared.")
+        terminal.needs_pin_prompt = True
+        terminal.retry_count = 0 
+    except Exception as e:
+        terminal.retry_count += 1
+        terminal.add_line(f"[-] Error: SSH connection failed: {e}")
+        terminal.add_line(f"[*] Auto-reconnecting... (Attempt {terminal.retry_count}/5)")
+        time.sleep(3)
+        threading.Thread(target=connect_ssh, args=(ip, pin, terminal, False), daemon=True).start()
 
 # ================== VIDEO & INPUT ==================
 class FastVideoStream:
@@ -476,38 +724,6 @@ def get_xbox_coords(mx, my, active_rect):
     ry = max(0, min(my - vy, vh))
     return int((rx / vw) * 65535), int((ry / vh) * 65535)
 
-def connect_ssh(ip, pin, terminal, save_on_success=False):
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
-
-        ssh.get_transport().set_keepalive(30)
-        
-        terminal.add_line("[*] Checking for existing telnetd process...")
-        stdin, stdout, stderr = ssh.exec_command('tasklist')
-        tasks = stdout.read().decode('utf-8', errors='ignore')
-        
-        if "telnetd.exe" not in tasks:
-            terminal.add_line("[+] Launching new telnetd instance...")
-            ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
-            time.sleep(2.8)
-        else:
-            terminal.add_line("[+] telnetd already running. Attaching to existing process...")
-        
-        if save_on_success:
-            save_pin(ip, pin)
-
-        terminal.start_telnet(ip, pin, ssh, 24)
-    except paramiko.AuthenticationException:
-        remove_pin(ip)
-        terminal.add_line("[-] Error: Authentication failed. Stored PIN cleared.")
-        terminal.needs_pin_prompt = True
-    except Exception as e:
-        remove_pin(ip)
-        terminal.add_line(f"[-] Error: SSH connection failed: {e}")
-        terminal.needs_pin_prompt = True
-
 # ================== MENU ==================
 def run_menu(screen, clock):
     font_big = pygame.font.SysFont(None, 64)
@@ -586,7 +802,10 @@ def run_stream(screen, clock, ip):
         video = IMGVideoStream(ip).start()
 
     shell_btn = Button(STREAM_SIZE[0] - 260, 18, 240, 52, "Connect Dev Shell", (0, 120, 215), (0, 160, 255))
+    full_term_btn = Button(STREAM_SIZE[0] - 520, 18, 240, 52, "Toggle Full Terminal", (60, 60, 80), (90, 90, 110))
+    
     terminal = IntegratedTerminal(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
+    terminal.ip = ip 
 
     vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
     target_size = (vid_rect[2], vid_rect[3])
@@ -598,16 +817,23 @@ def run_stream(screen, clock, ip):
     prompting_pin = False
     pin_buffer = ""
 
-    print(f"[*] Connected to {ip} | Press F8 to toggle RTSP <-> Screenshot mode")
-
     while running:
         cur_size = screen.get_size()
         if cur_size != STREAM_SIZE or force_resize:
             STREAM_SIZE = cur_size
-            vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
-            target_size = (vid_rect[2], vid_rect[3])
-            terminal.rect = pygame.Rect(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
+            
+            if terminal.fullscreen_mode:
+                terminal.rect = pygame.Rect(0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 80)
+                vid_rect = (0, 0, 0, 0)
+            else:
+                vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
+                target_size = (max(1, vid_rect[2]), max(1, vid_rect[3]))
+                terminal.rect = pygame.Rect(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
+                
+            # Dynamic button alignment
             shell_btn.rect.x = STREAM_SIZE[0] - shell_btn.rect.w - 20 
+            full_term_btn.rect.x = shell_btn.rect.x - full_term_btn.rect.w - 20
+            
             force_resize = False
             screen.fill((0,0,0))
             
@@ -616,38 +842,41 @@ def run_stream(screen, clock, ip):
             pin_buffer = ""
             terminal.needs_pin_prompt = False
 
-        ret, data = video.read()
-        frame_surf = None
-        if ret and data is not None:
-            if mode == "RTSP":
-                h, w = data.shape[:2]
-                scale = min(target_size[0] / w, target_size[1] / h)
-                nw, nh = int(w * scale), int(h * scale)
-                frame = cv2.resize(data, (nw, nh), interpolation=cv2.INTER_LINEAR)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = np.transpose(frame, (1, 0, 2))
-                frame_surf = pygame.surfarray.make_surface(frame)
-            else:
-                w, h = data.get_width(), data.get_height()
-                scale = min(target_size[0] / w, target_size[1] / h)
-                nw, nh = int(w * scale), int(h * scale)
-                frame_surf = pygame.transform.scale(data, (nw, nh))
+        if not terminal.fullscreen_mode:
+            ret, data = video.read()
+            frame_surf = None
+            if ret and data is not None:
+                if mode == "RTSP":
+                    h, w = data.shape[:2]
+                    scale = min(target_size[0] / max(1,w), target_size[1] / max(1,h))
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    frame = cv2.resize(data, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = np.transpose(frame, (1, 0, 2))
+                    frame_surf = pygame.surfarray.make_surface(frame)
+                else:
+                    w, h = data.get_width(), data.get_height()
+                    scale = min(target_size[0] / max(1,w), target_size[1] / max(1,h))
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    frame_surf = pygame.transform.scale(data, (nw, nh))
 
-            if frame_surf:
-                ox = vid_rect[0] + (target_size[0] - nw) // 2
-                oy = vid_rect[1] + (target_size[1] - nh) // 2
-                active_vid_rect = (ox, oy, nw, nh)
-                
-                pygame.draw.rect(screen, (0, 0, 0), vid_rect)
-                screen.blit(frame_surf, (ox, oy))
+                if frame_surf:
+                    ox = vid_rect[0] + (target_size[0] - nw) // 2
+                    oy = vid_rect[1] + (target_size[1] - nh) // 2
+                    active_vid_rect = (ox, oy, nw, nh)
+                    
+                    pygame.draw.rect(screen, (0, 0, 0), vid_rect)
+                    screen.blit(frame_surf, (ox, oy))
 
         pygame.draw.rect(screen, (28, 28, 35), (0, 0, STREAM_SIZE[0], 80))
         header = pygame.font.SysFont("consolas", 26, bold=True).render(f"Xbox Devkit • {ip} • {mode} mode", True, (0, 200, 255))
         screen.blit(header, (20, 20))
 
         shell_btn.draw(screen)
+        full_term_btn.draw(screen)
         terminal.draw(screen)
 
+        # ── PIN prompt overlay ──────────────────────────────────────────────
         if prompting_pin:
             overlay_w, overlay_h = 400, 150
             overlay_x, overlay_y = (STREAM_SIZE[0] - overlay_w) // 2, (STREAM_SIZE[1] - overlay_h) // 2
@@ -662,6 +891,39 @@ def run_stream(screen, clock, ip):
             
             screen.blit(txt1, (overlay_x + 20, overlay_y + 30))
             screen.blit(txt2, (overlay_x + 20, overlay_y + 80))
+
+        # ── Reboot prompt overlay ───────────────────────────────────────────
+        if terminal.needs_reboot_prompt:
+            overlay_w, overlay_h = 500, 200
+            overlay_x = (STREAM_SIZE[0] - overlay_w) // 2
+            overlay_y = (STREAM_SIZE[1] - overlay_h) // 2
+
+            # Dim the background slightly
+            dim = pygame.Surface((STREAM_SIZE[0], STREAM_SIZE[1]), pygame.SRCALPHA)
+            dim.fill((0, 0, 0, 120))
+            screen.blit(dim, (0, 0))
+
+            pygame.draw.rect(screen, (45, 15, 15), (overlay_x, overlay_y, overlay_w, overlay_h), border_radius=12)
+            pygame.draw.rect(screen, (200, 60, 60), (overlay_x, overlay_y, overlay_w, overlay_h), 3, border_radius=12)
+
+            p_font = pygame.font.SysFont("consolas", 19, bold=True)
+            s_font = pygame.font.SysFont("consolas", 17)
+
+            title_surf  = p_font.render("⚠  Xbox Sandbox is hung", True, (255, 100, 100))
+            sub_surf    = s_font.render("The daemon failed to recover after 5 retries.", True, (200, 200, 200))
+            enter_surf  = s_font.render("ENTER  —  Reboot console remotely", True, (255, 255, 255))
+            esc_surf    = s_font.render("ESC    —  Dismiss", True, (130, 130, 130))
+
+            screen.blit(title_surf, (overlay_x + 20, overlay_y + 22))
+            screen.blit(sub_surf,   (overlay_x + 20, overlay_y + 60))
+
+            # Divider
+            pygame.draw.line(screen, (80, 40, 40),
+                             (overlay_x + 20, overlay_y + 95),
+                             (overlay_x + overlay_w - 20, overlay_y + 95), 1)
+
+            screen.blit(enter_surf, (overlay_x + 20, overlay_y + 112))
+            screen.blit(esc_surf,   (overlay_x + 20, overlay_y + 155))
 
         pygame.display.flip()
 
@@ -679,7 +941,25 @@ def run_stream(screen, clock, ip):
                     threading.Thread(target=terminal.upload_file, args=(filepath,), daemon=True).start()
                 else:
                     terminal.add_line("[-] Connect Dev Shell first to upload files.")
-                
+
+            # ── Reboot popup key handling (highest priority) ────────────────
+            if terminal.needs_reboot_prompt:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        terminal.needs_reboot_prompt = False
+                        terminal.add_line("[-] Reboot dismissed.")
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        terminal.needs_reboot_prompt = False
+                        terminal.retry_count = 0
+                        try:
+                            requests.post(f"https://{ip}:11443/ext/power?action=reboot",
+                                          verify=False, timeout=3)
+                            terminal.add_line("[+] Reboot command sent! Waiting for console to restart...")
+                        except Exception as e:
+                            terminal.add_line(f"[-] Reboot failed: {e}")
+                continue  # block all other input while popup is up
+
+            # ── PIN popup key handling ──────────────────────────────────────
             if prompting_pin:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -734,12 +1014,16 @@ def run_stream(screen, clock, ip):
                             input_client.send_key(k, False)
                         active_keys.clear()
                         
+                    elif full_term_btn.clicked((mx, my)):
+                        terminal.fullscreen_mode = not terminal.fullscreen_mode
+                        force_resize = True
+                        
             if event.type == pygame.KEYDOWN:
-                if terminal.focused and terminal.connected:
+                if terminal.focused:
                     terminal.handle_key(event)
                 else:
                     mx, my = pygame.mouse.get_pos()
-                    if pygame.Rect(*active_vid_rect).collidepoint(mx, my):
+                    if not terminal.fullscreen_mode and pygame.Rect(*active_vid_rect).collidepoint(mx, my):
                         if event.key not in active_keys:
                             active_keys.add(event.key)
                             input_client.send_key(event.key, True)
@@ -752,7 +1036,7 @@ def run_stream(screen, clock, ip):
             elif event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                 mx, my = pygame.mouse.get_pos()
                 
-                if pygame.Rect(*active_vid_rect).collidepoint(mx, my):
+                if not terminal.fullscreen_mode and pygame.Rect(*active_vid_rect).collidepoint(mx, my):
                     xbox_x, xbox_y = get_xbox_coords(mx, my, active_vid_rect)
                     if event.type == pygame.MOUSEMOTION:
                         input_client.update_mouse(xbox_x, xbox_y)
@@ -769,7 +1053,7 @@ def run_stream(screen, clock, ip):
                 mx, my = pygame.mouse.get_pos()
                 if terminal.rect.collidepoint(mx, my):
                     terminal.scroll(-event.y * 3) 
-                elif pygame.Rect(*active_vid_rect).collidepoint(mx, my):
+                elif not terminal.fullscreen_mode and pygame.Rect(*active_vid_rect).collidepoint(mx, my):
                     xbox_x, xbox_y = get_xbox_coords(mx, my, active_vid_rect)
                     input_client.send_mouse(WHEEL_V, xbox_x, xbox_y, event.y * 120)
 
@@ -780,21 +1064,16 @@ def run_stream(screen, clock, ip):
 
 # ================== MAIN ==================
 def main():
-    # Force the window to spawn dead center 
     os.environ['SDL_VIDEO_CENTERED'] = '1'
     pygame.init()
     
-    # Dynamically grab your monitor's resolution
     info = pygame.display.Info()
-    
-    # Start maximized (leaving a little margin so it doesn't get hidden behind Mac Dock/Top Menu)
     start_w = info.current_w - 40
     start_h = info.current_h - 100
     
     screen = pygame.display.set_mode((start_w, start_h), pygame.RESIZABLE)
     pygame.display.set_caption("Xbox Devkit Launcher")
     
-    # Overwrite the global sizes so all UI math stretches natively
     global MENU_SIZE, STREAM_SIZE
     MENU_SIZE = screen.get_size()
     STREAM_SIZE = screen.get_size()
