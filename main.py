@@ -15,6 +15,7 @@ import urllib3
 import paramiko
 import io
 import re
+import json
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -22,9 +23,41 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 MENU_SIZE = (1280, 720)
 STREAM_SIZE = (1280, 920)   # tall window for video + terminal
 FPS = 60
+CONFIG_FILE = "xbox_config.json"
 
 # Regex to strip ANSI escape sequences
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+# ================== PIN STORAGE ==================
+def load_pin(ip):
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f).get(ip)
+    except: pass
+    return None
+
+def save_pin(ip, pin):
+    try:
+        data = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+        data[ip] = pin
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f)
+    except: pass
+
+def remove_pin(ip):
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+            if ip in data:
+                del data[ip]
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(data, f)
+    except: pass
 
 # ================== KEY & MOUSE CONSTANTS ==================
 VK_MAP = {
@@ -100,35 +133,70 @@ class IntegratedTerminal:
     def __init__(self, x, y, w, h):
         self.rect = pygame.Rect(x, y, w, h)
         self.font = pygame.font.SysFont("consolas", 17)
-        self.lines = ["[INFO] Xbox Devkit Terminal ready", "Click 'Connect Dev Shell' to get full SYSTEM cmd.exe"]
+        self.lines = [
+            "[INFO] Xbox Devkit Terminal ready", 
+            "Click 'Connect Dev Shell' to get full SYSTEM cmd.exe",
+            "[INFO] Drag and drop any file onto this window to upload to Sandbox."
+        ]
         self.input_buffer = ""
         self.max_lines = (h - 50) // 19
         self.sock = None
+        self.ssh_client = None 
         self.connected = False
         self.lock = threading.Lock()
+        
+        self.focused = False
+        self.scroll_offset = 0
+        self.needs_pin_prompt = False
+        self.ip = None
 
     def add_line(self, text):
-        # 1. Convert tabs to spaces so we don't lose formatting
         clean_text = text.replace('\t', '    ')
-        # 2. Strip ANSI escape codes
         clean_text = ANSI_ESCAPE.sub('', clean_text)
-        # 3. Nuclear option: Strip ALL non-printable control characters (except newline)
-        # This completely destroys those weird Pygame boxes (NUL bytes, Telnet negotiations, etc.)
-        clean_text = re.sub(r'[^\x20-\x7E\n]', '', clean_text)
+        
+        clean_text = clean_text.replace('\r\n', '\n')
 
         with self.lock:
-            # \r is already stripped by the regex above since it's outside the \x20-\x7E range
             for line in clean_text.split('\n'): 
-                if line.strip() or not self.lines or self.lines[-1] != "":
+                if '\r' in line:
+                    line = line.split('\r')[-1]
+                
+                while '\x08' in line:
+                    new_line = re.sub(r'[^\x08]\x08', '', line, count=1)
+                    if new_line == line: break
+                    line = new_line
+                line = line.replace('\x08', '') 
+                
+                line = re.sub(r'[^\x20-\x7E]', '', line)
+                line = line.rstrip()
+
+                if line or not self.lines or self.lines[-1] != "":
                     self.lines.append(line)
-            if len(self.lines) > 1200:
-                self.lines = self.lines[-900:]
+                    
+            if len(self.lines) > 2000: 
+                self.lines = self.lines[-1500:]
 
     def write(self, data):
-        self.add_line(data.decode('utf-8', errors='ignore'))
+        text = data.decode('utf-8', errors='ignore')
+        
+        if '\x1b[2J' in text or '\x0c' in text:
+            with self.lock:
+                self.lines.clear()
+            text = re.split(r'\x1b\[2J|\x0c', text)[-1]
+            
+        self.add_line(text)
+        
+    def scroll(self, amount):
+        max_scroll = max(0, len(self.lines) - self.max_lines)
+        self.scroll_offset += amount
+        if self.scroll_offset < 0: self.scroll_offset = 0
+        if self.scroll_offset > max_scroll: self.scroll_offset = max_scroll
 
     def handle_key(self, event):
         if not self.connected or event.type != pygame.KEYDOWN: return False
+        
+        self.scroll_offset = 0 
+        
         if event.key == pygame.K_RETURN:
             cmd = (self.input_buffer + "\r\n").encode('utf-8')
             try:
@@ -148,27 +216,79 @@ class IntegratedTerminal:
 
     def draw(self, screen):
         pygame.draw.rect(screen, (15, 15, 25), self.rect)
-        pygame.draw.rect(screen, (0, 220, 80), self.rect, 3)
+        
+        outline_color = (0, 255, 120) if self.focused else (50, 70, 80)
+        pygame.draw.rect(screen, outline_color, self.rect, 3)
+        
         y = self.rect.y + 10
-        start = max(0, len(self.lines) - self.max_lines)
-        for line in self.lines[start:]:
+        end_idx = len(self.lines) - self.scroll_offset
+        start_idx = max(0, end_idx - self.max_lines)
+        
+        for line in self.lines[start_idx:end_idx]:
             surf = self.font.render(line, True, (0, 255, 120))
             screen.blit(surf, (self.rect.x + 12, y))
             y += 19
         
-        cursor = "_" if time.time() % 1 > 0.5 else ""
+        cursor = "_" if (self.focused and time.time() % 1 > 0.5) else ""
         prompt = "> " + self.input_buffer + cursor
         ps = self.font.render(prompt, True, (0, 255, 200))
         screen.blit(ps, (self.rect.x + 12, self.rect.bottom - 30))
 
-    def start_telnet(self, ip, port=24):
+    def upload_file(self, filepath):
+        if not self.ssh_client or not self.ssh_client.get_transport().is_active():
+            self.add_line("[-] SSH disconnected. Please reconnect Dev Shell.")
+            return
+            
+        filename = os.path.basename(filepath)
+        self.add_line(f"[*] Uploading '{filename}' to Sandbox via SFTP...")
+        try:
+            sftp = self.ssh_client.open_sftp()
+            remote_path = f"D:/DevelopmentFiles/Sandbox/{filename}"
+            sftp.put(filepath, remote_path)
+            sftp.close()
+            
+            self.add_line(f"[+] '{filename}' uploaded successfully!")
+            
+            if self.connected:
+                self.sock.send(b"dir\r\n")
+                
+        except Exception as e:
+            self.add_line(f"[-] Upload failed: {e}")
+
+    def start_telnet(self, ip, ssh_client, port=24):
+        self.ip = ip
+        self.ssh_client = ssh_client 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.sock.settimeout(15)
             self.sock.connect((ip, port))
+            
+            try:
+                self.sock.send(b"\xff\xfb\x1f\xff\xfa\x1f\x00\xa0\x03\xe8\xff\xf0")
+            except: pass
+
             self.connected = True
+            self.focused = True 
             self.add_line(f"[+] Full SYSTEM shell via raw Telnet ({ip}:{port})")
+            
             def reader():
+                time.sleep(1.2) 
+                
+                startup_cmds = [
+                    b"d:\r\n",
+                    b"cd \\DevelopmentFiles\r\n",
+                    b"if not exist Sandbox mkdir Sandbox\r\n",
+                    b"cd Sandbox\r\n",
+                    b"cls\r\n"
+                ]
+                
+                for cmd in startup_cmds:
+                    try:
+                        self.sock.send(cmd)
+                        time.sleep(0.3)
+                    except: break
+                
                 while self.connected:
                     try:
                         data = self.sock.recv(4096)
@@ -179,10 +299,21 @@ class IntegratedTerminal:
                             self.connected = False
                             break
                     except:
-                        self.add_line("[-] Telnet error")
+                        self.add_line("[-] Telnet error / Disconnected")
                         self.connected = False
                         break
+
+            # Active SSH Heartbeat to completely bypass Xbox idle killing
+            def ssh_keepalive():
+                while self.connected and self.ssh_client:
+                    time.sleep(45)
+                    try:
+                        self.ssh_client.exec_command("echo 1")
+                    except:
+                        pass
+
             threading.Thread(target=reader, daemon=True).start()
+            threading.Thread(target=ssh_keepalive, daemon=True).start()
             return True
         except Exception as e:
             self.add_line(f"[-] Connection failed: {e}")
@@ -192,6 +323,9 @@ class IntegratedTerminal:
         self.connected = False
         if self.sock:
             try: self.sock.close()
+            except: pass
+        if self.ssh_client:
+            try: self.ssh_client.close()
             except: pass
 
 # ================== VIDEO & INPUT ==================
@@ -322,22 +456,39 @@ def get_xbox_coords(mx, my, active_rect):
     ry = max(0, min(my - vy, vh))
     return int((rx / vw) * 65535), int((ry / vh) * 65535)
 
-def connect_ssh(ip, pin, terminal):
+def connect_ssh(ip, pin, terminal, save_on_success=False):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
 
-        terminal.add_line("[+] SSH OK. Launching telnetd...")
-        ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
-        time.sleep(2.8)
-        ssh.close()
+        # Base TCP Keepalive
+        ssh.get_transport().set_keepalive(30)
+        
+        # Check if the process is already running to avoid saturating sockets
+        terminal.add_line("[*] Checking for existing telnetd process...")
+        stdin, stdout, stderr = ssh.exec_command('tasklist')
+        tasks = stdout.read().decode('utf-8', errors='ignore')
+        
+        if "telnetd.exe" not in tasks:
+            terminal.add_line("[+] Launching new telnetd instance...")
+            ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
+            time.sleep(2.8)
+        else:
+            terminal.add_line("[+] telnetd already running. Attaching to existing process...")
+        
+        if save_on_success:
+            save_pin(ip, pin)
 
-        terminal.start_telnet(ip, 24)
+        terminal.start_telnet(ip, ssh, 24)
     except paramiko.AuthenticationException:
-        terminal.add_line("[-] Error: Authentication failed. Double check your PIN.")
+        remove_pin(ip)
+        terminal.add_line("[-] Error: Authentication failed. Stored PIN cleared.")
+        terminal.needs_pin_prompt = True
     except Exception as e:
+        remove_pin(ip)
         terminal.add_line(f"[-] Error: {e}")
+        terminal.needs_pin_prompt = True
 
 # ================== MENU ==================
 def run_menu(screen, clock):
@@ -441,6 +592,11 @@ def run_stream(screen, clock, ip):
             shell_btn.rect.x = STREAM_SIZE[0] - shell_btn.rect.w - 20 
             force_resize = False
             screen.fill((0,0,0))
+            
+        if terminal.needs_pin_prompt:
+            prompting_pin = True
+            pin_buffer = ""
+            terminal.needs_pin_prompt = False
 
         ret, data = video.read()
         frame_surf = None
@@ -499,6 +655,13 @@ def run_stream(screen, clock, ip):
                 screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
                 force_resize = True
                 
+            elif event.type == pygame.DROPFILE:
+                if terminal.connected:
+                    filepath = event.file
+                    threading.Thread(target=terminal.upload_file, args=(filepath,), daemon=True).start()
+                else:
+                    terminal.add_line("[-] Connect Dev Shell first to upload files.")
+                
             if prompting_pin:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -509,7 +672,7 @@ def run_stream(screen, clock, ip):
                         if clean_pin:
                             prompting_pin = False
                             terminal.add_line("[*] Connecting via SSH...")
-                            threading.Thread(target=connect_ssh, args=(ip, clean_pin, terminal), daemon=True).start()
+                            threading.Thread(target=connect_ssh, args=(ip, clean_pin, terminal, True), daemon=True).start()
                             pin_buffer = ""
                         else:
                             terminal.add_line("[-] PIN required.")
@@ -532,21 +695,36 @@ def run_stream(screen, clock, ip):
                     video = FastVideoStream(ip).start()
                 pygame.display.set_caption(f"Xbox Devkit • {ip} • {mode} mode")
 
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if shell_btn.clicked(pygame.mouse.get_pos()) and not terminal.connected:
-                    prompting_pin = True
-                    pin_buffer = ""
-                    for k in list(active_keys):
-                        input_client.send_key(k, False)
-                    active_keys.clear()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = pygame.mouse.get_pos()
+                
+                if terminal.rect.collidepoint(mx, my):
+                    terminal.focused = True
+                else:
+                    terminal.focused = False
 
-            if terminal.connected and terminal.handle_key(event):
-                continue
-
-            elif event.type == pygame.KEYDOWN:
-                if event.key not in active_keys:
-                    active_keys.add(event.key)
-                    input_client.send_key(event.key, True)
+                if event.button == 1:
+                    if shell_btn.clicked((mx, my)) and not terminal.connected:
+                        saved_pin = load_pin(ip)
+                        if saved_pin:
+                            terminal.add_line("[*] Found saved PIN. Authenticating in background...")
+                            threading.Thread(target=connect_ssh, args=(ip, saved_pin, terminal, False), daemon=True).start()
+                        else:
+                            prompting_pin = True
+                            pin_buffer = ""
+                        for k in list(active_keys):
+                            input_client.send_key(k, False)
+                        active_keys.clear()
+                        
+            if event.type == pygame.KEYDOWN:
+                if terminal.focused and terminal.connected:
+                    terminal.handle_key(event)
+                else:
+                    mx, my = pygame.mouse.get_pos()
+                    if pygame.Rect(*active_vid_rect).collidepoint(mx, my):
+                        if event.key not in active_keys:
+                            active_keys.add(event.key)
+                            input_client.send_key(event.key, True)
             
             elif event.type == pygame.KEYUP:
                 if event.key in active_keys:
@@ -554,8 +732,9 @@ def run_stream(screen, clock, ip):
                     input_client.send_key(event.key, False)
 
             elif event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
-                mx, my = pygame.mouse.get_pos() 
-                if active_vid_rect[1] <= my <= active_vid_rect[1] + active_vid_rect[3]:
+                mx, my = pygame.mouse.get_pos()
+                
+                if pygame.Rect(*active_vid_rect).collidepoint(mx, my):
                     xbox_x, xbox_y = get_xbox_coords(mx, my, active_vid_rect)
                     if event.type == pygame.MOUSEMOTION:
                         input_client.update_mouse(xbox_x, xbox_y)
@@ -570,7 +749,9 @@ def run_stream(screen, clock, ip):
 
             elif event.type == pygame.MOUSEWHEEL:
                 mx, my = pygame.mouse.get_pos()
-                if active_vid_rect[1] <= my <= active_vid_rect[1] + active_vid_rect[3]:
+                if terminal.rect.collidepoint(mx, my):
+                    terminal.scroll(-event.y * 3) 
+                elif pygame.Rect(*active_vid_rect).collidepoint(mx, my):
                     xbox_x, xbox_y = get_xbox_coords(mx, my, active_vid_rect)
                     input_client.send_mouse(WHEEL_V, xbox_x, xbox_y, event.y * 120)
 
