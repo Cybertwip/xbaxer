@@ -1,20 +1,18 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-:: Create ESC character for ANSI escape codes (cursor-home trick to kill flicker)
-for /f %%a in ('echo prompt $E^| cmd /q') do set "ESC=%%a"
-
-:restart
+:: Initialize variables
 set /a ballX=20, ballY=10
 set /a dirX=1, dirY=1
-set /a paddle=8
+set /a paddle=9
 set /a score=0
 set /a loopCount=0
-set /a speed=6
+set /a speed=5
 
 :loop
 set /a loopCount+=1
 
+:: Only update physics every X loops to simulate "Real Time" speed
 set /a tick=loopCount %% speed
 if !tick! NEQ 0 goto draw
 
@@ -23,67 +21,60 @@ set /a ballX+=dirX
 set /a ballY+=dirY
 
 :: Bounce off top and bottom walls
-if !ballY! leq 1  set /a dirY=1
+if !ballY! leq 1 set /a dirY=1
 if !ballY! geq 18 set /a dirY=-1
 
 :: Bounce off right wall
 if !ballX! geq 38 set /a dirX=-1
 
-:: AI paddle tracks ball
+:: AI Paddle Movement (Since we can't read keys without pausing)
 if !ballY! gtr !paddle! set /a paddle+=1
 if !ballY! lss !paddle! set /a paddle-=1
 
-:: Clamp paddle within field
-if !paddle! lss 1  set /a paddle=1
-if !paddle! gtr 15 set /a paddle=15
-
-:: Paddle collision (left side, X=1..2)
+:: Paddle collision (Left side)
 if !ballX! leq 2 (
     set /a pEnd=paddle+3
     if !ballY! geq !paddle! if !ballY! leq !pEnd! (
         set /a dirX=1
         set /a score+=1
-        :: Speed up every 5 points (lower = faster)
-        set /a speed=6-score/5
-        if !speed! lss 1 set /a speed=1
     ) else (
         goto gameover
     )
 )
 
 :draw
-:: Move cursor to top-left instead of cls — eliminates flicker
-echo !ESC![H
-echo Score: !score!   Speed Lvl: !score!/5   Pong for Xbox Dev Shell      
-echo ========================================
+:: Clear screen using the ANSI-supported CLS
+cls
+echo Score: !score!  ^|  Mode: Real-Time Auto-Paddle
+echo ======================================
 for /L %%Y in (1,1,18) do (
     set "line="
     for /L %%X in (1,1,38) do (
         set "char= "
         if %%X==1 (
             set /a pEnd=paddle+3
-            if %%Y geq !paddle! if %%Y leq !pEnd! set "char=^|"
+            if %%Y geq !paddle! if %%Y leq !pEnd! set "char=]"
         )
         if %%X==!ballX! if %%Y==!ballY! set "char=O"
-        if %%X==38 set "char=^|"
+        if %%X==38 set "char=|"
         set "line=!line!!char!"
     )
     echo(!line!
 )
-echo ========================================
-echo Running — miss the ball to end game.   
+echo ======================================
+echo [Terminal is rendering at max FPS]
 
-:: Lightweight CPU yield
-for /L %%i in (1,1,80) do (set _=%%i)
+:: Small internal delay to prevent Xbox CPU spike
+for /L %%i in (1,1,100) do (set dummy=%%i)
+
 goto loop
 
 :gameover
-echo !ESC![H
-echo ========================================
-echo           GAME OVER!                   
-echo         Final Score: !score!           
-echo ========================================
-echo.
-echo  Press ENTER to play again...          
-set /p "_="
-goto restart
+cls
+echo ======================================
+echo              GAME OVER!
+echo            Your Score: !score!
+echo ======================================
+echo Press Enter to restart...
+set /p "restart="
+goto loop
