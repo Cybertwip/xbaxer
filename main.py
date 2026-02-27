@@ -143,7 +143,7 @@ class IntegratedTerminal:
         self.sock = None
         self.ssh_client = None 
         self.connected = False
-        self.intentional_disconnect = False # Flag to control Auto-Reconnect
+        self.intentional_disconnect = False
         self.lock = threading.Lock()
         
         self.focused = False
@@ -329,11 +329,22 @@ class IntegratedTerminal:
     def close(self):
         self.intentional_disconnect = True
         self.connected = False
+        
+        # FIX: Cleanly murder the orphaned Telnet daemon on the Xbox before we exit
+        if self.ssh_client and self.ssh_client.get_transport() and self.ssh_client.get_transport().is_active():
+            try:
+                print("[*] Terminating remote telnetd.exe to free Xbox resources...")
+                self.ssh_client.exec_command("taskkill /F /IM telnetd.exe /T")
+                time.sleep(0.2) # Give the Xbox a split second to process the kill order
+            except: 
+                pass
+            try: 
+                self.ssh_client.close()
+            except: 
+                pass
+
         if self.sock:
             try: self.sock.close()
-            except: pass
-        if self.ssh_client:
-            try: self.ssh_client.close()
             except: pass
 
 # ================== VIDEO & INPUT ==================
@@ -763,6 +774,7 @@ def run_stream(screen, clock, ip):
 
         clock.tick(FPS if mode == "RTSP" else 30)
 
+    # Automatically kills the daemon on exit
     video.stop()
     terminal.close()
 
