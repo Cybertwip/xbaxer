@@ -25,9 +25,6 @@ STREAM_SIZE = (1280, 920)
 FPS = 60
 CONFIG_FILE = "xbox_config.json"
 
-# Regex to strip ANSI escape sequences
-ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-
 # ================== PIN STORAGE ==================
 def load_pin(ip):
     try:
@@ -111,21 +108,19 @@ def scan_network_async(result_list, callback):
 # ================== UI ==================
 class Button:
     def __init__(self, x, y, w, h, text, color=(0, 120, 215), hover=(0, 160, 255)):
-        self.font = pygame.font.SysFont("consolas", 20, bold=True)
+        self.rect = pygame.Rect(x, y, w, h)
         self.text = text
-        
-        # Pre-measure text to prevent overflow & overlapping
-        txt_width = self.font.render(text, True, (255, 255, 255)).get_width()
-        actual_w = max(w, txt_width + 40) 
-        
-        self.rect = pygame.Rect(x, y, actual_w, h)
         self.color = color
         self.hover = hover
+        self.font = pygame.font.SysFont("consolas", 20, bold=True)
 
     def draw(self, surf):
+        txt = self.font.render(self.text, True, (255, 255, 255))
+        if txt.get_width() > self.rect.w - 20:
+            self.rect.w = txt.get_width() + 20
+            
         col = self.hover if self.rect.collidepoint(pygame.mouse.get_pos()) else self.color
         pygame.draw.rect(surf, col, self.rect, border_radius=8)
-        txt = self.font.render(self.text, True, (255, 255, 255))
         surf.blit(txt, txt.get_rect(center=self.rect.center))
 
     def clicked(self, pos):
@@ -137,6 +132,7 @@ class IntegratedTerminal:
         self.rect = pygame.Rect(x, y, w, h)
         self.font = pygame.font.SysFont("consolas", 17)
         
+        # 2D Viewport Grid Matrix 
         self.cols = 140
         self.rows = 40
         self.grid = [[' ' for _ in range(self.cols)] for _ in range(self.rows)]
@@ -160,9 +156,8 @@ class IntegratedTerminal:
         self.raw_input_mode = False 
         self.scroll_offset = 0
         self.needs_pin_prompt = False
-        self.needs_reboot_prompt = False  # <-- NEW: triggers reboot popup
-        
-        self.retry_count = 0 
+        self.needs_reboot_prompt = False  # triggers reboot popup overlay
+        self.retry_count = 0              # tracks reconnect attempts for hung detection
         self.ip = None
         self.pin = None
 
@@ -177,6 +172,7 @@ class IntegratedTerminal:
             self.cy = min(self.cy, new_rows - 1)
             self.rows = new_rows
             
+            # Send updated NAWS handshake to Xbox so it knows the new size
             if self.connected and self.sock:
                 try:
                     naws = b'\xff\xfb\x1f\xff\xfa\x1f' + struct.pack('!HH', self.cols, self.rows) + b'\xff\xf0'
@@ -199,65 +195,40 @@ class IntegratedTerminal:
         self.cx = 0
         self.cy = 0
 
-    def add_line(self, text):
-        clean_text = text.replace('\t', '    ')
-        clean_text = ANSI_ESCAPE.sub('', clean_text)
-        clean_text = clean_text.replace('\r\n', '\n')
-
-        with self.lock:
-            for line in clean_text.split('\n'): 
-                if '\r' in line:
-                    line = line.split('\r')[-1]
-                
-                while '\x08' in line:
-                    new_line = re.sub(r'[^\x08]\x08', '', line, count=1)
-                    if new_line == line: break
-                    line = new_line
-                line = line.replace('\x08', '') 
-                
-                line = re.sub(r'[^\x20-\x7E]', '', line)
-                line = line.rstrip()
-
-                if line or not self.lines or self.lines[-1] != "":
-                    if not self.connected:
-                        self.history.append(line)
-                    else:
-                        self.write(line.encode('utf-8'))
-                    
-            if len(self.history) > 2000: 
-                self.history = self.history[-1500:]
-
     def write(self, data):
         text = data.decode('utf-8', errors='replace')
         
+        # Strip invisible Telnet negotiation bytes (\xff) so they don't print garbage
         text = re.sub(r'\xff[\xfb-\xfe].', '', text)
         text = re.sub(r'\xff[\xf0-\xfa]', '', text)
         
+        # Tokenize stream by ANSI Escape Sequences
         tokens = re.split(r'(\x1b\[[0-9;?]*[A-Za-z])', text)
         
         with self.lock:
             for token in tokens:
                 if not token: continue
                 
+                # --- COMMAND SEQUENCE ---
                 if token.startswith('\x1b['):
                     code = token[-1]
                     args_str = token[2:-1].replace('?', '')
                     args = args_str.split(';') if args_str else []
                     
-                    if code == 'J': 
+                    if code == 'J': # Clear Screen Command
                         arg = args[0] if args else '0'
                         if arg == '2':
                             self.clear_screen()
                         elif arg == '0':
                             for c in range(self.cx, self.cols): self.grid[self.cy][c] = ' '
                             for r in range(self.cy + 1, self.rows): self.grid[r] = [' '] * self.cols
-                    elif code == 'K': 
+                    elif code == 'K': # Clear Line Command
                         arg = args[0] if args else '0'
                         if arg == '0':
                             for c in range(self.cx, self.cols): self.grid[self.cy][c] = ' '
                         elif arg == '2':
                             self.grid[self.cy] = [' '] * self.cols
-                    elif code in ('H', 'f'): 
+                    elif code in ('H', 'f'): # Move Cursor Command
                         r = int(args[0])-1 if len(args)>0 and args[0] else 0
                         c = int(args[1])-1 if len(args)>1 and args[1] else 0
                         self.cy = max(0, min(self.rows-1, r))
@@ -267,23 +238,24 @@ class IntegratedTerminal:
                     elif code == 'C': self.cx = min(self.cols-1, self.cx + (int(args[0]) if args and args[0] else 1))
                     elif code == 'D': self.cx = max(0, self.cx - (int(args[0]) if args and args[0] else 1))
                 
+                # --- STANDARD TEXT ---
                 else:
                     for char in token:
                         if char == '\n':
                             self.cy += 1
-                            self.cx = 0 
+                            self.cx = 0 # Implicit Carriage Return
                             if self.cy >= self.rows:
                                 self.scroll_up()
                                 self.cy = self.rows - 1
                         elif char == '\r':
                             self.cx = 0
-                        elif char == '\x08' or char == '\b':
+                        elif char == '\x08' or char == '\b': # Backspace
                             self.cx = max(0, self.cx - 1)
                         elif char == '\t':
                             self.cx = min(self.cols - 1, (self.cx + 4) // 4 * 4)
-                        elif char == '\x0c': 
+                        elif char == '\x0c': # Form feed
                             self.clear_screen()
-                        elif ord(char) >= 32:
+                        elif ord(char) >= 32: # Printable Char
                             if self.cx >= self.cols:
                                 self.cx = 0
                                 self.cy += 1
@@ -300,72 +272,15 @@ class IntegratedTerminal:
         if self.scroll_offset > max_scroll: self.scroll_offset = max_scroll
 
     def handle_key(self, event):
-        if event.type != pygame.KEYDOWN: return False
+        if not self.connected or event.type != pygame.KEYDOWN: return False
+        
         self.scroll_offset = 0 
         
-        # Offline Terminal Logic (Remote Reboot)
-        if not self.connected:
-            if event.key == pygame.K_RETURN:
-                if self.input_buffer.strip() == "REBOOT" and self.ip:
-                    try:
-                        self.add_line("[*] Sending remote reboot command...")
-                        requests.post(f"https://{self.ip}:11443/ext/power?action=reboot", verify=False, timeout=3)
-                        self.add_line("[+] Reboot command sent! Wait a few minutes for the console to restart.")
-                        self.retry_count = 0
-                    except Exception as e:
-                        self.add_line(f"[-] Reboot failed: {e}")
-                self.input_buffer = ""
-                return True
-            elif event.key == pygame.K_BACKSPACE:
-                self.input_buffer = self.input_buffer[:-1]
-                return True
-            elif event.unicode and event.unicode.isprintable():
-                self.input_buffer += event.unicode
-                return True
-            return False
-
-        # Toggle Raw Mode via TAB
+        # Toggle Raw Keyboard Mode (Send keystrokes instantly without pressing Enter)
         if event.key == pygame.K_TAB:
             self.raw_input_mode = not self.raw_input_mode
             return True
 
-        # Process Control Keys (Ctrl+C, Ctrl+D, Ctrl+Z, ESC)
-        mods = pygame.key.get_mods()
-        ctrl_held = (mods & pygame.KMOD_CTRL) or (mods & pygame.KMOD_META)
-        
-        if ctrl_held:
-            try:
-                if event.key == pygame.K_c: self.sock.send(b"\x03")
-                elif event.key == pygame.K_d: self.sock.send(b"\x04")
-                elif event.key == pygame.K_z: self.sock.send(b"\x1a")
-                elif event.key == pygame.K_l: self.sock.send(b"\x0c") # Form feed/clear
-            except: pass
-            return True
-
-        if event.key == pygame.K_ESCAPE:
-            try: self.sock.send(b"\x1b")
-            except: pass
-            return True
-            
-        # ANSI Navigation Keys
-        if event.key == pygame.K_UP:
-            try: self.sock.send(b"\x1b[A")
-            except: pass
-            return True
-        elif event.key == pygame.K_DOWN:
-            try: self.sock.send(b"\x1b[B")
-            except: pass
-            return True
-        elif event.key == pygame.K_RIGHT:
-            try: self.sock.send(b"\x1b[C")
-            except: pass
-            return True
-        elif event.key == pygame.K_LEFT:
-            try: self.sock.send(b"\x1b[D")
-            except: pass
-            return True
-
-        # Raw Keystroke Transmission
         if self.raw_input_mode:
             try:
                 if event.key == pygame.K_RETURN:
@@ -377,7 +292,6 @@ class IntegratedTerminal:
             except: pass
             return True
             
-        # Buffered Keystroke Transmission (Wait for Enter)
         if event.key == pygame.K_RETURN:
             cmd = (self.input_buffer + "\r\n").encode('utf-8')
             try:
@@ -394,6 +308,7 @@ class IntegratedTerminal:
         return False
 
     def draw(self, screen):
+        # Dynamically scale VT100 grid to exactly fit the window container
         visible_rows = (self.rect.height - 50) // 19
         if visible_rows != self.rows and visible_rows > 0:
             self.resize_grid(visible_rows)
@@ -417,14 +332,8 @@ class IntegratedTerminal:
                 screen.blit(surf, (self.rect.x + 12, y))
             y += 19
         
+        # Bottom Prompt Bar
         footer_y = self.rect.bottom - 30
-        
-        if not self.connected:
-            prompt = "> " + self.input_buffer + ("_" if (self.focused and time.time() % 1 > 0.5) else "")
-            ps = self.font.render(prompt, True, (150, 150, 150))
-            screen.blit(ps, (self.rect.x + 12, footer_y))
-            return
-
         mode_text = "[RAW INPUT ON]" if self.raw_input_mode else "[BUFFERED INPUT]"
         mode_color = (255, 100, 100) if self.raw_input_mode else (100, 150, 255)
         m_surf = self.font.render(mode_text, True, mode_color)
@@ -438,24 +347,28 @@ class IntegratedTerminal:
 
     def upload_file(self, filepath):
         if not self.ssh_client or not self.ssh_client.get_transport().is_active():
-            self.add_line("[-] SSH disconnected. Please wait for auto-reconnect.")
+            with self.lock:
+                self.history.append("[-] SSH disconnected. Please wait for auto-reconnect.")
             return
             
         filename = os.path.basename(filepath)
-        self.add_line(f"[*] Uploading '{filename}' to Sandbox via SFTP...")
+        with self.lock:
+            self.history.append(f"[*] Uploading '{filename}' to Sandbox via SFTP...")
         try:
             sftp = self.ssh_client.open_sftp()
             remote_path = f"D:/DevelopmentFiles/Sandbox/{filename}"
             sftp.put(filepath, remote_path)
             sftp.close()
             
-            self.add_line(f"[+] '{filename}' uploaded successfully!")
+            with self.lock:
+                self.history.append(f"[+] '{filename}' uploaded successfully!")
             
             if self.connected:
                 self.sock.send(b"dir\r\n")
                 
         except Exception as e:
-            self.add_line(f"[-] Upload failed: {e}")
+            with self.lock:
+                self.history.append(f"[-] Upload failed: {e}")
 
     def start_telnet(self, ip, pin, ssh_client, port=24):
         self.ip = ip
@@ -469,14 +382,17 @@ class IntegratedTerminal:
             self.sock.settimeout(15)
             self.sock.connect((ip, port))
             
+            # Initial NAWS Size Handshake
             try:
                 naws = b'\xff\xfb\x1f\xff\xfa\x1f' + struct.pack('!HH', self.cols, self.rows) + b'\xff\xf0'
                 self.sock.send(naws)
             except: pass
 
             self.connected = True
+            self.retry_count = 0  # reset on successful connect
             self.focused = True 
-            self.add_line(f"[+] Full SYSTEM shell via raw Telnet ({ip}:{port})")
+            with self.lock:
+                self.history.append(f"[+] Full SYSTEM shell via raw Telnet ({ip}:{port})")
             
             def reader():
                 time.sleep(1.2) 
@@ -506,10 +422,36 @@ class IntegratedTerminal:
                         self.connected = False
                         if not self.intentional_disconnect and self.ip and self.pin:
                             self.retry_count += 1
-                            self.add_line("[-] Connection dropped (Xbox likely killed the process).")
-                            self.add_line(f"[*] Auto-reconnecting... (Attempt {self.retry_count}/5)")
-                            time.sleep(3)
-                            threading.Thread(target=connect_ssh, args=(self.ip, self.pin, self, False), daemon=True).start()
+                            with self.lock:
+                                self.history.append("[-] Connection dropped (Xbox likely killed the process).")
+                                self.history.append(f"[*] Auto-reconnecting in 3 seconds... (Attempt {self.retry_count}/5)")
+
+                            # After 5 drops, check if Xbox is still reachable.
+                            # If yes, the Sandbox daemon is hung — show reboot popup.
+                            if self.retry_count >= 5:
+                                def check_and_prompt():
+                                    try:
+                                        res = requests.get(
+                                            f"https://{self.ip}:11443/ext/screenshot",
+                                            params={'download': 'false'},
+                                            verify=False, timeout=2.0
+                                        )
+                                        network_up = (res.status_code == 200)
+                                    except:
+                                        network_up = False
+
+                                    if network_up:
+                                        with self.lock:
+                                            self.history.append("[-] Max retries reached. Sandbox daemon appears hung.")
+                                        self.needs_reboot_prompt = True
+                                    else:
+                                        with self.lock:
+                                            self.history.append("[-] Xbox is unreachable on the network.")
+
+                                threading.Thread(target=check_and_prompt, daemon=True).start()
+                            else:
+                                time.sleep(3)
+                                threading.Thread(target=connect_ssh, args=(self.ip, self.pin, self, False), daemon=True).start()
                         break
 
             def ssh_keepalive():
@@ -524,7 +466,8 @@ class IntegratedTerminal:
             threading.Thread(target=ssh_keepalive, daemon=True).start()
             return True
         except Exception as e:
-            self.add_line(f"[-] Connection failed: {e}")
+            with self.lock:
+                self.history.append(f"[-] Connection failed: {e}")
             return False
 
     def close(self):
@@ -542,59 +485,6 @@ class IntegratedTerminal:
         if self.sock:
             try: self.sock.close()
             except: pass
-
-
-def connect_ssh(ip, pin, terminal, save_on_success=False):
-    if terminal.retry_count >= 5:
-        try:
-            res = requests.get(f"https://{ip}:11443/ext/screenshot", params={'download': 'false'}, verify=False, timeout=1.5)
-            network_up = (res.status_code == 200)
-        except:
-            network_up = False
-            
-        if network_up:
-            terminal.add_line("[-] Max retries (5) reached. The Xbox Sandbox daemon is hung.")
-            terminal.needs_reboot_prompt = True  # <-- CHANGED: trigger popup instead of terminal text
-        else:
-            terminal.add_line("[-] Network connection is lost. Xbox is unreachable.")
-        return
-
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
-
-        ssh.get_transport().set_keepalive(30)
-        
-        terminal.add_line("[*] Checking for existing telnetd process...")
-            
-        stdin, stdout, stderr = ssh.exec_command('tasklist')
-        tasks = stdout.read().decode('utf-8', errors='ignore')
-        
-        if "telnetd.exe" not in tasks:
-            terminal.add_line("[+] Launching new telnetd instance...")
-            ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
-            time.sleep(2.8)
-        else:
-            terminal.add_line("[+] telnetd already running. Attaching to existing process...")
-        
-        if save_on_success:
-            save_pin(ip, pin)
-
-        terminal.retry_count = 0 
-        terminal.start_telnet(ip, pin, ssh, 24)
-        
-    except paramiko.AuthenticationException:
-        remove_pin(ip)
-        terminal.add_line("[-] Error: Authentication failed. Stored PIN cleared.")
-        terminal.needs_pin_prompt = True
-        terminal.retry_count = 0 
-    except Exception as e:
-        terminal.retry_count += 1
-        terminal.add_line(f"[-] Error: SSH connection failed: {e}")
-        terminal.add_line(f"[*] Auto-reconnecting... (Attempt {terminal.retry_count}/5)")
-        time.sleep(3)
-        threading.Thread(target=connect_ssh, args=(ip, pin, terminal, False), daemon=True).start()
 
 # ================== VIDEO & INPUT ==================
 class FastVideoStream:
@@ -724,6 +614,44 @@ def get_xbox_coords(mx, my, active_rect):
     ry = max(0, min(my - vy, vh))
     return int((rx / vw) * 65535), int((ry / vh) * 65535)
 
+def connect_ssh(ip, pin, terminal, save_on_success=False):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
+
+        ssh.get_transport().set_keepalive(30)
+        
+        with terminal.lock:
+            terminal.history.append("[*] Checking for existing telnetd process...")
+            
+        stdin, stdout, stderr = ssh.exec_command('tasklist')
+        tasks = stdout.read().decode('utf-8', errors='ignore')
+        
+        if "telnetd.exe" not in tasks:
+            with terminal.lock:
+                terminal.history.append("[+] Launching new telnetd instance...")
+            ssh.exec_command('devtoolslauncher LaunchForProfiling telnetd "cmd.exe 24"')
+            time.sleep(2.8)
+        else:
+            with terminal.lock:
+                terminal.history.append("[+] telnetd already running. Attaching to existing process...")
+        
+        if save_on_success:
+            save_pin(ip, pin)
+
+        terminal.start_telnet(ip, pin, ssh, 24)
+    except paramiko.AuthenticationException:
+        remove_pin(ip)
+        with terminal.lock:
+            terminal.history.append("[-] Error: Authentication failed. Stored PIN cleared.")
+        terminal.needs_pin_prompt = True
+    except Exception as e:
+        remove_pin(ip)
+        with terminal.lock:
+            terminal.history.append(f"[-] Error: SSH connection failed: {e}")
+        terminal.needs_pin_prompt = True
+
 # ================== MENU ==================
 def run_menu(screen, clock):
     font_big = pygame.font.SysFont(None, 64)
@@ -805,7 +733,6 @@ def run_stream(screen, clock, ip):
     full_term_btn = Button(STREAM_SIZE[0] - 520, 18, 240, 52, "Toggle Full Terminal", (60, 60, 80), (90, 90, 110))
     
     terminal = IntegratedTerminal(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
-    terminal.ip = ip 
 
     vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
     target_size = (vid_rect[2], vid_rect[3])
@@ -817,11 +744,17 @@ def run_stream(screen, clock, ip):
     prompting_pin = False
     pin_buffer = ""
 
+    # Pre-allocate dim surface; rebuilt on resize
+    dim_surf = pygame.Surface(STREAM_SIZE, pygame.SRCALPHA)
+    dim_surf.fill((0, 0, 0, 120))
+
     while running:
         cur_size = screen.get_size()
         if cur_size != STREAM_SIZE or force_resize:
             STREAM_SIZE = cur_size
-            
+            dim_surf = pygame.Surface(STREAM_SIZE, pygame.SRCALPHA)
+            dim_surf.fill((0, 0, 0, 120))
+
             if terminal.fullscreen_mode:
                 terminal.rect = pygame.Rect(0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 80)
                 vid_rect = (0, 0, 0, 0)
@@ -830,7 +763,6 @@ def run_stream(screen, clock, ip):
                 target_size = (max(1, vid_rect[2]), max(1, vid_rect[3]))
                 terminal.rect = pygame.Rect(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
                 
-            # Dynamic button alignment
             shell_btn.rect.x = STREAM_SIZE[0] - shell_btn.rect.w - 20 
             full_term_btn.rect.x = shell_btn.rect.x - full_term_btn.rect.w - 20
             
@@ -885,10 +817,8 @@ def run_stream(screen, clock, ip):
             
             p_font = pygame.font.SysFont("consolas", 20)
             txt1 = p_font.render("Enter Visual Studio PIN:", True, (255, 255, 255))
-            
             cursor = "_" if time.time() % 1 > 0.5 else ""
             txt2 = p_font.render(">" + pin_buffer + cursor, True, (0, 255, 120))
-            
             screen.blit(txt1, (overlay_x + 20, overlay_y + 30))
             screen.blit(txt2, (overlay_x + 20, overlay_y + 80))
 
@@ -898,32 +828,24 @@ def run_stream(screen, clock, ip):
             overlay_x = (STREAM_SIZE[0] - overlay_w) // 2
             overlay_y = (STREAM_SIZE[1] - overlay_h) // 2
 
-            # Dim the background slightly
-            dim = pygame.Surface((STREAM_SIZE[0], STREAM_SIZE[1]), pygame.SRCALPHA)
-            dim.fill((0, 0, 0, 120))
-            screen.blit(dim, (0, 0))
-
+            screen.blit(dim_surf, (0, 0))
             pygame.draw.rect(screen, (45, 15, 15), (overlay_x, overlay_y, overlay_w, overlay_h), border_radius=12)
             pygame.draw.rect(screen, (200, 60, 60), (overlay_x, overlay_y, overlay_w, overlay_h), 3, border_radius=12)
 
             p_font = pygame.font.SysFont("consolas", 19, bold=True)
             s_font = pygame.font.SysFont("consolas", 17)
 
-            title_surf  = p_font.render("⚠  Xbox Sandbox is hung", True, (255, 100, 100))
-            sub_surf    = s_font.render("The daemon failed to recover after 5 retries.", True, (200, 200, 200))
-            enter_surf  = s_font.render("ENTER  —  Reboot console remotely", True, (255, 255, 255))
-            esc_surf    = s_font.render("ESC    —  Dismiss", True, (130, 130, 130))
-
-            screen.blit(title_surf, (overlay_x + 20, overlay_y + 22))
-            screen.blit(sub_surf,   (overlay_x + 20, overlay_y + 60))
-
-            # Divider
+            screen.blit(p_font.render("!  Xbox Sandbox is hung", True, (255, 100, 100)),
+                        (overlay_x + 20, overlay_y + 22))
+            screen.blit(s_font.render("The daemon failed to recover after 5 retries.", True, (200, 200, 200)),
+                        (overlay_x + 20, overlay_y + 60))
             pygame.draw.line(screen, (80, 40, 40),
                              (overlay_x + 20, overlay_y + 95),
                              (overlay_x + overlay_w - 20, overlay_y + 95), 1)
-
-            screen.blit(enter_surf, (overlay_x + 20, overlay_y + 112))
-            screen.blit(esc_surf,   (overlay_x + 20, overlay_y + 155))
+            screen.blit(s_font.render("ENTER  —  Reboot console remotely", True, (255, 255, 255)),
+                        (overlay_x + 20, overlay_y + 112))
+            screen.blit(s_font.render("ESC    —  Dismiss", True, (130, 130, 130)),
+                        (overlay_x + 20, overlay_y + 155))
 
         pygame.display.flip()
 
@@ -940,40 +862,46 @@ def run_stream(screen, clock, ip):
                     filepath = event.file
                     threading.Thread(target=terminal.upload_file, args=(filepath,), daemon=True).start()
                 else:
-                    terminal.add_line("[-] Connect Dev Shell first to upload files.")
+                    with terminal.lock:
+                        terminal.history.append("[-] Connect Dev Shell first to upload files.")
 
-            # ── Reboot popup key handling (highest priority) ────────────────
+            # ── Reboot popup: blocks all other input while visible ──────────
             if terminal.needs_reboot_prompt:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         terminal.needs_reboot_prompt = False
-                        terminal.add_line("[-] Reboot dismissed.")
+                        with terminal.lock:
+                            terminal.history.append("[-] Reboot dismissed.")
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         terminal.needs_reboot_prompt = False
                         terminal.retry_count = 0
-                        try:
-                            requests.post(f"https://{ip}:11443/ext/power?action=reboot",
-                                          verify=False, timeout=3)
-                            terminal.add_line("[+] Reboot command sent! Waiting for console to restart...")
-                        except Exception as e:
-                            terminal.add_line(f"[-] Reboot failed: {e}")
-                continue  # block all other input while popup is up
+                        def do_reboot(target_ip):
+                            try:
+                                requests.post(f"https://{target_ip}:11443/ext/power?action=reboot",
+                                              verify=False, timeout=3)
+                                with terminal.lock:
+                                    terminal.history.append("[+] Reboot command sent! Waiting for console to restart...")
+                            except Exception as ex:
+                                with terminal.lock:
+                                    terminal.history.append(f"[-] Reboot failed: {ex}")
+                        threading.Thread(target=do_reboot, args=(ip,), daemon=True).start()
+                continue  # swallow all events while reboot popup is open
 
             # ── PIN popup key handling ──────────────────────────────────────
             if prompting_pin:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         prompting_pin = False
-                        terminal.add_line("[-] PIN entry cancelled.")
+                        with terminal.lock: terminal.history.append("[-] PIN entry cancelled.")
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         clean_pin = pin_buffer.strip()
                         if clean_pin:
                             prompting_pin = False
-                            terminal.add_line("[*] Connecting via SSH...")
+                            with terminal.lock: terminal.history.append("[*] Connecting via SSH...")
                             threading.Thread(target=connect_ssh, args=(ip, clean_pin, terminal, True), daemon=True).start()
                             pin_buffer = ""
                         else:
-                            terminal.add_line("[-] PIN required.")
+                            with terminal.lock: terminal.history.append("[-] PIN required.")
                             prompting_pin = False
                     elif event.key == pygame.K_BACKSPACE:
                         pin_buffer = pin_buffer[:-1]
@@ -1005,7 +933,7 @@ def run_stream(screen, clock, ip):
                     if shell_btn.clicked((mx, my)) and not terminal.connected:
                         saved_pin = load_pin(ip)
                         if saved_pin:
-                            terminal.add_line("[*] Found saved PIN. Authenticating in background...")
+                            with terminal.lock: terminal.history.append("[*] Found saved PIN. Authenticating in background...")
                             threading.Thread(target=connect_ssh, args=(ip, saved_pin, terminal, False), daemon=True).start()
                         else:
                             prompting_pin = True
@@ -1019,7 +947,7 @@ def run_stream(screen, clock, ip):
                         force_resize = True
                         
             if event.type == pygame.KEYDOWN:
-                if terminal.focused:
+                if terminal.focused and terminal.connected:
                     terminal.handle_key(event)
                 else:
                     mx, my = pygame.mouse.get_pos()
