@@ -39,7 +39,7 @@ SPLITTER_HEIGHT = 10
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(REPO_ROOT, "build")
 LOCAL_PACKAGE_DIR = os.path.join(BUILD_DIR, "package", "Xbax")
-REMOTE_INSTALL_DIR = "D:/DevelopmentFiles/Xbax"
+REMOTE_INSTALL_DIR = "D:/DevelopmentFiles/Sandbox/Xbax"
 REMOTE_INSTALL_MANIFEST = ".xbax-install-manifest.json"
 REMOTE_INSTALL_BUNDLE = ".xbax-install-bundle.zip"
 BS_RELAY_LISTEN = "0.0.0.0:17777"
@@ -1060,7 +1060,7 @@ class IntegratedTerminal:
             return
         commands = [
             b"d:\r\n",
-            b"cd \\DevelopmentFiles\\Xbax\r\n",
+            b"cd \\DevelopmentFiles\\Sandbox\\Xbax\r\n",
             b"dir\r\n",
         ]
         for cmd in commands:
