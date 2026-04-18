@@ -357,9 +357,12 @@ func injectLegacyMingwIncludes(argv []string, triple string) []string {
 	if cxxVerDir := findHighestVersionDir(filepath.Join(include, "c++")); cxxVerDir != "" {
 		includes = append(includes, cxxVerDir)
 		// libstdc++ pulls bits/ from a target subdir.
-		targetSub := filepath.Join(cxxVerDir, triple)
-		if _, err := os.Stat(targetSub); err == nil {
-			includes = append(includes, targetSub)
+		for _, alias := range tripleAliases(triple) {
+			targetSub := filepath.Join(cxxVerDir, alias)
+			if _, err := os.Stat(targetSub); err == nil {
+				includes = append(includes, targetSub)
+				break
+			}
 		}
 	}
 	includes = append(includes, include)
