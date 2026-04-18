@@ -87,6 +87,48 @@ Then build a local Go workspace through it:
 cliant http://<server-ip>:17777 build . -goos windows -goarch amd64 -o myapp.exe
 ```
 
+## Manual HelloBax Test Flow
+
+Use this flow when you want to manually prove that `cliant` can send a Go project to `sarver`, have it compiled remotely, and receive the built artifact back on your host machine.
+
+1. Build the repo outputs first so you have:
+   `build/package/Xbax/sarver/sarver.exe`
+   `build/host/cliant/cliant` on macOS/Linux hosts, or `build/host/cliant/cliant.exe` on Windows hosts.
+2. Copy the packaged Xbax tree to the remote machine so `sarver.exe` and `campiler/` are present together.
+3. Start the compiler server on the remote machine:
+
+```bash
+sarver.exe -listen 0.0.0.0:17777
+```
+
+4. On the host machine, open the sample project:
+
+```bash
+cd HelloBax
+```
+
+5. Run the host `cliant` against the remote server.
+
+For a Windows build:
+
+```bash
+../build/host/cliant/cliant http://<server-ip>:17777 build . -goos windows -goarch amd64 -o myapp.exe
+```
+
+For macOS on this host (`darwin/amd64`):
+
+```bash
+../build/host/cliant/cliant http://<server-ip>:17777 build . -goos darwin -goarch amd64 -o myapp
+```
+
+If you want Apple Silicon output instead, use:
+
+```bash
+../build/host/cliant/cliant http://<server-ip>:17777 build . -goos darwin -goarch arm64 -o myapp
+```
+
+`HelloBax` is the smallest manual test target in this repo and prints `Hello Bax`.
+
 ## Licensing
 
 Project-specific files in this repository are covered by the Microsoft Public License in [LICENSE.MD](./LICENSE.MD).
