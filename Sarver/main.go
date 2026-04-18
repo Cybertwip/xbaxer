@@ -58,6 +58,7 @@ type buildExecution struct {
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:17777", "listen address")
 	reverseURL := flag.String("reverse", "", "reverse relay URL to pull build jobs from")
+	probeMode := flag.Bool("probe", false, "run the Xbox-firewall probe (binds every allowlisted port and logs inbound connections); pair with `cliant probe <xbox-ip>` from the host")
 	goBinary := flag.String("go", defaultGoBinaryPath(), "path to the Go executable used for builds")
 	cacheRoot := flag.String("cache-dir", defaultCacheRoot(), "directory used for Go build and module caches")
 	timeout := flag.Duration("timeout", 10*time.Minute, "maximum time allowed per build")
@@ -85,6 +86,13 @@ func main() {
 
 	log.Printf("sarver go binary: %s", *goBinary)
 	log.Printf("sarver cache root: %s", cacheRootPath)
+
+	if *probeMode {
+		if err := runProbe(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if srv.reverseURL != "" {
 		log.Printf("sarver reverse mode enabled; relay=%s", srv.reverseURL)

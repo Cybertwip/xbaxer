@@ -4,6 +4,7 @@ import numpy as np
 import websocket
 import threading
 import ssl
+import sys
 import time
 import os
 import queue
@@ -1413,7 +1414,259 @@ def run_stream(screen, clock, ip):
     terminal.close()
 
 # ================== MAIN ==================
+# ================== CLI ==================
+#
+# `main.py <subcommand> [...]` runs headlessly without bringing up pygame.
+# `main.py` with no arguments still starts the GUI as before.
+#
+# The CLI reuses the existing IntegratedTerminal install/upload logic by
+# subclassing it with a headless variant that skips pygame and prints log
+# lines straight to stdout.
+
+CLI_USAGE = """\
+Usage:
+  main.py                           # launch the GUI (default)
+  main.py scan [--timeout S]        # scan the LAN and print discovered devkits
+  main.py creds <ip>                # fetch DevToolsUser credentials from <ip>
+  main.py exec  <ip> <cmd> [args..] # run a command on <ip> via SSH and print output
+  main.py upload <ip> <local> [remote-dir]
+                                    # SFTP-upload a single file (default dir: D:/DevelopmentFiles/Sandbox)
+  main.py install <ip>              # build the Xbax package and sync it to <ip>
+  main.py reboot <ip>               # POST a reboot to <ip>:11443
+  main.py -h | --help               # show this message
+"""
+
+class HeadlessTerminal(IntegratedTerminal):
+    """IntegratedTerminal stripped of pygame; reuses the SSH/install/upload code."""
+
+    def __init__(self):
+        # Skip the pygame.Rect/SysFont calls in the base __init__ — none of
+        # the methods we reuse from the CLI touch the rendering state.
+        self.history = []
+        self.lock = threading.Lock()
+        self.cols = 140
+        self.rows = 40
+        self.grid = [[' ' for _ in range(self.cols)] for _ in range(self.rows)]
+
+        self.cx = 0
+        self.cy = 0
+        self.input_buffer = ""
+
+        self.sock = None
+        self.ssh_client = None
+        self.connected = False
+        self.intentional_disconnect = False
+        self.focused = False
+        self.fullscreen_mode = False
+        self.raw_input_mode = False
+        self.scroll_offset = 0
+        self.needs_pin_prompt = False
+        self.needs_reboot_prompt = False
+        self.retry_count = 0
+        self.ip = None
+        self.pin = None
+        self.installing = False
+
+        self._dirty = False
+        self._cached_surf = None
+        self._last_focused = None
+        self._last_scroll = None
+        self._last_rect = None
+
+    def _mark_dirty(self):
+        pass
+
+    def log(self, message):
+        with self.lock:
+            self.history.append(message)
+        print(message, flush=True)
+
+    def _open_remote_install_dir(self):
+        # No-op in CLI mode — we never have an active telnet session.
+        return
+
+def _cli_connect_ssh(ip, timeout=12):
+    """Open an SSH connection to <ip> using credentials fetched from the devkit.
+
+    Returns (paramiko.SSHClient, username) or raises RuntimeError.
+    """
+    user, pwd = fetch_dev_credentials(ip)
+    if not pwd:
+        raise RuntimeError(f"could not fetch dev credentials from https://{ip}:11443/ext/smb/developerfolder")
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, 22, user or "DevToolsUser", pwd, timeout=timeout)
+    except paramiko.AuthenticationException as exc:
+        raise RuntimeError(f"SSH authentication failed: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"SSH connection failed: {exc}") from exc
+    ssh.get_transport().set_keepalive(SSH_KEEPALIVE_INTERVAL)
+    return ssh, (user or "DevToolsUser")
+
+def _cli_scan(args):
+    timeout = 6.0
+    i = 0
+    while i < len(args):
+        if args[i] in ("--timeout", "-t") and i + 1 < len(args):
+            try:
+                timeout = float(args[i + 1])
+            except ValueError:
+                print(f"invalid timeout: {args[i + 1]}", file=sys.stderr)
+                return 2
+            i += 2
+        else:
+            print(f"unknown argument: {args[i]}", file=sys.stderr)
+            return 2
+
+    consoles = []
+    done = threading.Event()
+    threading.Thread(
+        target=scan_network_async,
+        args=(consoles, done.set),
+        daemon=True,
+    ).start()
+    if not done.wait(timeout=timeout):
+        print(f"scan still running after {timeout}s; printing partial results", file=sys.stderr)
+
+    if not consoles:
+        print("no devkits discovered", file=sys.stderr)
+        return 1
+    for entry in consoles:
+        if isinstance(entry, tuple) and len(entry) >= 2:
+            ip, hostname = entry[0], entry[1]
+            print(f"{ip:<16} {hostname}")
+        elif isinstance(entry, dict):
+            print(f"{entry.get('ip','?'):<16} {entry.get('hostname','')}")
+        else:
+            print(entry)
+    return 0
+
+def _cli_creds(args):
+    if not args:
+        print("missing <ip>", file=sys.stderr); return 2
+    ip = args[0]
+    user, pwd = fetch_dev_credentials(ip)
+    if not pwd:
+        print(f"could not fetch credentials from {ip}", file=sys.stderr)
+        return 1
+    print(json.dumps({"ip": ip, "username": user, "password": pwd}))
+    return 0
+
+def _cli_exec(args):
+    if len(args) < 2:
+        print("usage: main.py exec <ip> <cmd> [args...]", file=sys.stderr); return 2
+    ip = args[0]
+    command = " ".join(args[1:])
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    try:
+        _, stdout, stderr = ssh.exec_command(command, timeout=60)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        rc = stdout.channel.recv_exit_status()
+        if out:
+            sys.stdout.write(out)
+        if err:
+            sys.stderr.write(err)
+        return rc
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+def _cli_upload(args):
+    if len(args) < 2:
+        print("usage: main.py upload <ip> <local-file> [remote-dir]", file=sys.stderr); return 2
+    ip = args[0]
+    local_file = args[1]
+    remote_dir = args[2] if len(args) >= 3 else "D:/DevelopmentFiles/Sandbox"
+    if not os.path.isfile(local_file):
+        print(f"local file not found: {local_file}", file=sys.stderr); return 1
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    try:
+        term = HeadlessTerminal()
+        term.ssh_client = ssh
+        term.upload_file(local_file)
+        # upload_file logs success/failure via term.log → stdout. Detect
+        # failure by scanning the captured history for the "[-] Upload" tag.
+        for line in term.history:
+            if line.startswith("[-] Upload"):
+                return 1
+        return 0
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+def _cli_install(args):
+    if not args:
+        print("usage: main.py install <ip>", file=sys.stderr); return 2
+    ip = args[0]
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    try:
+        term = HeadlessTerminal()
+        term.ssh_client = ssh
+        term.connected = True  # has_active_ssh checks transport; install_package also gates on this flag
+        term.ip = ip
+        term.install_package()
+        for line in term.history:
+            if line.startswith("[-] Install"):
+                return 1
+        return 0
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+def _cli_reboot(args):
+    if not args:
+        print("usage: main.py reboot <ip>", file=sys.stderr); return 2
+    ip = args[0]
+    try:
+        res = requests.post(f"https://{ip}:11443/ext/power?action=reboot",
+                            verify=False, timeout=5)
+        if res.status_code >= 400:
+            print(f"reboot failed: HTTP {res.status_code}", file=sys.stderr); return 1
+        print(f"reboot requested for {ip}")
+        return 0
+    except Exception as exc:
+        print(f"reboot failed: {exc}", file=sys.stderr); return 1
+
+CLI_COMMANDS = {
+    "scan":    _cli_scan,
+    "creds":   _cli_creds,
+    "exec":    _cli_exec,
+    "upload":  _cli_upload,
+    "install": _cli_install,
+    "reboot":  _cli_reboot,
+}
+
+def run_cli(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(CLI_USAGE)
+        return 0
+    cmd = argv[0]
+    handler = CLI_COMMANDS.get(cmd)
+    if handler is None:
+        sys.stderr.write(f"unknown command: {cmd}\n\n{CLI_USAGE}")
+        return 2
+    return handler(argv[1:])
+
 def main():
+    # CLI mode: any positional arg → run a headless command and exit.
+    # No args → start the pygame GUI as before.
+    # `-h`/`--help`/`help` are also routed to the CLI usage banner.
+    if len(sys.argv) > 1 and (
+        not sys.argv[1].startswith("-") or sys.argv[1] in ("-h", "--help")
+    ):
+        sys.exit(run_cli(sys.argv[1:]))
+
     os.environ['SDL_VIDEO_CENTERED'] = '1'
     pygame.init()
     info = pygame.display.Info()

@@ -107,6 +107,8 @@ func run(args []string) error {
 			return err
 		}
 		return runServe(opts)
+	case "probe":
+		return runProbe(args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
@@ -852,6 +854,7 @@ func normalizeCGO(value string) string {
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "  cliant serve [-listen 0.0.0.0:17777] [-max-upload-mib 256]")
+	fmt.Fprintln(os.Stderr, "  cliant probe <xbox-ip>")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> build [path] [-o output] [-pkg target] [-goos os] [-goarch arch] [-cgo 0|1] [-timeout 10m]")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> health")
 }

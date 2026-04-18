@@ -163,7 +163,7 @@ cd \DevelopmentFiles\Xbax\sarver
 sarver.exe -reverse http://<host-ip>:17777
 ```
 
-If the host relay is reachable at `http://127.0.0.1:17777` from the Xbox (e.g. through a tunnel), running `sarver.exe` with no flags is enough. To force the legacy push-mode HTTP server instead, pass `-listen 0.0.0.0:17777` explicitly. On startup the log prints `sarver reverse mode enabled; relay=...` and `sarver will pull build jobs from the host relay`.
+If the host relay is reachable at `http://127.0.0.1:17777` from the Xbox (e.g. through a tunnel), running `sarver.exe` with no flags is enough. To force the legacy push-mode HTTP server instead, pass `-listen 0.0.0.0:3074` explicitly. The Xbox devkit firewall only opens a fixed list of inbound ports (53, 80, 3074, 3544, 4500); 3074 is the only one in that list that is TCP-allowed and not already used by the devkit's own services. Anything outside that list (e.g. 17777) will bind successfully on the console but inbound packets will be dropped at the firewall, so `sarver` will appear up while no remote client can connect. The reverse-poll relay on your host machine is unaffected by this restriction because the Xbox initiates the connection outward. On startup the log prints `sarver reverse mode enabled; relay=...` and `sarver will pull build jobs from the host relay`.
 
 6. On the host machine, open the sample project and submit a build to your own relay (`http://127.0.0.1:17777` from the same machine, or `http://<host-ip>:17777` from another host on the LAN):
 
