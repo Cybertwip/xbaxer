@@ -42,6 +42,7 @@ LOCAL_PACKAGE_DIR = os.path.join(BUILD_DIR, "package", "Xbax")
 REMOTE_INSTALL_DIR = "D:/DevelopmentFiles/Sandbox/Xbax"
 REMOTE_INSTALL_MANIFEST = ".xbax-install-manifest.json"
 REMOTE_INSTALL_BUNDLE = ".xbax-install-bundle.zip"
+REMOTE_BOOTSTRAP_DIRNAME = ".xbax-bootstrap"
 BS_RELAY_LISTEN = "0.0.0.0:17777"
 BS_RELAY_PORT = 17777
 REMOTE_SARVER_DIR = REMOTE_INSTALL_DIR + "/sarver"
@@ -779,8 +780,17 @@ class IntegratedTerminal:
     def _remote_manifest_path(self, remote_dir):
         return remote_dir.rstrip("/") + "/" + REMOTE_INSTALL_MANIFEST
 
+    def _remote_install_parent_dir(self, remote_dir):
+        remote_dir = remote_dir.replace("\\", "/").rstrip("/")
+        parent = os.path.dirname(remote_dir)
+        return parent.replace("\\", "/") if parent else remote_dir
+
+    def _remote_bootstrap_dir(self, remote_dir):
+        parent = self._remote_install_parent_dir(remote_dir).rstrip("/")
+        return parent + "/" + REMOTE_BOOTSTRAP_DIRNAME if parent else REMOTE_BOOTSTRAP_DIRNAME
+
     def _remote_bundle_path(self, remote_dir):
-        return remote_dir.rstrip("/") + "/" + REMOTE_INSTALL_BUNDLE
+        return self._remote_bootstrap_dir(remote_dir).rstrip("/") + "/" + REMOTE_INSTALL_BUNDLE
 
     def _is_windows_safe_relpath(self, rel_path):
         invalid_chars = set('<>:"|?*')
@@ -906,62 +916,96 @@ class IntegratedTerminal:
         # cmd.exe quoting: wrap in double quotes and escape any embedded ones.
         return '"' + value.replace('"', '\\"') + '"'
 
-    def _local_anzipper_path(self):
+    def _local_bootstrap_tool_path(self, tool_name):
         # Search the actual package layout produced by cmake. Some tools land
         # in <name>/bin/<name>.exe (cleng, sarver, cliant), others land in
         # <name>/<name>.exe (anzipper, gatter). Try both.
         candidates = [
-            os.path.join(LOCAL_PACKAGE_DIR, "anzipper", "anzipper.exe"),
-            os.path.join(LOCAL_PACKAGE_DIR, "anzipper", "bin", "anzipper.exe"),
+            os.path.join(LOCAL_PACKAGE_DIR, tool_name, tool_name + ".exe"),
+            os.path.join(LOCAL_PACKAGE_DIR, tool_name, "bin", tool_name + ".exe"),
         ]
         for path in candidates:
             if os.path.isfile(path):
                 return path
         return candidates[0]
 
-    def _remote_anzipper_path(self, remote_dir):
-        # Drop anzipper.exe at the install-dir root so the same path works
-        # regardless of which subdirectory the bundle restores into.
-        return remote_dir.rstrip("/") + "/anzipper.exe"
+    def _local_anzipper_path(self):
+        return self._local_bootstrap_tool_path("anzipper")
 
-    def _ensure_remote_anzipper(self, remote_dir):
-        """Upload anzipper.exe via SFTP if it isn't already present remotely.
+    def _local_cleener_path(self):
+        return self._local_bootstrap_tool_path("cleener")
+
+    def _remote_bootstrap_tool_path(self, remote_dir, tool_name):
+        return self._remote_bootstrap_dir(remote_dir).rstrip("/") + "/" + tool_name + ".exe"
+
+    def _remote_anzipper_path(self, remote_dir):
+        return self._remote_bootstrap_tool_path(remote_dir, "anzipper")
+
+    def _remote_cleener_path(self, remote_dir):
+        return self._remote_bootstrap_tool_path(remote_dir, "cleener")
+
+    def _ensure_remote_bootstrap_tool(self, remote_dir, tool_name):
+        """Upload a bootstrap helper beside the remote bundle if needed.
 
         The Xbox dev image ships without PowerShell, so we use our own Go
-        unzipper as the canonical extraction tool. anzipper.exe is part of
-        the package we're installing, but we need it *before* the bundle is
-        expanded — hence this bootstrap step.
+        helper binaries as the canonical bundle bootstrap tools. They are
+        part of the package we're installing, but we need them *before* the
+        bundle is expanded — hence this out-of-tree bootstrap directory.
         """
-        local_anzipper = self._local_anzipper_path()
-        if not os.path.isfile(local_anzipper):
+        local_tool = self._local_bootstrap_tool_path(tool_name)
+        if not os.path.isfile(local_tool):
             raise RuntimeError(
-                f"anzipper.exe not found at {local_anzipper}; "
-                "run `cmake --build build --target anzipper` first"
+                f"{tool_name}.exe not found at {local_tool}; "
+                f"run `cmake --build build --target {tool_name}` first"
             )
-        remote_anzipper = self._remote_anzipper_path(remote_dir)
+        remote_tool = self._remote_bootstrap_tool_path(remote_dir, tool_name)
+        remote_bootstrap_dir = self._remote_bootstrap_dir(remote_dir)
         sftp = self.ssh_client.open_sftp()
         try:
-            self._remote_mkdirs(sftp, remote_dir)
-            local_size = os.path.getsize(local_anzipper)
+            self._remote_mkdirs(sftp, remote_bootstrap_dir)
+            local_size = os.path.getsize(local_tool)
             try:
-                remote_stat = sftp.stat(remote_anzipper)
+                remote_stat = sftp.stat(remote_tool)
             except IOError:
                 remote_stat = None
             if remote_stat is None or remote_stat.st_size != local_size:
-                self.log("[*] Bootstrapping anzipper.exe on the remote machine...")
-                sftp.put(local_anzipper, remote_anzipper)
+                self.log(f"[*] Bootstrapping {tool_name}.exe on the remote machine...")
+                sftp.put(local_tool, remote_tool)
         finally:
             sftp.close()
-        return remote_anzipper
+        return remote_tool
+
+    def _ensure_remote_anzipper(self, remote_dir):
+        return self._ensure_remote_bootstrap_tool(remote_dir, "anzipper")
+
+    def _ensure_remote_cleener(self, remote_dir):
+        return self._ensure_remote_bootstrap_tool(remote_dir, "cleener")
+
+    def _wipe_remote_install_dir(self, remote_dir):
+        remote_dir_windows = remote_dir.replace("/", "\\")
+        remote_cleener = self._ensure_remote_cleener(remote_dir).replace("/", "\\")
+        self.log("[*] Removing existing remote Xbax folder with cleener.exe...")
+        command = (
+            f'cmd /c if exist {self._cmd_quote(remote_dir_windows)} '
+            f'({self._cmd_quote(remote_cleener)} -path {self._cmd_quote(remote_dir_windows)}) '
+            f'else (exit /b 0)'
+        )
+        exit_status, output, error = self._run_remote_command(command)
+        if exit_status != 0:
+            raise RuntimeError((error or output or "remote cleanup failed").strip())
+        if output.strip():
+            self.log(f"[*] {output.strip()}")
 
     def _extract_remote_bundle(self, remote_dir):
         remote_bundle_path = self._remote_bundle_path(remote_dir).replace("/", "\\")
         remote_dir_windows = remote_dir.replace("/", "\\")
         remote_anzipper = self._ensure_remote_anzipper(remote_dir).replace("/", "\\")
 
+        self._wipe_remote_install_dir(remote_dir)
+
         # anzipper handles directory creation, zip-slip protection, and
-        # symlink/irregular-entry rejection. Two commands chained with `&&`
-        # so we only delete the bundle on a successful extract.
+        # symlink/irregular-entry rejection. The bundle lives in a sibling
+        # bootstrap directory so we can wipe the install root beforehand.
         command = (
             f"{self._cmd_quote(remote_anzipper)} "
             f"-zip {self._cmd_quote(remote_bundle_path)} "
@@ -974,8 +1018,10 @@ class IntegratedTerminal:
         if output.strip():
             self.log(f"[*] {output.strip()}")
 
-    def _upload_files_individually(self, remote_dir, changed_files, manifest, skipped):
+    def _upload_files_individually(self, remote_dir, changed_files, manifest, skipped, wipe_first=False):
         uploaded = 0
+        if wipe_first:
+            self._wipe_remote_install_dir(remote_dir)
         sftp = self.ssh_client.open_sftp()
         try:
             self._remote_mkdirs(sftp, remote_dir)
@@ -1028,27 +1074,31 @@ class IntegratedTerminal:
             self.log(f"[+] Remote install already current. Skipped all {skipped} packaged file(s).")
             return 0, skipped
 
-        bundle_path = self._create_install_bundle(changed_files, next_manifest)
+        bundle_path = self._create_install_bundle(files, local_manifest)
         bundle_size = os.path.getsize(bundle_path)
         remote_bundle_path = self._remote_bundle_path(remote_dir)
         try:
             self.log(
-                f"[*] Uploading {len(changed_files)} changed file(s) as one compressed bundle "
-                f"({self._format_size(bundle_size)}); {skipped} already current..."
+                f"[*] {len(changed_files)} packaged file(s) changed; "
+                f"uploading a full clean-install bundle with {len(files)} file(s)."
+            )
+            self.log(
+                f"[*] Uploading bootstrap bundle ({self._format_size(bundle_size)}) "
+                f"to refresh {remote_dir} from scratch..."
             )
             sftp = self.ssh_client.open_sftp()
             try:
-                self._remote_mkdirs(sftp, remote_dir)
+                self._remote_mkdirs(sftp, self._remote_bootstrap_dir(remote_dir))
                 sftp.put(bundle_path, remote_bundle_path)
             finally:
                 sftp.close()
 
             self.log("[*] Expanding install bundle on the remote machine...")
             self._extract_remote_bundle(remote_dir)
-            return len(changed_files), skipped
+            return len(files), 0
         except Exception as exc:
             self.log(f"[*] Bundle install fallback activated: {exc}")
-            return self._upload_files_individually(remote_dir, changed_files, next_manifest, skipped)
+            return self._upload_files_individually(remote_dir, files, local_manifest, 0, wipe_first=True)
         finally:
             try:
                 os.remove(bundle_path)
