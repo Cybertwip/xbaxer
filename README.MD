@@ -7,6 +7,8 @@ It currently contains:
 - `main.py`: a Python desktop client for live video, remote input, PIN-based dev-shell access, and file upload to the sandbox.
 - `go/`: a vendored Go 1.24.13 source tree used to build a custom toolchain during the CMake build.
 - `dastrabution/`: a Go command that links against `github.com/go-git/go-git/v5` and is cross-compiled as a Windows PE executable.
+- `anzipper/`: a Go command for listing and safely extracting `.zip` archives.
+- `gatter/`: a Go command for HTTP/HTTPS downloads, similar to a very small single-purpose fetch client.
 - `campiler/`: packaging helpers for producing a Windows-targeted Go bootstrap/toolchain tree from the previously built host Go toolchain.
 
 ## Requirements
@@ -54,6 +56,8 @@ The default build packages these outputs:
 - `build/package/Xbax/campiler/bin/gofmt.exe`
 - `build/package/Xbax/campiler/pkg/tool/windows_amd64/...`
 - `build/package/Xbax/dastrabution/dastrabution.exe`
+- `build/package/Xbax/anzipper/anzipper.exe`
+- `build/package/Xbax/gatter/gatter.exe`
 
 ## Notes
 

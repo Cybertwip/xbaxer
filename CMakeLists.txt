@@ -22,6 +22,17 @@ set(CAMPILER_OUTPUT_DIR "${XBAX_PACKAGE_DIR}/campiler")
 set(CAMPILER_OUTPUT "${CAMPILER_OUTPUT_DIR}/bin/go.exe")
 set(CAMPILER_SCRIPT "${CMAKE_SOURCE_DIR}/campiler/build-campiler.sh")
 
+set(XBAX_GO_BUILD_ENV
+  "GOROOT=${GO_ROOT_DIR}"
+  "GOTOOLCHAIN=local"
+  "GOCACHE=${CMAKE_BINARY_DIR}/go-cache"
+  "GOMODCACHE=${CMAKE_BINARY_DIR}/go-mod-cache"
+  "GOPATH=${CMAKE_BINARY_DIR}/go-path"
+  "GOOS=windows"
+  "GOARCH=amd64"
+  "CGO_ENABLED=0"
+)
+
 add_custom_command(
   OUTPUT "${CAMPILER_OUTPUT}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${XBAX_PACKAGE_DIR}"
@@ -41,42 +52,41 @@ add_custom_command(
 add_custom_target(campiler DEPENDS "${CAMPILER_OUTPUT}")
 set_target_properties(campiler PROPERTIES FOLDER "Apps")
 
-set(DASTRABUTION_SOURCE_DIR "${CMAKE_SOURCE_DIR}/dastrabution")
-set(DASTRABUTION_OUTPUT_DIR "${XBAX_PACKAGE_DIR}/dastrabution")
-set(DASTRABUTION_OUTPUT "${DASTRABUTION_OUTPUT_DIR}/dastrabution.exe")
-
-set(DASTRABUTION_GO_ENV
-  "GOROOT=${GO_ROOT_DIR}"
-  "GOTOOLCHAIN=local"
-  "GOCACHE=${CMAKE_BINARY_DIR}/go-cache"
-  "GOMODCACHE=${CMAKE_BINARY_DIR}/go-mod-cache"
-  "GOPATH=${CMAKE_BINARY_DIR}/go-path"
-  "GOOS=windows"
-  "GOARCH=amd64"
-  "CGO_ENABLED=0"
-)
-
-add_custom_command(
-  OUTPUT "${DASTRABUTION_OUTPUT}"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-cache"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-mod-cache"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-path"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${DASTRABUTION_OUTPUT_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E env ${DASTRABUTION_GO_ENV}
-          "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
-          -o "${DASTRABUTION_OUTPUT}" .
-  DEPENDS
+function(add_xbax_windows_go_tool tool_name)
+  set(_source_dir "${CMAKE_SOURCE_DIR}/${tool_name}")
+  set(_output_dir "${XBAX_PACKAGE_DIR}/${tool_name}")
+  set(_output "${_output_dir}/${tool_name}.exe")
+  set(_deps
     go-toolchain
-    "${DASTRABUTION_SOURCE_DIR}/go.mod"
-    "${DASTRABUTION_SOURCE_DIR}/go.sum"
-    "${DASTRABUTION_SOURCE_DIR}/main.go"
-  WORKING_DIRECTORY "${DASTRABUTION_SOURCE_DIR}"
-  COMMENT "Building dastrabution.exe with the custom Go toolchain"
-  VERBATIM
-)
+    "${_source_dir}/go.mod"
+    "${_source_dir}/main.go"
+  )
+  if(EXISTS "${_source_dir}/go.sum")
+    list(APPEND _deps "${_source_dir}/go.sum")
+  endif()
 
-add_custom_target(dastrabution DEPENDS "${DASTRABUTION_OUTPUT}")
-set_target_properties(dastrabution PROPERTIES FOLDER "Apps")
+  add_custom_command(
+    OUTPUT "${_output}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-cache"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-mod-cache"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-path"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_output_dir}"
+    COMMAND ${CMAKE_COMMAND} -E env ${XBAX_GO_BUILD_ENV}
+            "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
+            -o "${_output}" .
+    DEPENDS ${_deps}
+    WORKING_DIRECTORY "${_source_dir}"
+    COMMENT "Building ${tool_name}.exe with the custom Go toolchain"
+    VERBATIM
+  )
 
-add_custom_target(package-xbax ALL DEPENDS campiler dastrabution)
+  add_custom_target("${tool_name}" DEPENDS "${_output}")
+  set_target_properties("${tool_name}" PROPERTIES FOLDER "Apps")
+endfunction()
+
+add_xbax_windows_go_tool(dastrabution)
+add_xbax_windows_go_tool(anzipper)
+add_xbax_windows_go_tool(gatter)
+
+add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper gatter)
 set_target_properties(package-xbax PROPERTIES FOLDER "Apps")
