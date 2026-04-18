@@ -1366,6 +1366,34 @@ INSERT AFTER .debug_types;
 	return path
 }
 
+func shouldUseWindowsGDBLinkerScript(extld []string) bool {
+	if len(extld) == 0 {
+		return true
+	}
+
+	name, args := extld[0], extld[1:]
+	base := strings.ToLower(filepath.Base(name))
+	if strings.Contains(base, "clang") || strings.Contains(base, "cleng") {
+		return false
+	}
+	for _, arg := range append(args, trimLinkerArgv(flagExtldflags)...) {
+		if strings.Contains(strings.ToLower(arg), "fuse-ld=lld") {
+			return false
+		}
+	}
+
+	versionArgs := append(args, trimLinkerArgv(flagExtldflags)...)
+	versionArgs = append(versionArgs, "-Wl,--version")
+	cmd := exec.Command(name, versionArgs...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return true
+	}
+
+	lowerOut := bytes.ToLower(out)
+	return !bytes.Contains(out, []byte("LLD ")) && !bytes.Contains(lowerOut, []byte("clang"))
+}
+
 type machoUpdateFunc func(ctxt *Link, exef *os.File, exem *macho.File, outexe string) error
 
 // archive builds a .a archive from the hostobj object files.
@@ -1898,23 +1926,11 @@ func (ctxt *Link) hostlink() {
 		checkStatic(p)
 	}
 	if ctxt.HeadType == objabi.Hwindows {
-		// Determine which linker we're using. Add in the extldflags in
-		// case used has specified "-fuse-ld=...".
-		extld := ctxt.extld()
-		name, args := extld[0], extld[1:]
-		args = append(args, trimLinkerArgv(flagExtldflags)...)
-		args = append(args, "-Wl,--version")
-		cmd := exec.Command(name, args...)
-		usingLLD := false
-		if out, err := cmd.CombinedOutput(); err == nil {
-			if bytes.Contains(out, []byte("LLD ")) {
-				usingLLD = true
-			}
-		}
-
 		// use gcc linker script to work around gcc bug
 		// (see https://golang.org/issue/20183 for details).
-		if !usingLLD {
+		// Skip it for clang/cleng/lld-style linkers: MinGW ld.lld rejects
+		// -T/--script entirely, and the workaround is only needed for gcc.
+		if shouldUseWindowsGDBLinkerScript(ctxt.extld()) {
 			p := writeGDBLinkerScript()
 			argv = append(argv, "-Wl,-T,"+p)
 		}
@@ -2002,13 +2018,17 @@ func (ctxt *Link) hostlink() {
 		if err != nil {
 			Exitf("%s: %s failed: %v", os.Args[0], op, err)
 		}
-		defer exef.Close()
 		exem, err := macho.NewFile(exef)
 		if err != nil {
 			Exitf("%s: parsing Mach-O header failed: %v", os.Args[0], err)
 		}
 		if err := updateFunc(ctxt, exef, exem, rewrittenOutput); err != nil {
 			Exitf("%s: %s failed: %v", os.Args[0], op, err)
+		}
+		// Close the original output before replacing it. Cross-linking Mach-O
+		// from a Windows host cannot rename over an open file handle.
+		if err := exef.Close(); err != nil {
+			Exitf("%s: closing %s failed: %v", os.Args[0], *flagOutfile, err)
 		}
 		os.Remove(*flagOutfile)
 		if err := os.Rename(rewrittenOutput, *flagOutfile); err != nil {

@@ -114,3 +114,17 @@ func main() {}`
 		t.Fatal(err)
 	}
 }
+
+func TestShouldUseWindowsGDBLinkerScriptClangLikeDriver(t *testing.T) {
+	got := shouldUseWindowsGDBLinkerScript([]string{`D:\xbax\cleng.exe`})
+	if got {
+		t.Fatal("clang-like driver should skip the Windows GDB linker script")
+	}
+}
+
+func TestShouldUseWindowsGDBLinkerScriptFuseLDLLD(t *testing.T) {
+	got := shouldUseWindowsGDBLinkerScript([]string{"gcc", "-fuse-ld=lld"})
+	if got {
+		t.Fatal("fuse-ld=lld should skip the Windows GDB linker script")
+	}
+}

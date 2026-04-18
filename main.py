@@ -36,6 +36,9 @@ DEFAULT_TERMINAL_HEIGHT = 290
 MIN_TERMINAL_HEIGHT = 180
 MIN_VIDEO_HEIGHT = 180
 SPLITTER_HEIGHT = 10
+LIVE_TERMINAL_ROW_SHARE_NUM = 2
+LIVE_TERMINAL_ROW_SHARE_DEN = 3
+MIN_LIVE_TERMINAL_ROWS = 6
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(REPO_ROOT, "build")
 LOCAL_PACKAGE_DIR = os.path.join(BUILD_DIR, "package", "Xbax")
@@ -239,7 +242,40 @@ class IntegratedTerminal:
         return active_lines[:max(1, last_visible + 1)]
 
     def _display_lines_locked(self):
-        return self.screen_history + self._active_display_lines_locked() + self.history
+        # Host-side status messages should read as scrollback above the live
+        # VT100 screen so the current remote prompt stays at the bottom.
+        return self.history + self.screen_history + self._active_display_lines_locked()
+
+    def _visible_lines_locked(self):
+        all_lines = self._display_lines_locked()
+        active_lines = self.screen_history + self._active_display_lines_locked()
+        if self.scroll_offset > 0 or not self.connected or not active_lines:
+            start_idx = max(0, len(all_lines) - self.rows - self.scroll_offset)
+            return all_lines[start_idx: start_idx + self.rows]
+
+        min_active_rows = max(
+            1,
+            min(
+                self.rows,
+                max(MIN_LIVE_TERMINAL_ROWS, (self.rows * LIVE_TERMINAL_ROW_SHARE_NUM) // LIVE_TERMINAL_ROW_SHARE_DEN),
+            ),
+        )
+        active_rows = min(len(active_lines), min_active_rows)
+        history_rows = min(len(self.history), max(0, self.rows - active_rows))
+
+        remaining_rows = self.rows - active_rows - history_rows
+        if remaining_rows > 0:
+            extra_active = min(len(active_lines) - active_rows, remaining_rows)
+            active_rows += extra_active
+            remaining_rows -= extra_active
+        if remaining_rows > 0:
+            history_rows += min(len(self.history) - history_rows, remaining_rows)
+
+        if history_rows:
+            visible_lines = self.history[-history_rows:] + active_lines[-active_rows:]
+        else:
+            visible_lines = active_lines[-active_rows:]
+        return visible_lines[-self.rows:]
 
     def _remember_command(self, command):
         command = command.rstrip()
@@ -808,10 +844,7 @@ class IntegratedTerminal:
             surf.fill((15, 15, 25))
 
             with self.lock:
-                all_lines = self._display_lines_locked()
-
-            start_idx = max(0, len(all_lines) - self.rows - self.scroll_offset)
-            visible_lines = all_lines[start_idx: start_idx + self.rows]
+                visible_lines = self._visible_lines_locked()
 
             y = 10
             for line in visible_lines:

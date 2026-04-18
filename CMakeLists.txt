@@ -47,6 +47,36 @@ if(CMAKE_HOST_WIN32)
   set(HOST_GO_EXECUTABLE_SUFFIX ".exe")
 endif()
 
+function(xbax_collect_go_module_sources out_var source_dir)
+  file(GLOB_RECURSE _sources CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${source_dir}/*.go"
+    "${source_dir}/*.c"
+    "${source_dir}/*.cc"
+    "${source_dir}/*.cpp"
+    "${source_dir}/*.cxx"
+    "${source_dir}/*.h"
+    "${source_dir}/*.hh"
+    "${source_dir}/*.hpp"
+    "${source_dir}/*.hxx"
+    "${source_dir}/*.m"
+    "${source_dir}/*.mm"
+    "${source_dir}/*.s"
+    "${source_dir}/*.S"
+    "${source_dir}/*.syso"
+  )
+  set(${out_var} ${_sources} PARENT_SCOPE)
+endfunction()
+
+file(GLOB_RECURSE CAMPILER_SOURCE_DEPS CONFIGURE_DEPENDS LIST_DIRECTORIES false
+  "${CMAKE_SOURCE_DIR}/go/src/*"
+  "${CMAKE_SOURCE_DIR}/go/lib/*"
+)
+list(APPEND CAMPILER_SOURCE_DEPS
+  "${CMAKE_SOURCE_DIR}/go/VERSION"
+  "${CMAKE_SOURCE_DIR}/go/go.env"
+  "${CMAKE_SOURCE_DIR}/go/README.md"
+)
+
 add_custom_command(
   OUTPUT "${CAMPILER_OUTPUT}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${XBAX_PACKAGE_DIR}"
@@ -57,6 +87,7 @@ add_custom_command(
           "${CAMPILER_OUTPUT_DIR}"
   DEPENDS
     go-toolchain
+    ${CAMPILER_SOURCE_DEPS}
     "${CMAKE_SOURCE_DIR}/go/src/make.bash"
     "${CAMPILER_SCRIPT}"
   COMMENT "Bootstrapping campiler for windows/amd64 using the custom Go toolchain"
@@ -72,10 +103,12 @@ function(add_xbax_windows_go_tool tool_name)
   else()
     set(_source_dir "${CMAKE_SOURCE_DIR}/${tool_name}")
   endif()
+  xbax_collect_go_module_sources(_source_files "${_source_dir}")
   set(_output_dir "${XBAX_PACKAGE_DIR}/${tool_name}")
   set(_output "${_output_dir}/${tool_name}.exe")
   set(_deps
     go-toolchain
+    ${_source_files}
     "${_source_dir}/go.mod"
     "${_source_dir}/main.go"
   )
@@ -108,10 +141,12 @@ function(add_xbax_host_go_tool tool_name)
   else()
     set(_source_dir "${CMAKE_SOURCE_DIR}/${tool_name}")
   endif()
+  xbax_collect_go_module_sources(_source_files "${_source_dir}")
   set(_output_dir "${XBAX_HOST_DIR}/${tool_name}")
   set(_output "${_output_dir}/${tool_name}${HOST_GO_EXECUTABLE_SUFFIX}")
   set(_deps
     go-toolchain
+    ${_source_files}
     "${_source_dir}/go.mod"
     "${_source_dir}/main.go"
   )
