@@ -31,15 +31,17 @@ if(NOT EXISTS "${SYSROOT_SOURCE}/${SYSROOT_MARKER}")
   return()
 endif()
 
-# Skip the copy if the destination already contains the marker we expect.
-# Delete ${SYSROOT_DEST} (or the whole cleng package) to force a refresh.
-if(EXISTS "${SYSROOT_DEST}/${SYSROOT_MARKER}")
+# Skip the copy if the destination already contains the marker we expect and
+# the caller explicitly asked for reuse.
+if(DEFINED SYSROOT_SKIP_IF_PRESENT AND SYSROOT_SKIP_IF_PRESENT AND EXISTS "${SYSROOT_DEST}/${SYSROOT_MARKER}")
   message(STATUS "cleng target bundle: ${SYSROOT_DEST} already populated; skipping copy")
   return()
 endif()
 
 message(STATUS "cleng target bundle: staging ${SYSROOT_SOURCE} -> ${SYSROOT_DEST}")
-file(REMOVE_RECURSE "${SYSROOT_DEST}")
+if(NOT DEFINED SYSROOT_PRESERVE_DEST OR NOT SYSROOT_PRESERVE_DEST)
+  file(REMOVE_RECURSE "${SYSROOT_DEST}")
+endif()
 file(MAKE_DIRECTORY "${SYSROOT_DEST}")
 
 function(cleng_copy_resolved_tree source_root rel_path dest_root)

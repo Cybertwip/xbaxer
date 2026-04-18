@@ -544,6 +544,7 @@ add_custom_command(
           -DSYSROOT_SOURCE=${CLENG_CLANG_PREFIX}/bin
           -DSYSROOT_DEST=${CLENG_OUTPUT_DIR}
           -DSYSROOT_MARKER=lld.exe
+          -DSYSROOT_PRESERVE_DEST=ON
           -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
   # Bundle the target-facing headers/framework stubs/runtime archives that
   # Clang itself does not own: mingw-w64 for windows, the active Apple SDK
