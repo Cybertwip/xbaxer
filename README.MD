@@ -9,8 +9,8 @@ It currently contains:
 - `dastrabution/`: a Go command that links against `github.com/go-git/go-git/v5` and is cross-compiled as a Windows PE executable.
 - `anzipper/`: a Go command for listing and safely extracting `.zip` archives.
 - `gatter/`: a Go command for HTTP/HTTPS downloads, similar to a very small single-purpose fetch client.
-- `Sarver/`: a Go HTTP build server that accepts Go source archives, compiles them remotely, and streams the built artifact back.
-- `Cliant/`: a Go client for the remote build server, supporting commands such as `cliant <server-url> build .`.
+- `Sarver/`: a Go HTTP build server that compiles Go source archives into binaries. In relay mode it dials out to a `cliant serve` host with `-reverse <relay-url>`, polls for queued build jobs, and streams the built artifact back.
+- `Cliant/`: a Go client *and* relay for remote builds. `cliant <relay-url> build .` submits a build, and `cliant serve -listen 0.0.0.0:17777` runs the relay that `sarver.exe` connects to.
 - `campiler/`: packaging helpers for producing a Windows-targeted Go bootstrap/toolchain tree from the previously built host Go toolchain.
 
 ## Requirements
@@ -86,52 +86,85 @@ python3 main.py
 2. Connect to the devkit stream, then connect to the shell using the Visual Studio PIN shown in the RTSP view.
 3. After the shell is connected, click `Install`.
    This builds the local package, syncs it to `D:/DevelopmentFiles/Xbax`, skips files that are already current, and updates remote files when the local packaged copy is newer.
-4. In the remote shell, start the compiler server from the installed Xbax tree:
+4. On the host machine, start the `cliant` relay. This is the new entry point — `cliant` now both submits build jobs and serves them, while `sarver.exe` on the Xbox connects out to it to poll for work. Run it from the repo root:
+
+```bash
+./build/host/cliant/cliant serve -listen 0.0.0.0:17777
+```
+
+Example session output:
+
+```text
+cybertwip@cybertwips-MacBook-Pro xbax-stream % ./build/host/cliant/cliant serve -listen 0.0.0.0:17777
+cliant relay listening on http://0.0.0.0:17777
+cliant relay waiting for reverse workers from remote sarver instances
+```
+
+Optional flags:
+
+- `-listen <addr>` — listen address, defaults to `0.0.0.0:17777`.
+- `-max-upload-mib <N>` — maximum accepted source archive size, defaults to `256`.
+
+5. In the remote Xbox shell, start `sarver.exe` in **reverse mode** so it dials back into the host relay and polls for build jobs:
 
 ```text
 d:
 cd \DevelopmentFiles\Xbax\sarver
-sarver.exe -listen 0.0.0.0:17777
+sarver.exe -reverse http://<host-ip>:17777
 ```
 
-`sarver.exe` now defaults to `0.0.0.0:17777`, so remote hosts can connect even if you omit the flag. The startup log will also tell you whether it is network-accessible or loopback-only.
+`sarver.exe` only needs `-reverse` to participate in the relay; the `-listen` flag is unused in this mode because the connection is initiated outbound from the Xbox. On startup the log prints `sarver reverse mode enabled; relay=...` and `sarver will pull build jobs from the host relay`.
 
-5. On the host machine, open the sample project:
+6. On the host machine, open the sample project and submit a build to your own relay (`http://127.0.0.1:17777` from the same machine, or `http://<host-ip>:17777` from another host on the LAN):
 
 ```bash
 cd HelloBax
 ```
 
-6. Run the native host `cliant` against the remote server.
+Example session — building HelloBax for macOS Intel via the relay:
 
-For a Windows build from macOS or Linux:
+```text
+cybertwip@cybertwips-MacBook-Pro HelloBax % ../build/host/cliant/cliant http://127.0.0.1:17777 build . -goos darwin -goarch amd64 -o myapp
+```
+
+The same `cliant <relay-url> build ...` command shape works for every target. Pick the matching `-goos`/`-goarch`:
+
+For a Windows build:
 
 ```bash
-../build/host/cliant/cliant http://<server-ip>:17777 build . -goos windows -goarch amd64 -o myapp.exe
+../build/host/cliant/cliant http://127.0.0.1:17777 build . -goos windows -goarch amd64 -o myapp.exe
 ```
 
 For macOS Intel:
 
 ```bash
-../build/host/cliant/cliant http://<server-ip>:17777 build . -goos darwin -goarch amd64 -o myapp
+../build/host/cliant/cliant http://127.0.0.1:17777 build . -goos darwin -goarch amd64 -o myapp
 ```
 
 For macOS Apple Silicon:
 
 ```bash
-../build/host/cliant/cliant http://<server-ip>:17777 build . -goos darwin -goarch arm64 -o myapp
+../build/host/cliant/cliant http://127.0.0.1:17777 build . -goos darwin -goarch arm64 -o myapp
 ```
 
 For Linux x86_64:
 
 ```bash
-../build/host/cliant/cliant http://<server-ip>:17777 build . -goos linux -goarch amd64 -o myapp
+../build/host/cliant/cliant http://127.0.0.1:17777 build . -goos linux -goarch amd64 -o myapp
 ```
 
 For Linux arm64:
 
 ```bash
-../build/host/cliant/cliant http://<server-ip>:17777 build . -goos linux -goarch arm64 -o myapp
+../build/host/cliant/cliant http://127.0.0.1:17777 build . -goos linux -goarch arm64 -o myapp
+```
+
+The relay queues the job, `sarver.exe` pulls it on its next poll, downloads the source archive, runs `go build` on the Xbox, posts the artifact back, and the host `cliant` writes it to `-o`.
+
+You can health-check the relay at any time:
+
+```bash
+../build/host/cliant/cliant http://127.0.0.1:17777 health
 ```
 
 `HelloBax` is the smallest manual test target in this repo and prints `Hello Bax`.
