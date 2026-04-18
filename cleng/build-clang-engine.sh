@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# build-clang-engine.sh — bootstrap LLVM/Clang for the cleng cgo bridge.
+#
+# Mirrors the pattern used by campiler/build-campiler.sh: take a vendored
+# upstream source tree (here ./llvm-project, added as a git submodule pinned
+# at llvmorg-22.1.3), build it twice — once natively to produce the
+# tablegen tools, then once cross-compiled to windows/amd64 — and install
+# the result as a self-contained prefix that cleng will later link against.
+#
+# Usage:
+#   build-clang-engine.sh <llvm-source-dir> <work-dir> <output-dir> \
+#                         <toolchain-file> [host-clang] [host-clang++]
+#
+# On success, <output-dir> contains:
+#   include/                # Clang + LLVM headers (windows-targeted)
+#   lib/libclang*.a         # static archives consumed by cleng's cgo bridge
+#   lib/libLLVM*.a
+#
+# Re-running this script is incremental: both stages use Ninja and a stamp
+# file gates the heavy work so a successful build is not redone.
+
+set -euo pipefail
+
+if [[ "$#" -lt 4 || "$#" -gt 6 ]]; then
+  echo "usage: $0 <llvm-source-dir> <work-dir> <output-dir> <toolchain-file> [host-clang] [host-clang++]" >&2
+  exit 2
+fi
+
+LLVM_SRC="$1"
+WORK_DIR="$2"
+OUTPUT_DIR="$3"
+TOOLCHAIN_FILE="$4"
+HOST_CC="${5:-clang}"
+HOST_CXX="${6:-clang++}"
+
+NATIVE_BUILD="$WORK_DIR/native"
+CROSS_BUILD="$WORK_DIR/cross"
+NATIVE_STAMP="$NATIVE_BUILD/.tblgen-built"
+CROSS_STAMP="$OUTPUT_DIR/.clang-engine-installed"
+
+mkdir -p "$NATIVE_BUILD" "$CROSS_BUILD" "$OUTPUT_DIR"
+
+# Common LLVM cmake flags shared by both stages. We keep the build minimal:
+# only the X86 backend, no tests/benchmarks/examples, no LTO, no docs.
+LLVM_COMMON_FLAGS=(
+  -G Ninja
+  -DCMAKE_BUILD_TYPE=Release
+  -DLLVM_ENABLE_PROJECTS=clang
+  -DLLVM_TARGETS_TO_BUILD=X86
+  -DLLVM_INCLUDE_TESTS=OFF
+  -DLLVM_INCLUDE_BENCHMARKS=OFF
+  -DLLVM_INCLUDE_EXAMPLES=OFF
+  -DLLVM_INCLUDE_DOCS=OFF
+  -DCLANG_INCLUDE_TESTS=OFF
+  -DCLANG_INCLUDE_DOCS=OFF
+  -DLLVM_ENABLE_ZLIB=OFF
+  -DLLVM_ENABLE_ZSTD=OFF
+  -DLLVM_ENABLE_LIBXML2=OFF
+  -DLLVM_ENABLE_TERMINFO=OFF
+  -DLLVM_ENABLE_LIBEDIT=OFF
+  -DLLVM_ENABLE_LIBPFM=OFF
+  -DLLVM_ENABLE_BINDINGS=OFF
+  -DLLVM_ENABLE_OCAMLDOC=OFF
+  -DBUILD_SHARED_LIBS=OFF
+)
+
+# ---- Stage 1: native bootstrap of llvm-tblgen / clang-tblgen ----------------
+#
+# Cross-compiling LLVM requires native versions of the tablegen drivers to
+# generate the .inc files consumed by the rest of the build. We build only
+# those two binaries, using the host clang (matching how go's make.bash uses
+# GOROOT_BOOTSTRAP).
+if [[ ! -f "$NATIVE_STAMP" ]]; then
+  echo "[clang-engine] stage 1: native tblgen bootstrap (host CC=$HOST_CC)"
+  cmake -S "$LLVM_SRC/llvm" -B "$NATIVE_BUILD" \
+    "${LLVM_COMMON_FLAGS[@]}" \
+    -DCMAKE_C_COMPILER="$HOST_CC" \
+    -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+    -DLLVM_BUILD_TOOLS=OFF \
+    -DLLVM_BUILD_UTILS=ON \
+    -DCLANG_BUILD_TOOLS=OFF
+  cmake --build "$NATIVE_BUILD" --target llvm-tblgen clang-tblgen llvm-min-tblgen
+  : > "$NATIVE_STAMP"
+fi
+
+NATIVE_LLVM_TBLGEN="$NATIVE_BUILD/bin/llvm-tblgen"
+NATIVE_CLANG_TBLGEN="$NATIVE_BUILD/bin/clang-tblgen"
+
+if [[ ! -x "$NATIVE_LLVM_TBLGEN" || ! -x "$NATIVE_CLANG_TBLGEN" ]]; then
+  echo "[clang-engine] stage 1 failed: tblgen binaries missing under $NATIVE_BUILD/bin" >&2
+  exit 1
+fi
+
+# ---- Stage 2: cross-compile to windows/amd64 -------------------------------
+#
+# We install only the static libs + headers (no clang.exe, no llvm-* tools).
+# cleng provides its own driver entry point in Go and links against
+# clang_main from libclangDriver via the C++ shim in
+# cleng/internal/cgobridge/bridge.cpp.
+if [[ ! -f "$CROSS_STAMP" ]]; then
+  echo "[clang-engine] stage 2: cross-compile clang static libs for windows/amd64"
+  cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \
+    "${LLVM_COMMON_FLAGS[@]}" \
+    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
+    -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
+    -DLLVM_TABLEGEN="$NATIVE_LLVM_TBLGEN" \
+    -DCLANG_TABLEGEN="$NATIVE_CLANG_TBLGEN" \
+    -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32 \
+    -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-w64-mingw32 \
+    -DLLVM_BUILD_TOOLS=OFF \
+    -DLLVM_BUILD_UTILS=OFF \
+    -DLLVM_INCLUDE_TOOLS=ON \
+    -DCLANG_BUILD_TOOLS=OFF \
+    -DLLVM_ENABLE_PIC=OFF
+  cmake --build "$CROSS_BUILD" --target install-clang-libraries install-llvm-libraries install-clang-headers install-llvm-headers
+  : > "$CROSS_STAMP"
+fi
+
+echo "[clang-engine] done — installed prefix: $OUTPUT_DIR"

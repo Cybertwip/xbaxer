@@ -145,7 +145,68 @@ add_xbax_windows_go_tool(sarver Sarver)
 add_xbax_windows_go_tool(cliant Cliant)
 add_xbax_host_go_tool(cliant Cliant)
 
-add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper gatter sarver cliant)
+# ==============================================================================
+# cleng — Go-fronted Clang driver (cgo, cross-compiled to windows/amd64)
+#
+# Unlike the other Go tools above, cleng links against the prebuilt LLVM/Clang
+# static libraries via cgo. It therefore needs CGO_ENABLED=1 plus a working
+# x86_64-w64-mingw32 C/C++ cross toolchain on the host (e.g. Homebrew's
+# `mingw-w64`). The Clang libraries themselves are expected under
+# ${CLENG_CLANG_PREFIX} (defaults to ${CMAKE_BINARY_DIR}/engine/clang-windows-amd64);
+# how that prefix is populated is intentionally out of scope here — the LLVM
+# project is vendored as a git submodule under ./llvm-project for a future
+# build target to consume.
+# ==============================================================================
+set(CLENG_SOURCE_DIR "${CMAKE_SOURCE_DIR}/cleng")
+set(CLENG_OUTPUT_DIR "${XBAX_PACKAGE_DIR}/cleng/bin")
+set(CLENG_OUTPUT "${CLENG_OUTPUT_DIR}/cleng.exe")
+set(CLENG_CLANG_PREFIX "${CMAKE_BINARY_DIR}/engine/clang-windows-amd64"
+    CACHE PATH "Prefix containing prebuilt Clang/LLVM static libs and headers for windows/amd64")
+
+find_program(MINGW_CC  x86_64-w64-mingw32-gcc)
+find_program(MINGW_CXX x86_64-w64-mingw32-g++)
+if(NOT MINGW_CC OR NOT MINGW_CXX)
+  set(MINGW_CC  "x86_64-w64-mingw32-gcc"  CACHE FILEPATH "Windows/amd64 C cross compiler")
+  set(MINGW_CXX "x86_64-w64-mingw32-g++"  CACHE FILEPATH "Windows/amd64 C++ cross compiler")
+endif()
+
+set(XBAX_CLENG_BUILD_ENV
+  ${XBAX_GO_BUILD_ENV}
+  "CGO_ENABLED=1"
+  "CC=${MINGW_CC}"
+  "CXX=${MINGW_CXX}"
+  "CGO_CXXFLAGS=-I${CLENG_CLANG_PREFIX}/include -std=c++17"
+  "CGO_LDFLAGS=-L${CLENG_CLANG_PREFIX}/lib"
+)
+# CGO_ENABLED=1 must override the CGO_ENABLED=0 that XBAX_GO_BUILD_ENV
+# sets, so it appears later in the list above (CMake env wins on last value).
+
+add_custom_command(
+  OUTPUT "${CLENG_OUTPUT}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-mod-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-path"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CLENG_OUTPUT_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E env ${XBAX_CLENG_BUILD_ENV}
+          "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
+          -o "${CLENG_OUTPUT}" .
+  DEPENDS
+    go-toolchain
+    "${CLENG_SOURCE_DIR}/go.mod"
+    "${CLENG_SOURCE_DIR}/main.go"
+    "${CLENG_SOURCE_DIR}/internal/cleng/run.go"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge.go"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge_link.go"
+  WORKING_DIRECTORY "${CLENG_SOURCE_DIR}"
+  COMMENT "Building cleng.exe (Go-fronted Clang driver) for windows/amd64"
+  VERBATIM
+)
+
+add_custom_target(cleng DEPENDS "${CLENG_OUTPUT}")
+set_target_properties(cleng PROPERTIES FOLDER "Apps")
+
+add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper gatter sarver cliant cleng)
 set_target_properties(package-xbax PROPERTIES FOLDER "Apps")
 
 add_custom_target(host-tools ALL DEPENDS host-cliant)
