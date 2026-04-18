@@ -466,6 +466,7 @@ add_custom_command(
 
 add_custom_target(clang-engine DEPENDS "${CLANG_ENGINE_STAMP}")
 set_target_properties(clang-engine PROPERTIES FOLDER "Toolchain")
+set(CLENG_LINKER_BIN_SOURCE "${CLANG_ENGINE_WORK_DIR}/cross/bin")
 
 # Generate bridge_link_generated.go listing every libclang*.a / libLLVM*.a in
 # the cleng prefix. The Go tooling parses #cgo LDFLAGS at compile time, so the
@@ -541,9 +542,9 @@ add_custom_command(
   # from LLVM's lld project and live next to cleng.exe in the deployed tree
   # so the wrapper can resolve them relative to itself.
   COMMAND ${CMAKE_COMMAND}
-          -DSYSROOT_SOURCE=${CLENG_CLANG_PREFIX}/bin
+          -DSYSROOT_SOURCE=${CLENG_LINKER_BIN_SOURCE}
           -DSYSROOT_DEST=${CLENG_OUTPUT_DIR}
-          -DSYSROOT_MARKER=lld.exe
+          -DSYSROOT_MARKERS=lld.exe\;ld64.lld.exe\;ld.lld.exe
           -DSYSROOT_PRESERVE_DEST=ON
           -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
   # Bundle the target-facing headers/framework stubs/runtime archives that

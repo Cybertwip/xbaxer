@@ -109,9 +109,10 @@ if [[ ! -f "$CROSS_STAMP" ]]; then
     -DCLANG_TABLEGEN="$NATIVE_CLANG_TBLGEN" \
     -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32 \
     -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-w64-mingw32 \
-    -DLLVM_BUILD_TOOLS=OFF \
+    -DLLVM_BUILD_TOOLS=ON \
     -DLLVM_BUILD_UTILS=OFF \
     -DLLVM_INCLUDE_TOOLS=ON \
+    -DLLD_BUILD_TOOLS=ON \
     -DCLANG_BUILD_TOOLS=OFF \
     -DLLVM_ENABLE_PIC=OFF
   # install-clang-resource-headers ships clang's compiler-builtin headers
