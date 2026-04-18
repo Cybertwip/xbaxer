@@ -19,11 +19,9 @@ package cgobridge
 #cgo windows,amd64 CXXFLAGS: -Wno-attributes -Wno-class-memaccess
 #cgo windows,amd64 CXXFLAGS: -Wno-comment -Wno-unused-function
 
-// Win32 system libraries that Clang's driver, libSupport, and libDebugInfo
-// link against (registry, COM, version info, sockets, debug help, etc.).
-#cgo windows,amd64 LDFLAGS: -lversion -luuid -lole32 -loleaut32
-#cgo windows,amd64 LDFLAGS: -lws2_32 -lntdll -ladvapi32 -lpsapi
-#cgo windows,amd64 LDFLAGS: -lshell32 -limagehlp -lshlwapi -lmsvcrt
+// Static C++ runtime + pthread. The Win32 system libs (version/uuid/ole32
+// /etc.) are emitted into bridge_link_generated.go AFTER --end-group so
+// they can satisfy references the LLVM group pulls in.
 #cgo windows,amd64 LDFLAGS: -static -lstdc++ -lpthread
 */
 import "C"

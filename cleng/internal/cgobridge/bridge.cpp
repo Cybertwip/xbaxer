@@ -12,8 +12,12 @@
 
 #include "llvm/Support/LLVMDriver.h"
 
-extern "C" int clang_main(int Argc, char **Argv,
-                          const llvm::ToolContext &ToolContext);
+// clang_main is defined in clang/tools/driver/driver.cpp (pulled in via
+// cleng_driver_inc.cpp) with C++ linkage — NOT extern "C". Re-declare it
+// the same way or the call will resolve to a mangled name that doesn't
+// exist.
+int clang_main(int Argc, char **Argv,
+               const llvm::ToolContext &ToolContext);
 
 extern "C" int cleng_clang_main(int argc, char **argv) {
   llvm::ToolContext ctx{};

@@ -60,6 +60,12 @@ foreach(_f IN LISTS _l_flags)
   string(APPEND _body "#cgo windows,amd64 LDFLAGS: ${_f}\n")
 endforeach()
 string(APPEND _body "#cgo windows,amd64 LDFLAGS: -Wl,--end-group\n")
+# System libs go AFTER the group so unresolved __imp_* / GUID references
+# pulled in from libLLVMSupport (Windows version, COM, registry, etc.) can
+# be satisfied. mingw-ld is single-pass for ungrouped libs, so order matters.
+string(APPEND _body "#cgo windows,amd64 LDFLAGS: -lversion -luuid -lole32 -loleaut32\n")
+string(APPEND _body "#cgo windows,amd64 LDFLAGS: -lws2_32 -lntdll -ladvapi32 -lpsapi\n")
+string(APPEND _body "#cgo windows,amd64 LDFLAGS: -lshell32 -limagehlp -lshlwapi\n")
 string(APPEND _body "*/\n")
 string(APPEND _body "import \"C\"\n")
 
