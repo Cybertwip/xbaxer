@@ -39,10 +39,7 @@ func findBundledLinker(argv []string) (string, []string, error) {
 		return "", nil, err
 	}
 	exeDir := filepath.Dir(exe)
-	flavor := "gnu"
-	if isAppleTriple(os.Getenv(clengTargetTripleEnv)) || looksLikeDarwinLinkerArgs(argv) {
-		flavor = "darwin"
-	}
+	flavor := detectLinkerFlavor(exe, argv)
 
 	for _, name := range linkerCandidates(flavor) {
 		candidate := filepath.Join(exeDir, name)
@@ -55,6 +52,21 @@ func findBundledLinker(argv []string) (string, []string, error) {
 		}
 	}
 	return "", nil, fmt.Errorf("bundled linker not found next to %s", exe)
+}
+
+func detectLinkerFlavor(exe string, argv []string) string {
+	base := strings.ToLower(filepath.Base(exe))
+	switch base {
+	case "ld64.lld.exe", "ld64.lld":
+		return "darwin"
+	case "ld.lld.exe", "ld.lld":
+		return "gnu"
+	}
+
+	if isAppleTriple(os.Getenv(clengTargetTripleEnv)) || looksLikeDarwinLinkerArgs(argv) {
+		return "darwin"
+	}
+	return "gnu"
 }
 
 func linkerCandidates(flavor string) []string {

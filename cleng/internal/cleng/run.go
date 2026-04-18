@@ -189,7 +189,7 @@ func injectBundledLinker(argv []string) []string {
 	if linkerPath == "" {
 		return argv
 	}
-	return insertAfterArgv0(argv, "-fuse-ld=lld", "--ld-path="+linkerPath)
+	return insertAfterArgv0(argv, "-B"+filepath.Dir(linkerPath), "-fuse-ld=lld")
 }
 
 func shouldInjectBundledLinker(argv []string) bool {
