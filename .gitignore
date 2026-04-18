@@ -28,3 +28,6 @@ __pycache__/
 *.test
 *.prof
 *.coverprofile
+
+# Generated source
+/cleng/internal/cgobridge/bridge_link_generated.go
