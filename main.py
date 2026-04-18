@@ -42,6 +42,9 @@ LOCAL_PACKAGE_DIR = os.path.join(BUILD_DIR, "package", "Xbax")
 REMOTE_INSTALL_DIR = "D:/DevelopmentFiles/Xbax"
 REMOTE_INSTALL_MANIFEST = ".xbax-install-manifest.json"
 REMOTE_INSTALL_BUNDLE = ".xbax-install-bundle.zip"
+BS_RELAY_LISTEN = "0.0.0.0:17777"
+BS_RELAY_PORT = 17777
+REMOTE_SARVER_DIR = REMOTE_INSTALL_DIR + "/sarver"
 
 # ================== PIN STORAGE ==================
 def load_pin(ip):
@@ -198,6 +201,12 @@ class IntegratedTerminal:
         self.ip = None
         self.pin = None
         self.installing = False
+        self.bs_running = False
+        self.bs_busy = False
+        self.bs_stop_requested = False
+        self.bs_process = None
+        self.bs_relay_url = None
+        self.bs_lock = threading.Lock()
 
         # Dirty-cache: only re-render the body surface when content changes
         self._dirty = True
@@ -265,6 +274,215 @@ class IntegratedTerminal:
 
     def can_install(self):
         return self.connected and self.has_active_ssh() and not self.installing
+
+    def is_bs_running(self):
+        with self.bs_lock:
+            return self.bs_running
+
+    def can_toggle_bs(self):
+        with self.bs_lock:
+            if self.bs_busy:
+                return False
+            if self.bs_running:
+                return True
+        return self.connected and self.has_active_ssh() and not self.installing
+
+    def _local_cliant_path(self):
+        candidates = [
+            os.path.join(BUILD_DIR, "host", "cliant", "cliant"),
+            os.path.join(BUILD_DIR, "host", "cliant", "cliant.exe"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return candidates[0]
+
+    def _remote_sarver_path(self):
+        return REMOTE_SARVER_DIR.rstrip("/") + "/sarver.exe"
+
+    def _ensure_local_cliant(self):
+        cliant_path = self._local_cliant_path()
+        if os.path.isfile(cliant_path):
+            return cliant_path
+        self.log("[*] Building host cliant relay...")
+        self._run_local_command(["cmake", "--build", BUILD_DIR, "--target", "host-cliant", "-j4"], REPO_ROOT)
+        if not os.path.isfile(cliant_path):
+            raise RuntimeError(f"host cliant not found after build: {cliant_path}")
+        return cliant_path
+
+    def _ensure_remote_sarver_installed(self):
+        remote_sarver = self._remote_sarver_path().replace("/", "\\")
+        command = f'cmd /c if exist {self._cmd_quote(remote_sarver)} (exit /b 0) else (exit /b 1)'
+        exit_status, _, _ = self._run_remote_command(command)
+        if exit_status != 0:
+            raise RuntimeError(
+                f"remote sarver.exe not found at {remote_sarver}; run Install first"
+            )
+        return remote_sarver
+
+    def _watch_bs_process(self, process):
+        try:
+            if process.stdout:
+                for line in process.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.log(f"[bs] {line}")
+        except Exception as exc:
+            self.log(f"[*] BS relay log stream ended unexpectedly: {exc}")
+        finally:
+            return_code = process.wait()
+            should_stop_remote = False
+            stop_requested = False
+            with self.bs_lock:
+                if self.bs_process is process:
+                    stop_requested = self.bs_stop_requested
+                    should_stop_remote = not stop_requested
+                    self.bs_process = None
+                    self.bs_running = False
+                    self.bs_busy = False
+                    self.bs_stop_requested = False
+                    self.bs_relay_url = None
+            self._mark_dirty()
+
+            if should_stop_remote and self.has_active_ssh():
+                try:
+                    self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
+                except Exception:
+                    pass
+
+            if stop_requested:
+                self.log("[*] BS relay stopped.")
+            elif return_code == 0:
+                self.log("[*] BS relay exited.")
+            else:
+                self.log(f"[-] BS relay exited with code {return_code}.")
+
+    def start_bs(self):
+        with self.bs_lock:
+            if self.bs_busy:
+                self.log("[-] BS start/stop already in progress.")
+                return
+            if self.bs_running:
+                self.log("[-] BS is already running.")
+                return
+            self.bs_busy = True
+            self.bs_stop_requested = False
+        self._mark_dirty()
+
+        relay_process = None
+        try:
+            if not self.connected or not self.has_active_ssh():
+                raise RuntimeError("Connect Dev Shell first to start BS.")
+
+            cliant_path = self._ensure_local_cliant()
+            remote_sarver = self._ensure_remote_sarver_installed()
+            relay_url = f"http://{get_local_ip()}:{BS_RELAY_PORT}"
+
+            self.log(f"[*] Starting local cliant relay on http://{BS_RELAY_LISTEN}...")
+            relay_process = subprocess.Popen(
+                [cliant_path, "serve", "-listen", BS_RELAY_LISTEN],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            time.sleep(0.35)
+            if relay_process.poll() is not None:
+                startup_log = ""
+                if relay_process.stdout:
+                    startup_log = relay_process.stdout.read().strip()
+                raise RuntimeError(startup_log or "cliant relay exited immediately")
+
+            self.log(f"[*] Launching remote sarver.exe -reverse {relay_url} ...")
+            try:
+                self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
+            except Exception:
+                pass
+
+            exit_status, output, error = self._run_remote_command(
+                f'cmd /c start "" /b {self._cmd_quote(remote_sarver)} -reverse {self._cmd_quote(relay_url)}'
+            )
+            if exit_status != 0:
+                raise RuntimeError((error or output or "remote sarver launch failed").strip())
+
+            with self.bs_lock:
+                self.bs_process = relay_process
+                self.bs_running = True
+                self.bs_busy = False
+                self.bs_stop_requested = False
+                self.bs_relay_url = relay_url
+            self._mark_dirty()
+
+            threading.Thread(target=self._watch_bs_process, args=(relay_process,), daemon=True).start()
+            self.log(f"[+] BS started. Relay URL: {relay_url}")
+        except Exception as exc:
+            if self.has_active_ssh():
+                try:
+                    self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
+                except Exception:
+                    pass
+            if relay_process and relay_process.poll() is None:
+                try:
+                    relay_process.terminate()
+                    relay_process.wait(timeout=3)
+                except Exception:
+                    try:
+                        relay_process.kill()
+                    except Exception:
+                        pass
+            with self.bs_lock:
+                self.bs_running = False
+                self.bs_busy = False
+                self.bs_stop_requested = False
+                self.bs_process = None
+                self.bs_relay_url = None
+            self._mark_dirty()
+            self.log(f"[-] Start BS failed: {exc}")
+
+    def stop_bs(self):
+        with self.bs_lock:
+            if self.bs_busy:
+                self.log("[-] BS start/stop already in progress.")
+                return
+            process = self.bs_process
+            running = self.bs_running
+            self.bs_busy = True
+            self.bs_stop_requested = True
+        self._mark_dirty()
+
+        try:
+            if self.has_active_ssh():
+                self.log("[*] Stopping remote sarver.exe...")
+                self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
+            else:
+                self.log("[*] SSH is unavailable; stopping the local BS relay only.")
+
+            if process and process.poll() is None:
+                self.log("[*] Stopping local cliant relay...")
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            elif not running:
+                self.log("[*] BS was not running.")
+
+            with self.bs_lock:
+                if self.bs_process is process:
+                    self.bs_process = None
+                    self.bs_running = False
+                    self.bs_busy = False
+                    self.bs_stop_requested = False
+                    self.bs_relay_url = None
+            self._mark_dirty()
+            self.log("[*] BS relay stopped.")
+        except Exception as exc:
+            with self.bs_lock:
+                self.bs_busy = False
+            self._mark_dirty()
+            self.log(f"[-] Stop BS failed: {exc}")
 
     def resize_grid(self, new_rows):
         if new_rows <= 0 or new_rows == self.rows: return
@@ -939,6 +1157,11 @@ class IntegratedTerminal:
     def close(self):
         self.intentional_disconnect = True
         self.connected = False
+        if self.is_bs_running():
+            try:
+                self.stop_bs()
+            except Exception:
+                pass
         if self.ssh_client and self.ssh_client.get_transport() and self.ssh_client.get_transport().is_active():
             try: self.ssh_client.exec_command("taskkill /F /IM telnetd.exe /T"); time.sleep(0.2)
             except: pass
@@ -1189,6 +1412,7 @@ def run_stream(screen, clock, ip):
     # Buttons auto-size their width from text at construction
     shell_btn     = Button(0, 18, 0, 52, "Connect Dev Shell",    (0, 120, 215), (0, 160, 255))
     install_btn   = Button(0, 18, 0, 52, "Install",              (35, 145, 85), (55, 185, 110))
+    bs_btn        = Button(0, 18, 0, 52, "Start BS",             (170, 95, 25), (205, 125, 40))
     full_term_btn = Button(0, 18, 0, 52, "Toggle Full Terminal", (60, 60, 80),  (90, 90, 110))
 
     terminal_height = DEFAULT_TERMINAL_HEIGHT
@@ -1246,7 +1470,8 @@ def run_stream(screen, clock, ip):
 
             # Right-align buttons — guaranteed no overlap
             full_term_btn.rect.x = STREAM_SIZE[0] - full_term_btn.rect.w - 12
-            install_btn.rect.x   = full_term_btn.rect.x - install_btn.rect.w - 10
+            bs_btn.rect.x        = full_term_btn.rect.x - bs_btn.rect.w - 10
+            install_btn.rect.x   = bs_btn.rect.x - install_btn.rect.w - 10
             shell_btn.rect.x     = install_btn.rect.x - shell_btn.rect.w - 10
 
             terminal._mark_dirty()
@@ -1258,6 +1483,8 @@ def run_stream(screen, clock, ip):
             terminal.needs_pin_prompt = False
 
         install_btn.enabled = terminal.can_install()
+        bs_btn.enabled = terminal.can_toggle_bs()
+        bs_btn.text = "Stop BS" if terminal.is_bs_running() else "Start BS"
 
         # ── Video ────────────────────────────────────────────────────────
         if not terminal.fullscreen_mode:
@@ -1289,6 +1516,7 @@ def run_stream(screen, clock, ip):
         screen.blit(header_font.render(f"Xbox Devkit • {ip} • {mode} mode", True, (0,200,255)), (20,20))
         shell_btn.draw(screen)
         install_btn.draw(screen)
+        bs_btn.draw(screen)
         full_term_btn.draw(screen)
 
         if not terminal.fullscreen_mode:
@@ -1411,6 +1639,11 @@ def run_stream(screen, clock, ip):
                         threading.Thread(target=auto_connect, args=(ip,), daemon=True).start()
                     elif install_btn.clicked((mx,my)):
                         threading.Thread(target=terminal.install_package, daemon=True).start()
+                    elif bs_btn.clicked((mx,my)):
+                        if terminal.is_bs_running():
+                            threading.Thread(target=terminal.stop_bs, daemon=True).start()
+                        else:
+                            threading.Thread(target=terminal.start_bs, daemon=True).start()
                     elif full_term_btn.clicked((mx,my)):
                         terminal.fullscreen_mode = not terminal.fullscreen_mode
                         force_resize = True
@@ -1519,6 +1752,12 @@ class HeadlessTerminal(IntegratedTerminal):
         self.ip = None
         self.pin = None
         self.installing = False
+        self.bs_running = False
+        self.bs_busy = False
+        self.bs_stop_requested = False
+        self.bs_process = None
+        self.bs_relay_url = None
+        self.bs_lock = threading.Lock()
 
         self._dirty = False
         self._cached_surf = None

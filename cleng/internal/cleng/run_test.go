@@ -107,6 +107,14 @@ func TestInjectBundledTargetRuntimeRespectsExplicitSysroot(t *testing.T) {
 	}
 }
 
+func TestPrepareArgvLeavesIntegratedToolInvocationsUntouched(t *testing.T) {
+	argv := []string{"cleng", "-cc1", "-triple", "x86_64-w64-windows-gnu", "-main-file-name", "hello.cpp"}
+	got := prepareArgv(argv)
+	if !reflect.DeepEqual(got, argv) {
+		t.Fatalf("argv should have been left alone:\n got: %#v\nwant: %#v", got, argv)
+	}
+}
+
 func withBundleRoots(t *testing.T, root string) {
 	t.Helper()
 	prev := bundleRootsFunc

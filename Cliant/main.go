@@ -191,7 +191,7 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 		// cgo defaults to ON because most builds pull in cleng-driven C/C++
 		// wrappers. Override with -cgo 0 for pure-Go builds, and -goos /
 		// -goarch when you really mean to cross-compile.
-		timeout:    10 * time.Minute,
+		timeout: 10 * time.Minute,
 	}
 
 	var sourceSet bool
@@ -268,9 +268,20 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 				return opts, fmt.Errorf("parse timeout: %w", err)
 			}
 			opts.timeout = timeout
+		case "--":
+			opts.compilerArgs = append(opts.compilerArgs, args[i+1:]...)
+			i = len(args)
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return opts, fmt.Errorf("unknown flag %q", arg)
+				opts.compilerArgs = append(opts.compilerArgs, arg)
+				if compilerArgConsumesNextValue(arg) {
+					i++
+					if i >= len(args) {
+						return opts, fmt.Errorf("missing value for compiler flag %q", arg)
+					}
+					opts.compilerArgs = append(opts.compilerArgs, args[i])
+				}
+				continue
 			}
 			if sourceSet {
 				return opts, fmt.Errorf("unexpected extra path %q", arg)
@@ -313,8 +324,53 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 	if opts.language == "" {
 		opts.language = detectLanguage(opts.sourcePath, opts.target, info)
 	}
+	if len(opts.compilerArgs) != 0 && !isCompilerLanguage(opts.language) {
+		return opts, fmt.Errorf(
+			"compiler flags were provided but build language resolved to %q; use -lang c/cpp or point cliant at a C/C++ source tree",
+			opts.language,
+		)
+	}
 
 	return opts, nil
+}
+
+func compilerArgConsumesNextValue(arg string) bool {
+	switch arg {
+	case "-I",
+		"-L",
+		"-D",
+		"-U",
+		"-F",
+		"-Xclang",
+		"-Xlinker",
+		"-Xassembler",
+		"-include",
+		"-imacros",
+		"-idirafter",
+		"-iframework",
+		"-isystem",
+		"-iquote",
+		"-isysroot",
+		"-syslibroot",
+		"-stdlib",
+		"-std",
+		"-target",
+		"--target",
+		"-arch",
+		"-x":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCompilerLanguage(lang string) bool {
+	switch strings.ToLower(lang) {
+	case "c", "cpp", "c++", "cc", "cxx":
+		return true
+	default:
+		return false
+	}
 }
 
 func runServe(opts serveOptions) error {
@@ -905,7 +961,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "  cliant serve [-listen 0.0.0.0:17777] [-max-upload-mib 256]")
 	fmt.Fprintln(os.Stderr, "  cliant probe <xbox-ip>")
-	fmt.Fprintln(os.Stderr, "  cliant <server-url> build [path] [-o output] [-pkg target] [-goos os] [-goarch arch] [-cgo 0|1] [-timeout 10m]")
+	fmt.Fprintln(os.Stderr, "  cliant <server-url> build [path] [-o output] [-pkg target] [-goos os] [-goarch arch] [-cgo 0|1] [-timeout 10m] [-- compiler-flags]")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> health")
 }
 

@@ -22,9 +22,26 @@ import (
 // happens inside the in-process Clang libraries. We do not fork an external
 // clang binary.
 func Run(argv []string) (int, error) {
+	argv = prepareArgv(argv)
+	return cgobridge.ClangMain(argv)
+}
+
+func prepareArgv(argv []string) []string {
+	// When clang re-invokes itself for a direct integrated-tool entry point
+	// (`-cc1`, `-cc1as`, `-cc1gen-reproducer`), that flag must remain argv[1].
+	// Prepending our own resource-dir/sysroot flags would shift it out of
+	// position and make the subprocess parse low-level cc1 flags as if they
+	// were top-level driver arguments.
+	if isDirectIntegratedToolInvocation(argv) {
+		return argv
+	}
 	argv = injectResourceDir(argv)
 	argv = injectBundledTargetRuntime(argv)
-	return cgobridge.ClangMain(argv)
+	return argv
+}
+
+func isDirectIntegratedToolInvocation(argv []string) bool {
+	return len(argv) >= 2 && strings.HasPrefix(argv[1], "-cc1")
 }
 
 // injectResourceDir prepends `-resource-dir <dir>` to argv if (a) the user
