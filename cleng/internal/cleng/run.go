@@ -177,7 +177,7 @@ func findBundledGNUFlags(triple string) []string {
 }
 
 func injectBundledLinker(argv []string) []string {
-	if hasExplicitLinkerOverride(argv) {
+	if !shouldInjectBundledLinker(argv) || hasExplicitLinkerOverride(argv) {
 		return argv
 	}
 	triple := effectiveTargetTriple(argv)
@@ -190,6 +190,16 @@ func injectBundledLinker(argv []string) []string {
 		return argv
 	}
 	return insertAfterArgv0(argv, "-fuse-ld=lld", "--ld-path="+linkerPath)
+}
+
+func shouldInjectBundledLinker(argv []string) bool {
+	for _, arg := range argv[1:] {
+		switch arg {
+		case "-c", "-E", "-S", "-fsyntax-only", "-emit-ast":
+			return false
+		}
+	}
+	return true
 }
 
 func setBundledToolEnv(argv []string) func() {

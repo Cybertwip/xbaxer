@@ -169,6 +169,20 @@ func TestInjectBundledLinkerUsesLedWrapper(t *testing.T) {
 	}
 }
 
+func TestInjectBundledLinkerSkipsCompileOnlyInvocation(t *testing.T) {
+	root := t.TempDir()
+	mustMkdirAll(t, filepath.Join(root, "bin"))
+	mustWriteFile(t, filepath.Join(root, "bin", "led.exe"))
+
+	withBundleRoots(t, root)
+
+	argv := []string{"cleng", "--target=x86_64-apple-darwin", "-c", "hello.c", "-o", "hello.o"}
+	got := injectBundledLinker(argv)
+	if !reflect.DeepEqual(got, argv) {
+		t.Fatalf("argv should have been left alone:\n got: %#v\nwant: %#v", got, argv)
+	}
+}
+
 func withBundleRoots(t *testing.T, root string) {
 	t.Helper()
 	prev := bundleRootsFunc
