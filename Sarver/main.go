@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -40,7 +41,7 @@ type server struct {
 }
 
 func main() {
-	listenAddr := flag.String("listen", "127.0.0.1:17777", "listen address")
+	listenAddr := flag.String("listen", "0.0.0.0:17777", "listen address")
 	goBinary := flag.String("go", defaultGoBinaryPath(), "path to the Go executable used for builds")
 	cacheRoot := flag.String("cache-dir", defaultCacheRoot(), "directory used for Go build and module caches")
 	timeout := flag.Duration("timeout", 10*time.Minute, "maximum time allowed per build")
@@ -75,7 +76,14 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("sarver listening on http://%s", *listenAddr)
+	log.Printf("sarver listen address: http://%s", *listenAddr)
+	log.Printf("sarver go binary: %s", *goBinary)
+	log.Printf("sarver cache root: %s", cacheRootPath)
+	if isLoopbackListenAddr(*listenAddr) {
+		log.Printf("sarver warning: %s is loopback-only; remote hosts will not be able to connect", *listenAddr)
+	} else {
+		log.Printf("sarver network access enabled; connect from your host using http://<server-ip>:%s", listenPort(*listenAddr))
+	}
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -84,8 +92,9 @@ func main() {
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s (%s)", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(recorder, r)
+		log.Printf("%s %s from %s -> %d (%s)", r.Method, r.URL.Path, r.RemoteAddr, recorder.status, time.Since(start).Round(time.Millisecond))
 	})
 }
 
@@ -166,6 +175,7 @@ func (s *server) handleBuild(maxUploadMiB int64) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 			return
 		}
+		log.Printf("build request from %s: target=%s output=%s goos=%s goarch=%s cgo=%s", r.RemoteAddr, target, outputName, req.GOOS, req.GOARCH, req.CGOEnabled)
 		args = append(args, target)
 
 		cmd := exec.CommandContext(ctx, s.goBinary, args...)
@@ -184,6 +194,10 @@ func (s *server) handleBuild(maxUploadMiB int64) http.HandlerFunc {
 			status := http.StatusInternalServerError
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				status = http.StatusGatewayTimeout
+			}
+			log.Printf("build failed for %s: %v", outputName, err)
+			if len(buildLog) > 0 {
+				log.Printf("build log for %s:\n%s", outputName, strings.TrimSpace(string(buildLog)))
 			}
 			writeJSON(w, status, errorResponse{
 				Error: fmt.Sprintf("build failed: %v", err),
@@ -209,11 +223,22 @@ func (s *server) handleBuild(maxUploadMiB int64) http.HandlerFunc {
 		w.Header().Set("X-Sarver-Goos", req.GOOS)
 		w.Header().Set("X-Sarver-Goarch", req.GOARCH)
 		w.WriteHeader(http.StatusOK)
+		log.Printf("build succeeded for %s; streaming result to %s", outputName, r.RemoteAddr)
 
 		if _, err := io.Copy(w, builtFile); err != nil {
 			log.Printf("stream build output: %v", err)
 		}
 	}
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
 }
 
 func decodeBuildRequest(raw string) (buildRequest, error) {
@@ -388,4 +413,25 @@ func defaultGoBinaryPath() string {
 		}
 	}
 	return "go"
+}
+
+func isLoopbackListenAddr(listenAddr string) bool {
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func listenPort(listenAddr string) string {
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil || port == "" {
+		return "17777"
+	}
+	return port
 }

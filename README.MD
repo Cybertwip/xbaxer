@@ -73,58 +73,65 @@ The default build packages these outputs:
 - The local build also produces a native host copy of `cliant` under `build/host/cliant/`.
 - Build artifacts are intentionally ignored by the repository `.gitignore`.
 
-## Remote Build Example
+## Install And Manual HelloBax Test Flow
 
-Start the server from the packaged Xbax tree on the remote machine:
+Use this flow when you want to install the packaged toolchain onto the Xbox from the UI, then manually prove that `cliant` can send a Go project to `sarver`, have it compiled remotely, and receive the built artifact back on your host machine.
+
+1. Start the desktop client from the repo root:
 
 ```bash
+python3 main.py
+```
+
+2. Connect to the devkit stream, then connect to the shell using the Visual Studio PIN shown in the RTSP view.
+3. After the shell is connected, click `Install`.
+   This builds the local package, syncs it to `D:/DevelopmentFiles/Xbax`, skips files that are already current, and updates remote files when the local packaged copy is newer.
+4. In the remote shell, start the compiler server from the installed Xbax tree:
+
+```text
+d:
+cd \DevelopmentFiles\Xbax\sarver
 sarver.exe -listen 0.0.0.0:17777
 ```
 
-Then build a local Go workspace through it:
+`sarver.exe` now defaults to `0.0.0.0:17777`, so remote hosts can connect even if you omit the flag. The startup log will also tell you whether it is network-accessible or loopback-only.
 
-```bash
-cliant http://<server-ip>:17777 build . -goos windows -goarch amd64 -o myapp.exe
-```
-
-## Manual HelloBax Test Flow
-
-Use this flow when you want to manually prove that `cliant` can send a Go project to `sarver`, have it compiled remotely, and receive the built artifact back on your host machine.
-
-1. Build the repo outputs first so you have:
-   `build/package/Xbax/sarver/sarver.exe`
-   `build/host/cliant/cliant` on macOS/Linux hosts, or `build/host/cliant/cliant.exe` on Windows hosts.
-2. Copy the packaged Xbax tree to the remote machine so `sarver.exe` and `campiler/` are present together.
-3. Start the compiler server on the remote machine:
-
-```bash
-sarver.exe -listen 0.0.0.0:17777
-```
-
-4. On the host machine, open the sample project:
+5. On the host machine, open the sample project:
 
 ```bash
 cd HelloBax
 ```
 
-5. Run the host `cliant` against the remote server.
+6. Run the native host `cliant` against the remote server.
 
-For a Windows build:
+For a Windows build from macOS or Linux:
 
 ```bash
 ../build/host/cliant/cliant http://<server-ip>:17777 build . -goos windows -goarch amd64 -o myapp.exe
 ```
 
-For macOS on this host (`darwin/amd64`):
+For macOS Intel:
 
 ```bash
 ../build/host/cliant/cliant http://<server-ip>:17777 build . -goos darwin -goarch amd64 -o myapp
 ```
 
-If you want Apple Silicon output instead, use:
+For macOS Apple Silicon:
 
 ```bash
 ../build/host/cliant/cliant http://<server-ip>:17777 build . -goos darwin -goarch arm64 -o myapp
+```
+
+For Linux x86_64:
+
+```bash
+../build/host/cliant/cliant http://<server-ip>:17777 build . -goos linux -goarch amd64 -o myapp
+```
+
+For Linux arm64:
+
+```bash
+../build/host/cliant/cliant http://<server-ip>:17777 build . -goos linux -goarch arm64 -o myapp
 ```
 
 `HelloBax` is the smallest manual test target in this repo and prints `Hello Bax`.

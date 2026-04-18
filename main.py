@@ -482,10 +482,22 @@ class IntegratedTerminal:
 
     def _remote_path_exists(self, sftp, remote_path):
         try:
-            sftp.stat(remote_path)
-            return True
+            return sftp.stat(remote_path)
         except IOError:
+            return None
+
+    def _remote_file_is_current(self, sftp, local_path, remote_path):
+        remote_stat = self._remote_path_exists(sftp, remote_path)
+        if remote_stat is None:
             return False
+
+        local_stat = os.stat(local_path)
+        if remote_stat.st_size != local_stat.st_size:
+            return False
+
+        local_mtime = int(local_stat.st_mtime)
+        remote_mtime = int(getattr(remote_stat, "st_mtime", 0))
+        return remote_mtime >= local_mtime
 
     def _upload_tree(self, local_dir, remote_dir):
         files = []
@@ -504,7 +516,7 @@ class IntegratedTerminal:
             self._remote_mkdirs(sftp, remote_dir)
             for index, (local_path, remote_path) in enumerate(files, start=1):
                 self._remote_mkdirs(sftp, os.path.dirname(remote_path))
-                if self._remote_path_exists(sftp, remote_path):
+                if self._remote_file_is_current(sftp, local_path, remote_path):
                     skipped += 1
                 else:
                     sftp.put(local_path, remote_path)
