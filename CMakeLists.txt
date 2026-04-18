@@ -507,6 +507,8 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E env ${XBAX_GO_BUILD_ENV}
           "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
           -o "${LED_OUTPUT}" .
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LED_OUTPUT}" "${CLENG_OUTPUT_DIR}/ld.lld.exe"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LED_OUTPUT}" "${CLENG_OUTPUT_DIR}/ld64.lld.exe"
   DEPENDS
     go-toolchain
     "${LED_SOURCE_DIR}/go.mod"

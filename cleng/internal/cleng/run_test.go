@@ -159,8 +159,8 @@ func TestInjectBundledLinkerUsesLedWrapper(t *testing.T) {
 	got := injectBundledLinker([]string{"cleng", "--target=x86_64-apple-darwin", "hello.o"})
 	want := []string{
 		"cleng",
+		"-B" + filepath.Join(root, "bin"),
 		"-fuse-ld=lld",
-		"--ld-path=" + filepath.Join(root, "bin", "led.exe"),
 		"--target=x86_64-apple-darwin",
 		"hello.o",
 	}
