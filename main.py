@@ -782,14 +782,38 @@ class IntegratedTerminal:
     def _remote_bundle_path(self, remote_dir):
         return remote_dir.rstrip("/") + "/" + REMOTE_INSTALL_BUNDLE
 
+    def _is_windows_safe_relpath(self, rel_path):
+        invalid_chars = set('<>:"|?*')
+        reserved_names = {
+            "con", "prn", "aux", "nul",
+            "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+            "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        }
+
+        for part in rel_path.replace("\\", "/").split("/"):
+            if not part:
+                continue
+            if any(ch in invalid_chars for ch in part):
+                return False
+            if part.endswith((" ", ".")):
+                return False
+            stem = part.rstrip(" .").split(".", 1)[0].lower()
+            if stem in reserved_names:
+                return False
+        return True
+
     def _collect_local_package_files(self, local_dir):
         files = []
         manifest = {}
+        skipped_unsafe = []
         for root, _, filenames in os.walk(local_dir):
             filenames.sort()
             for filename in filenames:
                 local_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(local_path, local_dir).replace(os.sep, "/")
+                if not self._is_windows_safe_relpath(rel_path):
+                    skipped_unsafe.append(rel_path)
+                    continue
                 # Package installs should upload the real file bytes even when
                 # the package tree exposes SDK headers via symlinks.
                 resolved_path = os.path.realpath(local_path)
@@ -801,7 +825,7 @@ class IntegratedTerminal:
                     "size": local_stat.st_size,
                     "mtime": int(local_stat.st_mtime),
                 }
-        return files, manifest
+        return files, manifest, skipped_unsafe
 
     def _read_remote_manifest(self, sftp, remote_dir):
         remote_manifest_path = self._remote_manifest_path(remote_dir)
@@ -968,7 +992,12 @@ class IntegratedTerminal:
         return uploaded, skipped
 
     def _upload_tree(self, local_dir, remote_dir):
-        files, local_manifest = self._collect_local_package_files(local_dir)
+        files, local_manifest, skipped_unsafe = self._collect_local_package_files(local_dir)
+        if skipped_unsafe:
+            self.log(
+                f"[*] Skipping {len(skipped_unsafe)} Windows-incompatible packaged file(s) "
+                f"(first: {skipped_unsafe[0]})"
+            )
         self.log(f"[*] Scanning {len(files)} packaged file(s) for install sync...")
 
         sftp = self.ssh_client.open_sftp()

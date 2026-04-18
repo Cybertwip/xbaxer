@@ -237,9 +237,11 @@ endif()
 #   cleng/sysroot/x86_64-w64-mingw32/include/                      (C/C++)
 #   cleng/sysroot/x86_64-w64-mingw32/lib/                          (PE import libs)
 #   cleng/sysroot/x86_64-w64-mingw32/lib/gcc/...                   (libgcc, crt*)
-#   cleng/sysroot/x86_64-apple-darwin/usr + /System + /Library     (macOS SDK)
-#   cleng/sysroot/aarch64-apple-darwin/usr + /System + /Library
-#   cleng/sysroot/x86_64-linux-gnu/sysroot/usr/...                 (glibc sysroot)
+#   cleng/sysroot/x86_64-apple-darwin/usr/include + /usr/lib       (macOS SDK)
+#   cleng/sysroot/x86_64-apple-darwin/System/Library/*Frameworks   (framework stubs/headers)
+#   cleng/sysroot/x86_64-apple-darwin/Library/Frameworks
+#   cleng/sysroot/aarch64-apple-darwin/...
+#   cleng/sysroot/x86_64-linux-gnu/sysroot/{usr/include,usr/lib,...}(glibc sysroot)
 #   cleng/sysroot/x86_64-linux-gnu/include/c++/...                 (libstdc++)
 #   cleng/sysroot/x86_64-linux-gnu/lib/gcc/...                     (libgcc, crt*)
 #   cleng/sysroot/aarch64-linux-gnu/...
@@ -379,19 +381,19 @@ cleng_append_runtime_bundle_command(
   "${CLENG_APPLE_SDKROOT}"
   "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-apple-darwin"
   "usr/include/stdio.h"
-  "usr;System;Library"
+  "usr/include;usr/lib;System/Library/Frameworks;System/Library/PrivateFrameworks;Library/Frameworks"
 )
 cleng_append_runtime_bundle_command(
   "${CLENG_APPLE_SDKROOT}"
   "${XBAX_PACKAGE_DIR}/cleng/sysroot/aarch64-apple-darwin"
   "usr/include/stdio.h"
-  "usr;System;Library"
+  "usr/include;usr/lib;System/Library/Frameworks;System/Library/PrivateFrameworks;Library/Frameworks"
 )
 cleng_append_runtime_bundle_command(
   "${CLENG_LINUX_AMD64_TARGET_ROOT}"
   "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-linux-gnu"
   "sysroot/usr/include/stdio.h"
-  "include;lib;lib32;lib64;sysroot"
+  "include;lib;lib32;lib64;sysroot/include;sysroot/lib;sysroot/lib64;sysroot/usr/include;sysroot/usr/lib;sysroot/usr/lib64"
 )
 cleng_append_runtime_bundle_command(
   "${CLENG_LINUX_AMD64_TOOLCHAIN_ROOT}"
@@ -403,7 +405,7 @@ cleng_append_runtime_bundle_command(
   "${CLENG_LINUX_ARM64_TARGET_ROOT}"
   "${XBAX_PACKAGE_DIR}/cleng/sysroot/aarch64-linux-gnu"
   "sysroot/usr/include/stdio.h"
-  "include;lib;lib32;lib64;sysroot"
+  "include;lib;lib32;lib64;sysroot/include;sysroot/lib;sysroot/lib64;sysroot/usr/include;sysroot/usr/lib;sysroot/usr/lib64"
 )
 cleng_append_runtime_bundle_command(
   "${CLENG_LINUX_ARM64_TOOLCHAIN_ROOT}"
