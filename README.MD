@@ -105,7 +105,7 @@ Optional flags:
 - `-listen <addr>` — listen address, defaults to `0.0.0.0:17777`.
 - `-max-upload-mib <N>` — maximum accepted source archive size, defaults to `256`.
 
-5. In the remote Xbox shell, start `sarver.exe` in **reverse mode** so it dials back into the host relay and polls for build jobs:
+5. In the remote Xbox shell, start `sarver.exe`. Reverse-poll mode is now the default — `sarver.exe` will dial back into the host relay (defaulting to `http://127.0.0.1:17777`) and poll for build jobs:
 
 ```text
 d:
@@ -113,7 +113,7 @@ cd \DevelopmentFiles\Xbax\sarver
 sarver.exe -reverse http://<host-ip>:17777
 ```
 
-`sarver.exe` only needs `-reverse` to participate in the relay; the `-listen` flag is unused in this mode because the connection is initiated outbound from the Xbox. On startup the log prints `sarver reverse mode enabled; relay=...` and `sarver will pull build jobs from the host relay`.
+If the host relay is reachable at `http://127.0.0.1:17777` from the Xbox (e.g. through a tunnel), running `sarver.exe` with no flags is enough. To force the legacy push-mode HTTP server instead, pass `-listen 0.0.0.0:17777` explicitly. On startup the log prints `sarver reverse mode enabled; relay=...` and `sarver will pull build jobs from the host relay`.
 
 6. On the host machine, open the sample project and submit a build to your own relay (`http://127.0.0.1:17777` from the same machine, or `http://<host-ip>:17777` from another host on the LAN):
 
