@@ -1035,12 +1035,10 @@ def connect_ssh(ip, pin, terminal, save_on_success=False):
         terminal.start_telnet(ip, pin, ssh, 24)
 
     except paramiko.AuthenticationException:
-        remove_pin(ip)
-        with terminal.lock: terminal.history.append("[-] Error: Authentication failed. Stored PIN cleared.")
+        with terminal.lock: terminal.history.append("[-] Error: Authentication failed. Re-enter PIN.")
         terminal._mark_dirty()
         terminal.needs_pin_prompt = True
     except Exception as e:
-        remove_pin(ip)
         with terminal.lock: terminal.history.append(f"[-] Error: SSH connection failed: {e}")
         terminal._mark_dirty()
         terminal.needs_pin_prompt = True
@@ -1320,12 +1318,9 @@ def run_stream(screen, clock, ip):
                 terminal.focused = terminal.rect.collidepoint(mx,my)
                 if event.button == 1:
                     if shell_btn.clicked((mx,my)) and not terminal.connected:
-                        saved_pin = load_pin(ip)
-                        if saved_pin:
-                            terminal.log("[*] Found saved PIN. Authenticating in background...")
-                            threading.Thread(target=connect_ssh, args=(ip,saved_pin,terminal,False), daemon=True).start()
-                        else:
-                            prompting_pin = True; pin_buffer = ""
+                        # Always prompt for PIN; xbox_config is updated only when a
+                        # new PIN is successfully entered, never auto-loaded.
+                        prompting_pin = True; pin_buffer = ""
                         for k in list(active_keys): input_client.send_key(k,False)
                         active_keys.clear()
                     elif install_btn.clicked((mx,my)):
