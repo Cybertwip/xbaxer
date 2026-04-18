@@ -9,6 +9,8 @@ It currently contains:
 - `dastrabution/`: a Go command that links against `github.com/go-git/go-git/v5` and is cross-compiled as a Windows PE executable.
 - `anzipper/`: a Go command for listing and safely extracting `.zip` archives.
 - `gatter/`: a Go command for HTTP/HTTPS downloads, similar to a very small single-purpose fetch client.
+- `Sarver/`: a Go HTTP build server that accepts Go source archives, compiles them remotely, and streams the built artifact back.
+- `Cliant/`: a Go client for the remote build server, supporting commands such as `cliant <server-url> build .`.
 - `campiler/`: packaging helpers for producing a Windows-targeted Go bootstrap/toolchain tree from the previously built host Go toolchain.
 
 ## Requirements
@@ -58,12 +60,30 @@ The default build packages these outputs:
 - `build/package/Xbax/dastrabution/dastrabution.exe`
 - `build/package/Xbax/anzipper/anzipper.exe`
 - `build/package/Xbax/gatter/gatter.exe`
+- `build/package/Xbax/sarver/sarver.exe`
+- `build/package/Xbax/cliant/cliant.exe`
 
 ## Notes
 
 - `campiler` is built from the vendored Go source, using the previously built host Go toolchain as `GOROOT_BOOTSTRAP`.
 - `dastrabution.exe` is built with the custom Go toolchain and targets `windows/amd64`.
+- `sarver` exposes an HTTP API for remote `go build` requests and automatically prefers the packaged `campiler/bin/go.exe` when it is available next to the Xbax package.
+- `cliant` archives a Go workspace, uploads it to `sarver`, and saves the compiled binary locally.
 - Build artifacts are intentionally ignored by the repository `.gitignore`.
+
+## Remote Build Example
+
+Start the server from the packaged Xbax tree on the remote machine:
+
+```bash
+sarver.exe -listen 0.0.0.0:17777
+```
+
+Then build a local Go workspace through it:
+
+```bash
+cliant http://<server-ip>:17777 build . -goos windows -goarch amd64 -o myapp.exe
+```
 
 ## Licensing
 
