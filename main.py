@@ -982,7 +982,10 @@ class IntegratedTerminal:
             for index, (local_path, rel_path) in enumerate(changed_files, start=1):
                 remote_path = remote_dir.rstrip("/") + "/" + rel_path
                 self._remote_mkdirs(sftp, os.path.dirname(remote_path))
-                sftp.put(local_path, remote_path)
+                try:
+                    sftp.put(local_path, remote_path)
+                except Exception as exc:
+                    raise RuntimeError(f"{exc} while uploading {rel_path} -> {remote_path}") from exc
                 uploaded += 1
                 if index == len(changed_files) or index % 25 == 0:
                     self.log(f"[*] Uploaded {index}/{len(changed_files)} changed file(s) ({skipped} already current)...")
