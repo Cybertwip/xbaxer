@@ -24,6 +24,9 @@ MENU_SIZE = (1280, 720)
 STREAM_SIZE = (1280, 920)
 FPS = 60
 CONFIG_FILE = "xbox_config.json"
+TELNET_CONNECT_TIMEOUT = 15
+TELNET_KEEPALIVE_INTERVAL = 10
+SSH_KEEPALIVE_INTERVAL = 20
 
 # ================== PIN STORAGE ==================
 def load_pin(ip):
@@ -55,6 +58,18 @@ def remove_pin(ip):
                 with open(CONFIG_FILE, 'w') as f:
                     json.dump(data, f)
     except: pass
+
+def configure_keepalive(sock_obj):
+    sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    for opt_name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock_obj.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError:
+            pass
 
 # ================== KEY & MOUSE CONSTANTS ==================
 VK_MAP = {
@@ -185,7 +200,7 @@ class IntegratedTerminal:
             if self.connected and self.sock:
                 try:
                     naws = b'\xff\xfb\x1f\xff\xfa\x1f' + struct.pack('!HH', self.cols, self.rows) + b'\xff\xf0'
-                    self.sock.send(naws)
+                    self.sock.sendall(naws)
                 except: pass
 
     def scroll_up(self):
@@ -285,15 +300,15 @@ class IntegratedTerminal:
 
         if self.raw_input_mode:
             try:
-                if event.key == pygame.K_RETURN:   self.sock.send(b"\r\n")
-                elif event.key == pygame.K_BACKSPACE: self.sock.send(b"\x08")
-                elif event.unicode: self.sock.send(event.unicode.encode('utf-8'))
+                if event.key == pygame.K_RETURN:   self.sock.sendall(b"\r\n")
+                elif event.key == pygame.K_BACKSPACE: self.sock.sendall(b"\x08")
+                elif event.unicode: self.sock.sendall(event.unicode.encode('utf-8'))
             except: pass
             return True
 
         if event.key == pygame.K_RETURN:
             cmd = (self.input_buffer + "\r\n").encode('utf-8')
-            try: self.sock.send(cmd)
+            try: self.sock.sendall(cmd)
             except: pass
             self.input_buffer = ""
             self._mark_dirty()
@@ -379,7 +394,7 @@ class IntegratedTerminal:
             sftp.close()
             with self.lock: self.history.append(f"[+] '{filename}' uploaded successfully!")
             self._mark_dirty()
-            if self.connected: self.sock.send(b"dir\r\n")
+            if self.connected: self.sock.sendall(b"dir\r\n")
         except Exception as e:
             with self.lock: self.history.append(f"[-] Upload failed: {e}")
             self._mark_dirty()
@@ -392,12 +407,13 @@ class IntegratedTerminal:
 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self.sock.settimeout(15)
+            configure_keepalive(self.sock)
+            self.sock.settimeout(TELNET_CONNECT_TIMEOUT)
             self.sock.connect((ip, port))
+            self.sock.settimeout(None)
             try:
                 naws = b'\xff\xfb\x1f\xff\xfa\x1f' + struct.pack('!HH', self.cols, self.rows) + b'\xff\xf0'
-                self.sock.send(naws)
+                self.sock.sendall(naws)
             except: pass
 
             self.connected = True
@@ -411,7 +427,7 @@ class IntegratedTerminal:
                 for cmd in [b"d:\r\n", b"cd \\DevelopmentFiles\r\n",
                              b"if not exist Sandbox mkdir Sandbox\r\n",
                              b"cd Sandbox\r\n", b"cls\r\n"]:
-                    try: self.sock.send(cmd); time.sleep(0.3)
+                    try: self.sock.sendall(cmd); time.sleep(0.3)
                     except: break
 
                 while self.connected:
@@ -448,13 +464,27 @@ class IntegratedTerminal:
                                 threading.Thread(target=connect_ssh, args=(self.ip, self.pin, self, False), daemon=True).start()
                         break
 
+            def telnet_keepalive():
+                while self.connected and self.sock:
+                    time.sleep(TELNET_KEEPALIVE_INTERVAL)
+                    try:
+                        self.sock.sendall(b"\xff\xf1")
+                    except Exception:
+                        break
+
             def ssh_keepalive():
                 while self.connected and self.ssh_client:
-                    time.sleep(45)
-                    try: self.ssh_client.exec_command("echo 1")
-                    except: pass
+                    time.sleep(SSH_KEEPALIVE_INTERVAL)
+                    try:
+                        transport = self.ssh_client.get_transport()
+                        if not transport or not transport.is_active():
+                            break
+                        transport.send_ignore()
+                    except Exception:
+                        break
 
             threading.Thread(target=reader, daemon=True).start()
+            threading.Thread(target=telnet_keepalive, daemon=True).start()
             threading.Thread(target=ssh_keepalive, daemon=True).start()
             return True
         except Exception as e:
@@ -594,7 +624,7 @@ def connect_ssh(ip, pin, terminal, save_on_success=False):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, 22, "DevToolsUser", pin, timeout=12)
-        ssh.get_transport().set_keepalive(30)
+        ssh.get_transport().set_keepalive(SSH_KEEPALIVE_INTERVAL)
 
         with terminal.lock: terminal.history.append("[*] Checking for existing telnetd process...")
         terminal._mark_dirty()

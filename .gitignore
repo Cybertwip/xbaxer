@@ -1,0 +1,30 @@
+# Local config and OS noise
+.DS_Store
+xbox_config.json
+
+# Python cache
+.pycache/
+__pycache__/
+
+# CMake and build output
+/build/
+/cmake-build-*/
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/compile_commands.json
+/Makefile
+
+# Native and Go build products
+*.a
+*.dll
+*.dylib
+*.exe
+*.lib
+*.o
+*.obj
+*.pdb
+*.so
+*.test
+*.prof
+*.coverprofile
