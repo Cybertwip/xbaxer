@@ -170,6 +170,57 @@ if(NOT MINGW_CC OR NOT MINGW_CXX)
   set(MINGW_CXX "x86_64-w64-mingw32-g++"  CACHE FILEPATH "Windows/amd64 C++ cross compiler")
 endif()
 
+# ---- clang-engine: cross-build LLVM/Clang static libs for windows/amd64 ----
+#
+# Mirrors the way `campiler` consumes the vendored ./go source tree: take the
+# `llvm-project` git submodule, run a script that does a two-stage build
+# (native tblgen bootstrap, then mingw-w64 cross compile), and install the
+# Windows-targeted static libs + headers under ${CLENG_CLANG_PREFIX}. cleng
+# itself depends on this target so `cmake --build build --target cleng`
+# transparently triggers the engine build first.
+set(CLANG_ENGINE_SCRIPT "${CLENG_SOURCE_DIR}/build-clang-engine.sh")
+set(CLANG_ENGINE_TOOLCHAIN_FILE "${CLENG_SOURCE_DIR}/cmake/mingw-w64-x86_64.cmake")
+set(CLANG_ENGINE_WORK_DIR "${CMAKE_BINARY_DIR}/engine/clang-build")
+set(CLANG_ENGINE_STAMP "${CLENG_CLANG_PREFIX}/.clang-engine-installed")
+
+# Auto-detect a host clang the same way go/CMakeLists.txt finds GOROOT_BOOTSTRAP.
+# Honour an explicit -DCLENG_HOST_CLANG=... if provided.
+if(NOT DEFINED CLENG_HOST_CLANG)
+  find_program(CLENG_HOST_CLANG NAMES clang)
+endif()
+if(NOT DEFINED CLENG_HOST_CLANGXX)
+  find_program(CLENG_HOST_CLANGXX NAMES clang++)
+endif()
+if(NOT CLENG_HOST_CLANG OR NOT CLENG_HOST_CLANGXX)
+  message(STATUS "cleng: host clang not auto-detected; clang-engine target will rely on PATH (clang/clang++)")
+  if(NOT CLENG_HOST_CLANG)
+    set(CLENG_HOST_CLANG "clang")
+  endif()
+  if(NOT CLENG_HOST_CLANGXX)
+    set(CLENG_HOST_CLANGXX "clang++")
+  endif()
+endif()
+
+add_custom_command(
+  OUTPUT "${CLANG_ENGINE_STAMP}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CLENG_CLANG_PREFIX}"
+  COMMAND bash "${CLANG_ENGINE_SCRIPT}"
+          "${CMAKE_SOURCE_DIR}/llvm-project"
+          "${CLANG_ENGINE_WORK_DIR}"
+          "${CLENG_CLANG_PREFIX}"
+          "${CLANG_ENGINE_TOOLCHAIN_FILE}"
+          "${CLENG_HOST_CLANG}"
+          "${CLENG_HOST_CLANGXX}"
+  DEPENDS
+    "${CLANG_ENGINE_SCRIPT}"
+    "${CLANG_ENGINE_TOOLCHAIN_FILE}"
+  COMMENT "Building Clang/LLVM static libs for windows/amd64 (cleng engine)"
+  VERBATIM
+)
+
+add_custom_target(clang-engine DEPENDS "${CLANG_ENGINE_STAMP}")
+set_target_properties(clang-engine PROPERTIES FOLDER "Toolchain")
+
 set(XBAX_CLENG_BUILD_ENV
   ${XBAX_GO_BUILD_ENV}
   "CGO_ENABLED=1"
@@ -192,6 +243,8 @@ add_custom_command(
           -o "${CLENG_OUTPUT}" .
   DEPENDS
     go-toolchain
+    clang-engine
+    "${CLANG_ENGINE_STAMP}"
     "${CLENG_SOURCE_DIR}/go.mod"
     "${CLENG_SOURCE_DIR}/main.go"
     "${CLENG_SOURCE_DIR}/internal/cleng/run.go"

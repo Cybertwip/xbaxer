@@ -12,10 +12,46 @@ It currently contains:
 - `Sarver/`: a Go HTTP build server that compiles Go source archives into binaries. In relay mode it dials out to a `cliant serve` host with `-reverse <relay-url>`, polls for queued build jobs, and streams the built artifact back.
 - `Cliant/`: a Go client *and* relay for remote builds. `cliant <relay-url> build .` submits a build, and `cliant serve -listen 0.0.0.0:17777` runs the relay that `sarver.exe` connects to.
 - `campiler/`: packaging helpers for producing a Windows-targeted Go bootstrap/toolchain tree from the previously built host Go toolchain.
+- `cleng/`: a Go-fronted Clang driver. Replaces Clang's C++ `main` with a Go entry point that links the LLVM/Clang static libs (built from the `llvm-project` submodule) via cgo, then forwards to `clang_main`. Cross-compiled to `windows/amd64` and packaged at `build/package/Xbax/cleng/bin/cleng.exe`.
+- `llvm-project/`: git submodule pinned at `llvmorg-22.1.3`. Source for the Windows-targeted Clang/LLVM static libs that `cleng` links against.
 
 ## Requirements
 
-Python packages:
+### macOS (Homebrew)
+
+A `Brewfile` at the repo root captures every native dependency — CMake +
+Ninja, the host clang/clang++ used to bootstrap the LLVM cross-build, the
+mingw-w64 cross toolchain used to target Windows, an existing `go` for
+`GOROOT_BOOTSTRAP`, and Python 3.12 for the streaming client.
+
+```bash
+brew bundle
+```
+
+### Linux (Debian / Ubuntu)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  cmake ninja-build pkg-config git \
+  clang lld \
+  mingw-w64 \
+  golang-go \
+  python3 python3-pip
+```
+
+### Linux (Fedora)
+
+```bash
+sudo dnf install -y \
+  cmake ninja-build pkgconf-pkg-config git \
+  clang lld \
+  mingw64-gcc mingw64-gcc-c++ mingw64-winpthreads-static \
+  golang \
+  python3 python3-pip
+```
+
+Python packages (all platforms):
 
 - `pygame`
 - `opencv-python-headless`
@@ -63,6 +99,20 @@ The default build packages these outputs:
 - `build/package/Xbax/sarver/sarver.exe`
 - `build/package/Xbax/cliant/cliant.exe`
 - `build/host/cliant/cliant` on macOS/Linux hosts, or `build/host/cliant/cliant.exe` on Windows hosts
+
+To additionally build the Go-fronted Clang driver:
+
+```bash
+git submodule update --init --recursive    # one-time, fetches llvm-project
+cmake --build build --target cleng -j4
+```
+
+This first builds the Windows-targeted Clang/LLVM static libs from the
+`llvm-project` submodule (under `build/engine/clang-windows-amd64/`) using
+your host `clang`/`clang++` as the bootstrap — exactly the same role that
+an existing `go` plays as `GOROOT_BOOTSTRAP` for the vendored Go tree —
+then links `build/package/Xbax/cleng/bin/cleng.exe` via the mingw-w64
+cross toolchain.
 
 ## Notes
 
