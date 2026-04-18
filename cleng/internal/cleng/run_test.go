@@ -126,6 +126,41 @@ func TestInjectBundledTargetRuntimeMingwBundleAcceptsWindowsGNUAlias(t *testing.
 	}
 }
 
+func TestInjectBundledTargetRuntimeCompileOnlySkipsLibrarySearch(t *testing.T) {
+	root := t.TempDir()
+	bundle := filepath.Join(root, "sysroot", "x86_64-w64-mingw32")
+	gccLib := filepath.Join(bundle, "lib", "gcc", "x86_64-w64-mingw32", "15.2.0")
+	cxx := filepath.Join(bundle, "include", "c++", "15.2.0")
+	cxxTarget := filepath.Join(cxx, "x86_64-w64-mingw32")
+	include := filepath.Join(bundle, "include")
+	lib := filepath.Join(bundle, "lib")
+
+	for _, dir := range []string{gccLib, cxxTarget, include, lib} {
+		mustMkdirAll(t, dir)
+	}
+	mustWriteFile(t, filepath.Join(include, "stdio.h"))
+
+	withBundleRoots(t, root)
+
+	got := injectBundledTargetRuntime([]string{"cleng", "--target=x86_64-w64-mingw32", "-c", "hello.c", "-o", "hello.o"})
+	want := []string{
+		"cleng",
+		"--sysroot=" + bundle,
+		"-B" + gccLib,
+		"-isystem", cxx,
+		"-isystem", cxxTarget,
+		"-isystem", include,
+		"--target=x86_64-w64-mingw32",
+		"-c",
+		"hello.c",
+		"-o",
+		"hello.o",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestInjectBundledTargetRuntimeRespectsExplicitSysroot(t *testing.T) {
 	root := t.TempDir()
 	sdk := filepath.Join(root, "sysroot", "x86_64-apple-darwin")
@@ -180,6 +215,29 @@ func TestInjectBundledLinkerSkipsCompileOnlyInvocation(t *testing.T) {
 	got := injectBundledLinker(argv)
 	if !reflect.DeepEqual(got, argv) {
 		t.Fatalf("argv should have been left alone:\n got: %#v\nwant: %#v", got, argv)
+	}
+}
+
+func TestRequestedProgramName(t *testing.T) {
+	if got := requestedProgramName([]string{"cleng", "-arch", "x86_64", "--print-prog-name", "dsymutil"}); got != "dsymutil" {
+		t.Fatalf("unexpected program name: got %q want %q", got, "dsymutil")
+	}
+	if got := requestedProgramName([]string{"cleng", "--print-prog-name=strip"}); got != "strip" {
+		t.Fatalf("unexpected program name: got %q want %q", got, "strip")
+	}
+}
+
+func TestFindBundledProgramPath(t *testing.T) {
+	root := t.TempDir()
+	mustMkdirAll(t, filepath.Join(root, "bin"))
+	mustWriteFile(t, filepath.Join(root, "bin", "dsymutil.exe"))
+
+	withBundleRoots(t, root)
+
+	got := findBundledProgramPath("dsymutil")
+	want := filepath.Join(root, "bin", "dsymutil.exe")
+	if got != want {
+		t.Fatalf("unexpected tool path: got %q want %q", got, want)
 	}
 }
 

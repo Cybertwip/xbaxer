@@ -11,6 +11,14 @@ import (
 const clengTargetTripleEnv = "CLENG_TARGET_TRIPLE"
 
 func main() {
+	if handled, err := maybeRunUtilityShim(os.Args); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "led: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	tool, flavorArg, err := findBundledLinker(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "led: %v\n", err)
@@ -30,6 +38,16 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "led: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func maybeRunUtilityShim(argv []string) (bool, error) {
+	base := strings.ToLower(filepath.Base(argv[0]))
+	switch base {
+	case "dsymutil.exe", "dsymutil", "strip.exe", "strip":
+		return true, nil
+	default:
+		return false, nil
 	}
 }
 

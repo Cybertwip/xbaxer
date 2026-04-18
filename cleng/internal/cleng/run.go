@@ -7,6 +7,7 @@
 package cleng
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +25,9 @@ const clengTargetTripleEnv = "CLENG_TARGET_TRIPLE"
 // happens inside the in-process Clang libraries. We do not fork an external
 // clang binary.
 func Run(argv []string) (int, error) {
+	if handled, err := maybeHandleProgramLookup(argv); handled {
+		return 0, err
+	}
 	argv = prepareArgv(argv)
 	restoreEnv := setBundledToolEnv(argv)
 	defer restoreEnv()
@@ -108,7 +112,7 @@ func injectBundledTargetRuntime(argv []string) []string {
 		return argv
 	}
 
-	if extra := findBundledGNUFlags(triple); len(extra) != 0 {
+	if extra := findBundledGNUFlagsForPhase(triple, shouldInjectBundledLibrarySearchFlags(argv)); len(extra) != 0 {
 		return insertAfterArgv0(argv, extra...)
 	}
 
@@ -153,7 +157,7 @@ func findBundledAppleSDK(triple string) string {
 	return root
 }
 
-func findBundledGNUFlags(triple string) []string {
+func findBundledGNUFlagsForPhase(triple string, includeLibrarySearch bool) []string {
 	root := findTargetBundleDir(triple)
 	if root == "" {
 		return nil
@@ -165,13 +169,18 @@ func findBundledGNUFlags(triple string) []string {
 
 	extra := []string{"--sysroot=" + sysroot}
 	if gccLib := findHighestGCCLibDir(root, triple); gccLib != "" {
-		extra = append(extra, "-B"+gccLib, "-L", gccLib)
+		extra = append(extra, "-B"+gccLib)
+		if includeLibrarySearch {
+			extra = append(extra, "-L", gccLib)
+		}
 	}
 	for _, dir := range findBundledGNUIncludeDirs(root, sysroot, triple) {
 		extra = append(extra, "-isystem", dir)
 	}
-	for _, dir := range findBundledGNULibraryDirs(root, sysroot, triple) {
-		extra = append(extra, "-L", dir)
+	if includeLibrarySearch {
+		for _, dir := range findBundledGNULibraryDirs(root, sysroot, triple) {
+			extra = append(extra, "-L", dir)
+		}
 	}
 	return extra
 }
@@ -193,13 +202,21 @@ func injectBundledLinker(argv []string) []string {
 }
 
 func shouldInjectBundledLinker(argv []string) bool {
+	return !isCompileOnlyDriverPhase(argv)
+}
+
+func shouldInjectBundledLibrarySearchFlags(argv []string) bool {
+	return !isCompileOnlyDriverPhase(argv)
+}
+
+func isCompileOnlyDriverPhase(argv []string) bool {
 	for _, arg := range argv[1:] {
 		switch arg {
 		case "-c", "-E", "-S", "-fsyntax-only", "-emit-ast":
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func setBundledToolEnv(argv []string) func() {
@@ -239,6 +256,51 @@ func findBundledLinkerPath(triple string) string {
 			filepath.Join(root, "bin", "led"),
 			filepath.Join(root, "led.exe"),
 			filepath.Join(root, "led"),
+		} {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func maybeHandleProgramLookup(argv []string) (bool, error) {
+	tool := requestedProgramName(argv)
+	if tool == "" {
+		return false, nil
+	}
+
+	path := findBundledProgramPath(tool)
+	if path == "" {
+		_, err := fmt.Fprintln(os.Stdout, tool)
+		return true, err
+	}
+	_, err := fmt.Fprintln(os.Stdout, path)
+	return true, err
+}
+
+func requestedProgramName(argv []string) string {
+	for i := 1; i < len(argv); i++ {
+		arg := argv[i]
+		switch {
+		case arg == "--print-prog-name" && i+1 < len(argv):
+			return argv[i+1]
+		case strings.HasPrefix(arg, "--print-prog-name="):
+			return strings.TrimPrefix(arg, "--print-prog-name=")
+		}
+	}
+	return ""
+}
+
+func findBundledProgramPath(name string) string {
+	for _, root := range bundleRootsFunc() {
+		for _, candidate := range []string{
+			filepath.Join(root, "bin", name+".exe"),
+			filepath.Join(root, "bin", name),
+			filepath.Join(root, name+".exe"),
+			filepath.Join(root, name),
 		} {
 			info, err := os.Stat(candidate)
 			if err == nil && !info.IsDir() {
