@@ -42,6 +42,7 @@ type reverseJob struct {
 
 type server struct {
 	goBinary   string
+	clengBinary string
 	goCacheDir string
 	goModCache string
 	goPathDir  string
@@ -60,6 +61,7 @@ func main() {
 	reverseURL := flag.String("reverse", "", "reverse relay URL to pull build jobs from")
 	probeMode := flag.Bool("probe", false, "run the Xbox-firewall probe (binds every allowlisted port and logs inbound connections); pair with `cliant probe <xbox-ip>` from the host")
 	goBinary := flag.String("go", defaultGoBinaryPath(), "path to the Go executable used for builds")
+	clengBinary := flag.String("cleng", defaultClengBinaryPath(), "path to cleng.exe (used as CC/CXX for cgo C/C++ compilation); empty disables")
 	cacheRoot := flag.String("cache-dir", defaultCacheRoot(), "directory used for Go build and module caches")
 	timeout := flag.Duration("timeout", 10*time.Minute, "maximum time allowed per build")
 	maxUploadMiB := flag.Int64("max-upload-mib", 256, "maximum accepted source archive size in MiB")
@@ -77,6 +79,7 @@ func main() {
 
 	srv := &server{
 		goBinary:   *goBinary,
+		clengBinary: *clengBinary,
 		goCacheDir: goCacheDir,
 		goModCache: goModCache,
 		goPathDir:  goPathDir,
@@ -85,6 +88,11 @@ func main() {
 	}
 
 	log.Printf("sarver go binary: %s", *goBinary)
+	if *clengBinary != "" {
+		log.Printf("sarver cleng binary (CC/CXX for cgo): %s", *clengBinary)
+	} else {
+		log.Printf("sarver cleng binary: <disabled> — cgo C/C++ builds will fall back to whatever CC/CXX the environment provides")
+	}
 	log.Printf("sarver cache root: %s", cacheRootPath)
 
 	if *probeMode {
@@ -372,6 +380,15 @@ func (s *server) executeBuild(parent context.Context, req buildRequest, archiveR
 		"GOMODCACHE="+s.goModCache,
 		"GOPATH="+s.goPathDir,
 	)
+	if s.clengBinary != "" && req.CGOEnabled == "1" {
+		// cleng.exe is a Go-fronted Clang driver. Pointing CC/CXX at it lets
+		// cgo compile any .c / .cpp / .cxx file in the source tree without
+		// requiring a separate mingw toolchain on the console.
+		cmd.Env = append(cmd.Env,
+			"CC="+s.clengBinary,
+			"CXX="+s.clengBinary,
+		)
+	}
 	buildLog, err := cmd.CombinedOutput()
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -584,6 +601,32 @@ func defaultGoBinaryPath() string {
 		}
 	}
 	return "go"
+}
+
+// defaultClengBinaryPath looks for cleng.exe next to sarver in the
+// package layout produced by `cmake --build build --target package-xbax`:
+//
+//	package/Xbax/sarver/bin/sarver.exe
+//	package/Xbax/cleng/bin/cleng.exe
+//
+// Returns an empty string if cleng is not present so cgo builds can still
+// proceed with whatever CC/CXX is on PATH (or fail loudly if there is none).
+func defaultClengBinaryPath() string {
+	executablePath, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	executableDir := filepath.Dir(executablePath)
+	candidates := []string{
+		filepath.Join(executableDir, "..", "cleng", "bin", "cleng.exe"),
+		filepath.Join(executableDir, "..", "cleng", "bin", "cleng"),
+	}
+	for _, candidate := range candidates {
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func isLoopbackListenAddr(listenAddr string) bool {
