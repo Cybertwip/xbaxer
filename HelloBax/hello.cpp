@@ -1,27 +1,20 @@
-// hello.cpp — actual greeting is composed via std::string + std::ostringstream
-// to prove the build is going through a real C++ compiler (cleng.exe on
-// the Xbox path; the host's clang++/g++ on the host path).
+// hello.cpp — minimal C++ implementation that intentionally avoids the
+// standard library so cleng can compile it for any GOOS/GOARCH without
+// access to a platform SDK. The arithmetic still goes through a C++
+// template to prove cleng is in C++ mode (a C compiler would reject the
+// `template` keyword).
 
 #include "hello.h"
 
-#include <cstdio>
-#include <sstream>
-#include <string>
-
 namespace hellobax {
 
-static std::string Compose() {
-  std::ostringstream oss;
-  oss << "Hello Bax from C++ (" << __cplusplus << ")";
-  return oss.str();
+template <typename T>
+static T Add(T a, T b) {
+  return a + b;
 }
 
 } // namespace hellobax
 
-extern "C" int hellobax_greet(char *buf, int cap) {
-  const std::string greeting = hellobax::Compose();
-  if (buf == nullptr || cap <= 0) {
-    return static_cast<int>(greeting.size());
-  }
-  return std::snprintf(buf, static_cast<size_t>(cap), "%s", greeting.c_str());
+extern "C" int hellobax_sum(int a, int b) {
+  return hellobax::Add<int>(a, b);
 }

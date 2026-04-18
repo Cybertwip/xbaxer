@@ -1,6 +1,10 @@
 // hello.h — C-linkage facade so cgo can call the C++ implementation in
-// hello.cpp. cgo doesn't understand C++ name mangling; everything that
-// crosses the Go ↔ C++ boundary has to be declared `extern "C"`.
+// hello.cpp without needing the platform's libc/libc++ headers.
+//
+// We deliberately use only built-in types here (`int`) so this header
+// pulls in zero standard library headers — clang would otherwise look
+// for `<stddef.h>` etc. via the system SDK, which sarver-on-Xbox does
+// not have for non-Windows targets.
 
 #ifndef HELLOBAX_HELLO_H
 #define HELLOBAX_HELLO_H
@@ -9,11 +13,8 @@
 extern "C" {
 #endif
 
-// hellobax_greet writes a NUL-terminated greeting (composed in C++) into
-// the caller-provided buffer and returns the number of bytes that would
-// have been written excluding the terminator (snprintf semantics). If
-// `buf` is NULL or `cap` is 0 nothing is written.
-int hellobax_greet(char *buf, int cap);
+// hellobax_sum returns the sum of two integers, computed in C++.
+int hellobax_sum(int a, int b);
 
 #ifdef __cplusplus
 }
