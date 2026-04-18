@@ -660,7 +660,17 @@ class IntegratedTerminal:
         return '"' + value.replace('"', '\\"') + '"'
 
     def _local_anzipper_path(self):
-        return os.path.join(LOCAL_PACKAGE_DIR, "anzipper", "bin", "anzipper.exe")
+        # Search the actual package layout produced by cmake. Some tools land
+        # in <name>/bin/<name>.exe (cleng, sarver, cliant), others land in
+        # <name>/<name>.exe (anzipper, gatter). Try both.
+        candidates = [
+            os.path.join(LOCAL_PACKAGE_DIR, "anzipper", "anzipper.exe"),
+            os.path.join(LOCAL_PACKAGE_DIR, "anzipper", "bin", "anzipper.exe"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return candidates[0]
 
     def _remote_anzipper_path(self, remote_dir):
         # Drop anzipper.exe at the install-dir root so the same path works
