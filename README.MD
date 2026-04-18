@@ -62,6 +62,7 @@ The default build packages these outputs:
 - `build/package/Xbax/gatter/gatter.exe`
 - `build/package/Xbax/sarver/sarver.exe`
 - `build/package/Xbax/cliant/cliant.exe`
+- `build/host/cliant/cliant` on macOS/Linux hosts, or `build/host/cliant/cliant.exe` on Windows hosts
 
 ## Notes
 
@@ -69,6 +70,7 @@ The default build packages these outputs:
 - `dastrabution.exe` is built with the custom Go toolchain and targets `windows/amd64`.
 - `sarver` exposes an HTTP API for remote `go build` requests and automatically prefers the packaged `campiler/bin/go.exe` when it is available next to the Xbax package.
 - `cliant` archives a Go workspace, uploads it to `sarver`, and saves the compiled binary locally.
+- The local build also produces a native host copy of `cliant` under `build/host/cliant/`.
 - Build artifacts are intentionally ignored by the repository `.gitignore`.
 
 ## Remote Build Example

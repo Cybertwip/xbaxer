@@ -480,6 +480,13 @@ class IntegratedTerminal:
             except IOError:
                 sftp.mkdir(current)
 
+    def _remote_path_exists(self, sftp, remote_path):
+        try:
+            sftp.stat(remote_path)
+            return True
+        except IOError:
+            return False
+
     def _upload_tree(self, local_dir, remote_dir):
         files = []
         for root, _, filenames in os.walk(local_dir):
@@ -489,17 +496,24 @@ class IntegratedTerminal:
                 remote_path = remote_dir.rstrip("/") + "/" + rel_path.replace(os.sep, "/")
                 files.append((local_path, remote_path))
 
-        self.log(f"[*] Uploading {len(files)} packaged file(s) to {remote_dir}...")
+        self.log(f"[*] Syncing {len(files)} packaged file(s) to {remote_dir}...")
         sftp = self.ssh_client.open_sftp()
+        uploaded = 0
+        skipped = 0
         try:
             self._remote_mkdirs(sftp, remote_dir)
             for index, (local_path, remote_path) in enumerate(files, start=1):
                 self._remote_mkdirs(sftp, os.path.dirname(remote_path))
-                sftp.put(local_path, remote_path)
+                if self._remote_path_exists(sftp, remote_path):
+                    skipped += 1
+                else:
+                    sftp.put(local_path, remote_path)
+                    uploaded += 1
                 if index == len(files) or index % 25 == 0:
-                    self.log(f"[*] Uploaded {index}/{len(files)} files...")
+                    self.log(f"[*] Processed {index}/{len(files)} files ({uploaded} uploaded, {skipped} skipped)...")
         finally:
             sftp.close()
+        return uploaded, skipped
 
     def _open_remote_install_dir(self):
         if not self.connected or not self.sock:
@@ -529,14 +543,14 @@ class IntegratedTerminal:
         try:
             self.log("[*] Configuring Xbax package build...")
             self._run_local_command(["cmake", "-S", REPO_ROOT, "-B", BUILD_DIR], REPO_ROOT)
-            self.log("[*] Building Xbax package artifacts...")
-            self._run_local_command(["cmake", "--build", BUILD_DIR, "--target", "package-xbax", "-j4"], REPO_ROOT)
+            self.log("[*] Building Xbax package artifacts and host cliant...")
+            self._run_local_command(["cmake", "--build", BUILD_DIR, "--target", "package-xbax", "host-cliant", "-j4"], REPO_ROOT)
 
             if not os.path.isdir(LOCAL_PACKAGE_DIR):
                 raise RuntimeError(f"package directory not found: {LOCAL_PACKAGE_DIR}")
 
-            self._upload_tree(LOCAL_PACKAGE_DIR, REMOTE_INSTALL_DIR)
-            self.log(f"[+] Install complete. Artifacts uploaded to {REMOTE_INSTALL_DIR}")
+            uploaded, skipped = self._upload_tree(LOCAL_PACKAGE_DIR, REMOTE_INSTALL_DIR)
+            self.log(f"[+] Install complete. {uploaded} uploaded, {skipped} skipped in {REMOTE_INSTALL_DIR}")
             self._open_remote_install_dir()
         except Exception as exc:
             self.log(f"[-] Install failed: {exc}")

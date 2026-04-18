@@ -17,6 +17,7 @@ set(CMAKE_FOLDER "")
 # add_dependencies(... go-toolchain).
 
 set(XBAX_PACKAGE_DIR "${CMAKE_BINARY_DIR}/package/Xbax")
+set(XBAX_HOST_DIR "${CMAKE_BINARY_DIR}/host")
 set(CAMPILER_TEMP_DIR "${CMAKE_BINARY_DIR}/engine/go-windows-amd64-bootstrap")
 set(CAMPILER_OUTPUT_DIR "${XBAX_PACKAGE_DIR}/campiler")
 set(CAMPILER_OUTPUT "${CAMPILER_OUTPUT_DIR}/bin/go.exe")
@@ -32,6 +33,19 @@ set(XBAX_GO_BUILD_ENV
   "GOARCH=amd64"
   "CGO_ENABLED=0"
 )
+
+set(XBAX_HOST_GO_BUILD_ENV
+  "GOROOT=${GO_ROOT_DIR}"
+  "GOTOOLCHAIN=local"
+  "GOCACHE=${CMAKE_BINARY_DIR}/host-go-cache"
+  "GOMODCACHE=${CMAKE_BINARY_DIR}/host-go-mod-cache"
+  "GOPATH=${CMAKE_BINARY_DIR}/host-go-path"
+)
+
+set(HOST_GO_EXECUTABLE_SUFFIX "")
+if(CMAKE_HOST_WIN32)
+  set(HOST_GO_EXECUTABLE_SUFFIX ".exe")
+endif()
 
 add_custom_command(
   OUTPUT "${CAMPILER_OUTPUT}"
@@ -88,11 +102,51 @@ function(add_xbax_windows_go_tool tool_name)
   set_target_properties("${tool_name}" PROPERTIES FOLDER "Apps")
 endfunction()
 
+function(add_xbax_host_go_tool tool_name)
+  if(ARGC GREATER 1)
+    set(_source_dir "${CMAKE_SOURCE_DIR}/${ARGV1}")
+  else()
+    set(_source_dir "${CMAKE_SOURCE_DIR}/${tool_name}")
+  endif()
+  set(_output_dir "${XBAX_HOST_DIR}/${tool_name}")
+  set(_output "${_output_dir}/${tool_name}${HOST_GO_EXECUTABLE_SUFFIX}")
+  set(_deps
+    go-toolchain
+    "${_source_dir}/go.mod"
+    "${_source_dir}/main.go"
+  )
+  if(EXISTS "${_source_dir}/go.sum")
+    list(APPEND _deps "${_source_dir}/go.sum")
+  endif()
+
+  add_custom_command(
+    OUTPUT "${_output}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-cache"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-mod-cache"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-path"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_output_dir}"
+    COMMAND ${CMAKE_COMMAND} -E env ${XBAX_HOST_GO_BUILD_ENV}
+            "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
+            -o "${_output}" .
+    DEPENDS ${_deps}
+    WORKING_DIRECTORY "${_source_dir}"
+    COMMENT "Building host ${tool_name}${HOST_GO_EXECUTABLE_SUFFIX} with the custom Go toolchain"
+    VERBATIM
+  )
+
+  add_custom_target("host-${tool_name}" DEPENDS "${_output}")
+  set_target_properties("host-${tool_name}" PROPERTIES FOLDER "Apps")
+endfunction()
+
 add_xbax_windows_go_tool(dastrabution)
 add_xbax_windows_go_tool(anzipper)
 add_xbax_windows_go_tool(gatter)
 add_xbax_windows_go_tool(sarver Sarver)
 add_xbax_windows_go_tool(cliant Cliant)
+add_xbax_host_go_tool(cliant Cliant)
 
 add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper gatter sarver cliant)
 set_target_properties(package-xbax PROPERTIES FOLDER "Apps")
+
+add_custom_target(host-tools ALL DEPENDS host-cliant)
+set_target_properties(host-tools PROPERTIES FOLDER "Apps")
