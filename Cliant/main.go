@@ -2,10 +2,13 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -13,9 +16,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+const relayPullTimeout = 25 * time.Second
 
 var errUsageRequested = errors.New("usage requested")
 
@@ -43,6 +50,40 @@ type buildOptions struct {
 	timeout    time.Duration
 }
 
+type serveOptions struct {
+	listenAddr   string
+	maxUploadMiB int64
+}
+
+type reverseJobPayload struct {
+	ID         string       `json:"id"`
+	Request    buildRequest `json:"request"`
+	ArchiveURL string       `json:"archive_url"`
+	ResultURL  string       `json:"result_url"`
+	ErrorURL   string       `json:"error_url"`
+}
+
+type relayResult struct {
+	Status       int
+	ArtifactPath string
+	ErrorPayload errorResponse
+}
+
+type relayJob struct {
+	ID          string
+	Request     buildRequest
+	ArchivePath string
+	OutputName  string
+	Result      chan relayResult
+}
+
+type relayServer struct {
+	jobs chan *relayJob
+
+	mu     sync.Mutex
+	active map[string]*relayJob
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "cliant: %v\n", err)
@@ -53,8 +94,24 @@ func main() {
 func run(args []string) error {
 	if len(args) == 0 {
 		printUsage()
-		return errors.New("missing server URL")
+		return errors.New("missing command or server URL")
 	}
+
+	switch args[0] {
+	case "serve":
+		opts, err := parseServeOptions(args[1:])
+		if err != nil {
+			if errors.Is(err, errUsageRequested) {
+				return nil
+			}
+			return err
+		}
+		return runServe(opts)
+	case "-h", "--help", "help":
+		printUsage()
+		return nil
+	}
+
 	if len(args) == 1 {
 		printUsage()
 		return errors.New("missing command")
@@ -75,13 +132,45 @@ func run(args []string) error {
 		return runBuild(opts)
 	case "health":
 		return runHealth(serverURL)
-	case "-h", "--help", "help":
-		printUsage()
-		return nil
 	default:
 		printUsage()
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func parseServeOptions(args []string) (serveOptions, error) {
+	opts := serveOptions{
+		listenAddr:   "0.0.0.0:17777",
+		maxUploadMiB: 256,
+	}
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "--help":
+			printUsage()
+			return opts, errUsageRequested
+		case "-listen":
+			i++
+			if i >= len(args) {
+				return opts, errors.New("missing value for -listen")
+			}
+			opts.listenAddr = args[i]
+		case "-max-upload-mib":
+			i++
+			if i >= len(args) {
+				return opts, errors.New("missing value for -max-upload-mib")
+			}
+			value, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil || value <= 0 {
+				return opts, errors.New("max upload size must be a positive integer")
+			}
+			opts.maxUploadMiB = value
+		default:
+			return opts, fmt.Errorf("unknown serve flag %q", args[i])
+		}
+	}
+
+	return opts, nil
 }
 
 func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
@@ -186,6 +275,31 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 	return opts, nil
 }
 
+func runServe(opts serveOptions) error {
+	relay := &relayServer{
+		jobs:   make(chan *relayJob, 16),
+		active: make(map[string]*relayJob),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", relay.handleHealth)
+	mux.HandleFunc("/build", relay.handleBuild(opts.maxUploadMiB))
+	mux.HandleFunc("/reverse/pull", relay.handleReversePull)
+	mux.HandleFunc("/reverse/archive/", relay.handleReverseArchive)
+	mux.HandleFunc("/reverse/result/", relay.handleReverseResult)
+	mux.HandleFunc("/reverse/error/", relay.handleReverseError)
+
+	server := &http.Server{
+		Addr:              opts.listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	log.Printf("cliant relay listening on http://%s", opts.listenAddr)
+	log.Printf("cliant relay waiting for reverse workers from remote sarver instances")
+	return server.ListenAndServe()
+}
+
 func runBuild(opts buildOptions) error {
 	archivePath, err := createSourceArchive(opts.sourcePath)
 	if err != nil {
@@ -252,6 +366,310 @@ func runHealth(serverURL string) error {
 	}
 	_, err = io.Copy(os.Stdout, response.Body)
 	return err
+}
+
+func (s *relayServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *relayServer) handleBuild(maxUploadMiB int64) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+			return
+		}
+
+		req, archivePath, status, errResp := receiveBuildRequest(r, maxUploadMiB)
+		if errResp != nil {
+			writeJSON(w, status, *errResp)
+			return
+		}
+
+		job, err := s.newJob(req, archivePath)
+		if err != nil {
+			_ = os.Remove(archivePath)
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: err.Error()})
+			return
+		}
+		defer s.cleanupJob(job)
+
+		log.Printf("queued reverse build job %s: target=%s output=%s goos=%s goarch=%s", job.ID, req.Target, job.OutputName, req.GOOS, req.GOARCH)
+
+		select {
+		case result := <-job.Result:
+			if result.ArtifactPath != "" {
+				defer os.Remove(result.ArtifactPath)
+
+				builtFile, err := os.Open(result.ArtifactPath)
+				if err != nil {
+					writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("open build output: %v", err)})
+					return
+				}
+				defer builtFile.Close()
+
+				if stat, err := builtFile.Stat(); err == nil {
+					w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", job.OutputName))
+				w.WriteHeader(http.StatusOK)
+				if _, err := io.Copy(w, builtFile); err != nil {
+					log.Printf("stream relay build output: %v", err)
+				}
+				return
+			}
+
+			status := result.Status
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			writeJSON(w, status, result.ErrorPayload)
+		case <-r.Context().Done():
+			writeJSON(w, http.StatusRequestTimeout, errorResponse{Error: "build request canceled while waiting for reverse worker"})
+		}
+	}
+}
+
+func (s *relayServer) handleReversePull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	deadline := time.Now().Add(relayPullTimeout)
+	for time.Now().Before(deadline) {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			break
+		}
+
+		select {
+		case job := <-s.jobs:
+			if !s.hasJob(job.ID) {
+				continue
+			}
+
+			baseURL := baseURLFromRequest(r)
+			payload := reverseJobPayload{
+				ID:         job.ID,
+				Request:    job.Request,
+				ArchiveURL: baseURL + "/reverse/archive/" + job.ID,
+				ResultURL:  baseURL + "/reverse/result/" + job.ID,
+				ErrorURL:   baseURL + "/reverse/error/" + job.ID,
+			}
+			log.Printf("dispatching reverse build job %s", job.ID)
+			writeJSON(w, http.StatusOK, payload)
+			return
+		case <-time.After(minDuration(wait, 2*time.Second)):
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *relayServer) handleReverseArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	job := s.getJob(strings.TrimPrefix(r.URL.Path, "/reverse/archive/"))
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "unknown job"})
+		return
+	}
+
+	archiveFile, err := os.Open(job.ArchivePath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("open archive: %v", err)})
+		return
+	}
+	defer archiveFile.Close()
+
+	if stat, err := archiveFile.Stat(); err == nil {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	if _, err := io.Copy(w, archiveFile); err != nil {
+		log.Printf("stream reverse archive for %s: %v", job.ID, err)
+	}
+}
+
+func (s *relayServer) handleReverseResult(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	job := s.getJob(strings.TrimPrefix(r.URL.Path, "/reverse/result/"))
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "unknown job"})
+		return
+	}
+
+	tempFile, err := os.CreateTemp("", "cliant-result-*")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("create temp result: %v", err)})
+		return
+	}
+	defer tempFile.Close()
+
+	if _, err := io.Copy(tempFile, r.Body); err != nil {
+		_ = os.Remove(tempFile.Name())
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: fmt.Sprintf("read result: %v", err)})
+		return
+	}
+
+	if err := s.completeJob(job.ID, relayResult{
+		Status:       http.StatusOK,
+		ArtifactPath: tempFile.Name(),
+	}); err != nil {
+		_ = os.Remove(tempFile.Name())
+		writeJSON(w, http.StatusGone, errorResponse{Error: err.Error()})
+		return
+	}
+
+	log.Printf("reverse build job %s returned artifact", job.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *relayServer) handleReverseError(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	jobID := strings.TrimPrefix(r.URL.Path, "/reverse/error/")
+	if s.getJob(jobID) == nil {
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "unknown job"})
+		return
+	}
+
+	payload, _ := io.ReadAll(r.Body)
+	status := http.StatusInternalServerError
+	if rawStatus := strings.TrimSpace(r.Header.Get("X-Sarver-Status")); rawStatus != "" {
+		if parsed, err := strconv.Atoi(rawStatus); err == nil {
+			status = parsed
+		}
+	}
+
+	var errPayload errorResponse
+	if json.Unmarshal(payload, &errPayload) != nil || errPayload.Error == "" {
+		errPayload = errorResponse{Error: strings.TrimSpace(string(payload))}
+		if errPayload.Error == "" {
+			errPayload.Error = "reverse build failed"
+		}
+	}
+
+	if err := s.completeJob(jobID, relayResult{
+		Status:       status,
+		ErrorPayload: errPayload,
+	}); err != nil {
+		writeJSON(w, http.StatusGone, errorResponse{Error: err.Error()})
+		return
+	}
+
+	log.Printf("reverse build job %s returned error: %s", jobID, errPayload.Error)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *relayServer) newJob(req buildRequest, archivePath string) (*relayJob, error) {
+	job := &relayJob{
+		ID:          newJobID(),
+		Request:     req,
+		ArchivePath: archivePath,
+		OutputName:  req.OutputName,
+		Result:      make(chan relayResult, 1),
+	}
+	if job.OutputName == "" {
+		job.OutputName = defaultOutputPath(".", req.Target, nil, req.GOOS)
+	}
+
+	s.mu.Lock()
+	s.active[job.ID] = job
+	s.mu.Unlock()
+
+	select {
+	case s.jobs <- job:
+		return job, nil
+	default:
+		s.mu.Lock()
+		delete(s.active, job.ID)
+		s.mu.Unlock()
+		return nil, errors.New("reverse build queue is full; start sarver in reverse mode first")
+	}
+}
+
+func (s *relayServer) cleanupJob(job *relayJob) {
+	s.mu.Lock()
+	delete(s.active, job.ID)
+	s.mu.Unlock()
+	_ = os.Remove(job.ArchivePath)
+}
+
+func (s *relayServer) getJob(jobID string) *relayJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active[jobID]
+}
+
+func (s *relayServer) hasJob(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.active[jobID]
+	return ok
+}
+
+func (s *relayServer) completeJob(jobID string, result relayResult) error {
+	s.mu.Lock()
+	job, ok := s.active[jobID]
+	s.mu.Unlock()
+	if !ok || job == nil {
+		return errors.New("job is no longer waiting for a result")
+	}
+
+	select {
+	case job.Result <- result:
+		return nil
+	default:
+		return errors.New("job result channel is no longer available")
+	}
+}
+
+func receiveBuildRequest(r *http.Request, maxUploadMiB int64) (buildRequest, string, int, *errorResponse) {
+	maxBytes := maxUploadMiB * 1024 * 1024
+	r.Body = io.NopCloser(io.LimitReader(r.Body, maxBytes+1))
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		return buildRequest{}, "", http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("invalid multipart request: %v", err)}
+	}
+
+	req, err := decodeBuildRequest(r.FormValue("request"))
+	if err != nil {
+		return buildRequest{}, "", http.StatusBadRequest, &errorResponse{Error: err.Error()}
+	}
+
+	archiveFile, _, err := r.FormFile("archive")
+	if err != nil {
+		return buildRequest{}, "", http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("missing archive: %v", err)}
+	}
+	defer archiveFile.Close()
+
+	tempFile, err := os.CreateTemp("", "cliant-relay-*.zip")
+	if err != nil {
+		return buildRequest{}, "", http.StatusInternalServerError, &errorResponse{Error: fmt.Sprintf("create temp archive: %v", err)}
+	}
+	defer tempFile.Close()
+
+	if _, err := io.Copy(tempFile, archiveFile); err != nil {
+		_ = os.Remove(tempFile.Name())
+		return buildRequest{}, "", http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("save archive: %v", err)}
+	}
+
+	return req, tempFile.Name(), http.StatusOK, nil
 }
 
 func createSourceArchive(sourcePath string) (string, error) {
@@ -390,6 +808,23 @@ func makeMultipartBody(archivePath string, request buildRequest) (io.Reader, str
 	return pipeReader, writer.FormDataContentType(), nil
 }
 
+func decodeBuildRequest(raw string) (buildRequest, error) {
+	var req buildRequest
+	if raw == "" {
+		return req, errors.New("missing build request metadata")
+	}
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		return req, fmt.Errorf("decode build request: %w", err)
+	}
+	if req.GOOS == "" || req.GOARCH == "" {
+		return req, errors.New("goos and goarch are required")
+	}
+	if req.CGOEnabled == "" {
+		req.CGOEnabled = "0"
+	}
+	return req, nil
+}
+
 func decodeServerError(response *http.Response) error {
 	payload, _ := io.ReadAll(response.Body)
 	var structured errorResponse
@@ -416,6 +851,7 @@ func normalizeCGO(value string) string {
 
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
+	fmt.Fprintln(os.Stderr, "  cliant serve [-listen 0.0.0.0:17777] [-max-upload-mib 256]")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> build [path] [-o output] [-pkg target] [-goos os] [-goarch arch] [-cgo 0|1] [-timeout 10m]")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> health")
 }
@@ -445,4 +881,33 @@ func defaultOutputPath(sourcePath, target string, sourceInfo os.FileInfo, goos s
 		base += ".exe"
 	}
 	return base
+}
+
+func newJobID() string {
+	randomBytes := make([]byte, 8)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return fmt.Sprintf("job-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(randomBytes)
+}
+
+func baseURLFromRequest(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }

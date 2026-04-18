@@ -474,18 +474,33 @@ class IntegratedTerminal:
             self._mark_dirty(); return
 
         filename = os.path.basename(filepath)
-        with self.lock: self.history.append(f"[*] Uploading '{filename}' to Sandbox via SFTP...")
+        remote_dir = self._current_remote_directory() or "D:/DevelopmentFiles/Sandbox"
+        remote_path = remote_dir.rstrip("/") + "/" + filename
+        with self.lock: self.history.append(f"[*] Uploading '{filename}' to {remote_dir} via SFTP...")
         self._mark_dirty()
         try:
             sftp = self.ssh_client.open_sftp()
-            sftp.put(filepath, f"D:/DevelopmentFiles/Sandbox/{filename}")
+            self._remote_mkdirs(sftp, remote_dir)
+            sftp.put(filepath, remote_path)
             sftp.close()
-            with self.lock: self.history.append(f"[+] '{filename}' uploaded successfully!")
+            with self.lock: self.history.append(f"[+] '{filename}' uploaded successfully to {remote_dir}!")
             self._mark_dirty()
             if self.connected: self.sock.sendall(b"dir\r\n")
         except Exception as e:
             with self.lock: self.history.append(f"[-] Upload failed: {e}")
             self._mark_dirty()
+
+    def _current_remote_directory(self):
+        prompt_pattern = re.compile(r"([A-Za-z]:(?:\\[^>\r\n]*)?)>")
+        with self.lock:
+            active_lines = [''.join(r).rstrip() for r in self.grid]
+            all_lines = self.history + active_lines
+
+        for line in reversed(all_lines):
+            match = prompt_pattern.search(line)
+            if match:
+                return match.group(1).replace("\\", "/")
+        return None
 
     def _run_local_command(self, cmd, cwd):
         self.log(f"[*] Running: {' '.join(cmd)}")

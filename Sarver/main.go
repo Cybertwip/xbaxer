@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -32,16 +32,32 @@ type errorResponse struct {
 	Log   string `json:"log,omitempty"`
 }
 
+type reverseJob struct {
+	ID         string       `json:"id"`
+	Request    buildRequest `json:"request"`
+	ArchiveURL string       `json:"archive_url"`
+	ResultURL  string       `json:"result_url"`
+	ErrorURL   string       `json:"error_url"`
+}
+
 type server struct {
 	goBinary   string
 	goCacheDir string
 	goModCache string
 	goPathDir  string
 	timeout    time.Duration
+	reverseURL string
+}
+
+type buildExecution struct {
+	OutputName string
+	OutputPath string
+	Workspace  string
 }
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:17777", "listen address")
+	reverseURL := flag.String("reverse", "", "reverse relay URL to pull build jobs from")
 	goBinary := flag.String("go", defaultGoBinaryPath(), "path to the Go executable used for builds")
 	cacheRoot := flag.String("cache-dir", defaultCacheRoot(), "directory used for Go build and module caches")
 	timeout := flag.Duration("timeout", 10*time.Minute, "maximum time allowed per build")
@@ -64,6 +80,19 @@ func main() {
 		goModCache: goModCache,
 		goPathDir:  goPathDir,
 		timeout:    *timeout,
+		reverseURL: strings.TrimRight(*reverseURL, "/"),
+	}
+
+	log.Printf("sarver go binary: %s", *goBinary)
+	log.Printf("sarver cache root: %s", cacheRootPath)
+
+	if srv.reverseURL != "" {
+		log.Printf("sarver reverse mode enabled; relay=%s", srv.reverseURL)
+		log.Printf("sarver will pull build jobs from the host relay")
+		if err := srv.runReverseLoop(); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	mux := http.NewServeMux()
@@ -77,12 +106,13 @@ func main() {
 	}
 
 	log.Printf("sarver listen address: http://%s", *listenAddr)
-	log.Printf("sarver go binary: %s", *goBinary)
-	log.Printf("sarver cache root: %s", cacheRootPath)
 	if isLoopbackListenAddr(*listenAddr) {
 		log.Printf("sarver warning: %s is loopback-only; remote hosts will not be able to connect", *listenAddr)
 	} else {
 		log.Printf("sarver network access enabled; connect from your host using http://<server-ip>:%s", listenPort(*listenAddr))
+	}
+	if err := ensureFirewallRule(listenPort(*listenAddr)); err == nil && runtime.GOOS == "windows" {
+		log.Printf("sarver firewall rule ready for TCP port %s", listenPort(*listenAddr))
 	}
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
@@ -136,98 +166,231 @@ func (s *server) handleBuild(maxUploadMiB int64) http.HandlerFunc {
 		}
 		defer archiveFile.Close()
 
-		workspace, err := os.MkdirTemp("", "sarver-build-*")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("create temp workspace: %v", err)})
+		execResult, status, errResp := s.executeBuild(r.Context(), req, archiveFile, r.RemoteAddr)
+		if errResp != nil {
+			writeJSON(w, status, *errResp)
 			return
 		}
-		defer os.RemoveAll(workspace)
+		defer execResult.cleanup()
 
-		sourceDir := filepath.Join(workspace, "src")
-		if err := os.MkdirAll(sourceDir, 0o755); err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("create source workspace: %v", err)})
-			return
-		}
-
-		if err := extractArchive(archiveFile, sourceDir); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: fmt.Sprintf("extract archive: %v", err)})
-			return
-		}
-
-		outputName := req.OutputName
-		if outputName == "" {
-			outputName = defaultOutputName(req.Target, req.GOOS)
-		} else {
-			outputName, err = sanitizeOutputName(outputName, req.GOOS)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
-				return
-			}
-		}
-		outputPath := filepath.Join(workspace, outputName)
-
-		ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
-		defer cancel()
-
-		args := []string{"build", "-buildvcs=false", "-trimpath", "-o", outputPath}
-		target, err := sanitizeBuildTarget(req.Target)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
-			return
-		}
-		log.Printf("build request from %s: target=%s output=%s goos=%s goarch=%s cgo=%s", r.RemoteAddr, target, outputName, req.GOOS, req.GOARCH, req.CGOEnabled)
-		args = append(args, target)
-
-		cmd := exec.CommandContext(ctx, s.goBinary, args...)
-		cmd.Dir = sourceDir
-		cmd.Env = append(os.Environ(),
-			"GOOS="+req.GOOS,
-			"GOARCH="+req.GOARCH,
-			"CGO_ENABLED="+req.CGOEnabled,
-			"GOTOOLCHAIN=local",
-			"GOCACHE="+s.goCacheDir,
-			"GOMODCACHE="+s.goModCache,
-			"GOPATH="+s.goPathDir,
-		)
-		buildLog, err := cmd.CombinedOutput()
-		if err != nil {
-			status := http.StatusInternalServerError
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				status = http.StatusGatewayTimeout
-			}
-			log.Printf("build failed for %s: %v", outputName, err)
-			if len(buildLog) > 0 {
-				log.Printf("build log for %s:\n%s", outputName, strings.TrimSpace(string(buildLog)))
-			}
-			writeJSON(w, status, errorResponse{
-				Error: fmt.Sprintf("build failed: %v", err),
-				Log:   string(buildLog),
-			})
-			return
-		}
-
-		builtFile, err := os.Open(outputPath)
+		builtFile, err := os.Open(execResult.OutputPath)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("open build output: %v", err)})
 			return
 		}
 		defer builtFile.Close()
 
-		stat, err := builtFile.Stat()
-		if err == nil {
+		if stat, err := builtFile.Stat(); err == nil {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", outputName))
-		w.Header().Set("X-Sarver-Output-Name", outputName)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", execResult.OutputName))
+		w.Header().Set("X-Sarver-Output-Name", execResult.OutputName)
 		w.Header().Set("X-Sarver-Goos", req.GOOS)
 		w.Header().Set("X-Sarver-Goarch", req.GOARCH)
 		w.WriteHeader(http.StatusOK)
-		log.Printf("build succeeded for %s; streaming result to %s", outputName, r.RemoteAddr)
+		log.Printf("build succeeded for %s; streaming result to %s", execResult.OutputName, r.RemoteAddr)
 
 		if _, err := io.Copy(w, builtFile); err != nil {
 			log.Printf("stream build output: %v", err)
 		}
+	}
+}
+
+func (s *server) runReverseLoop() error {
+	client := &http.Client{Timeout: 45 * time.Second}
+	for {
+		job, err := s.pullReverseJob(client)
+		if err != nil {
+			log.Printf("reverse poll error: %v", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if job == nil {
+			continue
+		}
+		s.handleReverseJob(client, *job)
+	}
+}
+
+func (s *server) pullReverseJob(client *http.Client) (*reverseJob, error) {
+	resp, err := client.Get(s.reverseURL + "/reverse/pull")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil, nil
+	case http.StatusOK:
+		var job reverseJob
+		if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+			return nil, fmt.Errorf("decode reverse job: %w", err)
+		}
+		return &job, nil
+	default:
+		payload, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("reverse pull failed: %s %s", resp.Status, strings.TrimSpace(string(payload)))
+	}
+}
+
+func (s *server) handleReverseJob(client *http.Client, job reverseJob) {
+	log.Printf("reverse build job received: id=%s target=%s output=%s goos=%s goarch=%s", job.ID, job.Request.Target, job.Request.OutputName, job.Request.GOOS, job.Request.GOARCH)
+
+	resp, err := client.Get(job.ArchiveURL)
+	if err != nil {
+		s.postReverseError(client, job, http.StatusBadGateway, errorResponse{Error: fmt.Sprintf("download archive: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		s.postReverseError(client, job, http.StatusBadGateway, errorResponse{
+			Error: fmt.Sprintf("download archive failed: %s", resp.Status),
+			Log:   strings.TrimSpace(string(payload)),
+		})
+		return
+	}
+
+	execResult, status, errResp := s.executeBuild(context.Background(), job.Request, resp.Body, "reverse:"+job.ID)
+	if errResp != nil {
+		s.postReverseError(client, job, status, *errResp)
+		return
+	}
+	defer execResult.cleanup()
+
+	if err := s.postReverseResult(client, job, execResult); err != nil {
+		log.Printf("reverse result upload failed for %s: %v", job.ID, err)
+	}
+}
+
+func (s *server) postReverseResult(client *http.Client, job reverseJob, execResult *buildExecution) error {
+	file, err := os.Open(execResult.OutputPath)
+	if err != nil {
+		return fmt.Errorf("open build output: %w", err)
+	}
+	defer file.Close()
+
+	req, err := http.NewRequest(http.MethodPost, job.ResultURL, file)
+	if err != nil {
+		return fmt.Errorf("create result request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Sarver-Output-Name", execResult.OutputName)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post result: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("post result failed: %s %s", resp.Status, strings.TrimSpace(string(payload)))
+	}
+
+	log.Printf("reverse build job %s completed successfully", job.ID)
+	return nil
+}
+
+func (s *server) postReverseError(client *http.Client, job reverseJob, status int, payload errorResponse) {
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, job.ErrorURL, strings.NewReader(string(body)))
+	if err != nil {
+		log.Printf("create reverse error request for %s: %v", job.ID, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Sarver-Status", fmt.Sprintf("%d", status))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("post reverse error for %s: %v", job.ID, err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("reverse build job %s failed: %s", job.ID, payload.Error)
+}
+
+func (s *server) executeBuild(parent context.Context, req buildRequest, archiveReader io.Reader, requester string) (*buildExecution, int, *errorResponse) {
+	workspace, err := os.MkdirTemp("", "sarver-build-*")
+	if err != nil {
+		return nil, http.StatusInternalServerError, &errorResponse{Error: fmt.Sprintf("create temp workspace: %v", err)}
+	}
+
+	sourceDir := filepath.Join(workspace, "src")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		_ = os.RemoveAll(workspace)
+		return nil, http.StatusInternalServerError, &errorResponse{Error: fmt.Sprintf("create source workspace: %v", err)}
+	}
+
+	if err := extractArchive(archiveReader, sourceDir); err != nil {
+		_ = os.RemoveAll(workspace)
+		return nil, http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("extract archive: %v", err)}
+	}
+
+	outputName := req.OutputName
+	if outputName == "" {
+		outputName = defaultOutputName(req.Target, req.GOOS)
+	} else {
+		outputName, err = sanitizeOutputName(outputName, req.GOOS)
+		if err != nil {
+			_ = os.RemoveAll(workspace)
+			return nil, http.StatusBadRequest, &errorResponse{Error: err.Error()}
+		}
+	}
+
+	target, err := sanitizeBuildTarget(req.Target)
+	if err != nil {
+		_ = os.RemoveAll(workspace)
+		return nil, http.StatusBadRequest, &errorResponse{Error: err.Error()}
+	}
+
+	outputPath := filepath.Join(workspace, outputName)
+	log.Printf("build request from %s: target=%s output=%s goos=%s goarch=%s cgo=%s", requester, target, outputName, req.GOOS, req.GOARCH, req.CGOEnabled)
+
+	ctx, cancel := context.WithTimeout(parent, s.timeout)
+	defer cancel()
+
+	args := []string{"build", "-buildvcs=false", "-trimpath", "-o", outputPath, target}
+	cmd := exec.CommandContext(ctx, s.goBinary, args...)
+	cmd.Dir = sourceDir
+	cmd.Env = append(os.Environ(),
+		"GOOS="+req.GOOS,
+		"GOARCH="+req.GOARCH,
+		"CGO_ENABLED="+req.CGOEnabled,
+		"GOTOOLCHAIN=local",
+		"GOCACHE="+s.goCacheDir,
+		"GOMODCACHE="+s.goModCache,
+		"GOPATH="+s.goPathDir,
+	)
+	buildLog, err := cmd.CombinedOutput()
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		log.Printf("build failed for %s: %v", outputName, err)
+		if len(buildLog) > 0 {
+			log.Printf("build log for %s:\n%s", outputName, strings.TrimSpace(string(buildLog)))
+		}
+		_ = os.RemoveAll(workspace)
+		return nil, status, &errorResponse{
+			Error: fmt.Sprintf("build failed: %v", err),
+			Log:   string(buildLog),
+		}
+	}
+
+	return &buildExecution{
+		OutputName: outputName,
+		OutputPath: outputPath,
+		Workspace:  workspace,
+	}, http.StatusOK, nil
+}
+
+func (e *buildExecution) cleanup() {
+	if e != nil && e.Workspace != "" {
+		_ = os.RemoveAll(e.Workspace)
 	}
 }
 
@@ -258,7 +421,7 @@ func decodeBuildRequest(raw string) (buildRequest, error) {
 	return req, nil
 }
 
-func extractArchive(reader multipart.File, destination string) error {
+func extractArchive(reader io.Reader, destination string) error {
 	tempFile, err := os.CreateTemp(destination, "archive-*.zip")
 	if err != nil {
 		return err
@@ -434,4 +597,38 @@ func listenPort(listenAddr string) string {
 		return "17777"
 	}
 	return port
+}
+
+func ensureFirewallRule(port string) error {
+	if runtime.GOOS != "windows" || port == "" {
+		return nil
+	}
+
+	netshPath, err := exec.LookPath("netsh")
+	if err != nil {
+		return nil
+	}
+
+	ruleName := fmt.Sprintf("Sarver-TCP-%s", port)
+
+	deleteCmd := exec.Command(
+		netshPath, "advfirewall", "firewall", "delete", "rule",
+		fmt.Sprintf("name=%s", ruleName),
+		"protocol=TCP",
+		fmt.Sprintf("localport=%s", port),
+	)
+	_ = deleteCmd.Run()
+
+	addCmd := exec.Command(
+		netshPath, "advfirewall", "firewall", "add", "rule",
+		fmt.Sprintf("name=%s", ruleName),
+		"dir=in",
+		"action=allow",
+		"protocol=TCP",
+		fmt.Sprintf("localport=%s", port),
+		"profile=any",
+		"enable=yes",
+	)
+	_, err = addCmd.CombinedOutput()
+	return err
 }
