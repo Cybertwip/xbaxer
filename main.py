@@ -181,11 +181,15 @@ class IntegratedTerminal:
             "[INFO] Xbox Devkit VT100 Terminal Emulation Active",
             "[INFO] Drag and drop any file onto this window to upload to Sandbox."
         ]
+        self.screen_history = []
 
         self.cx = 0
         self.cy = 0
 
         self.input_buffer = ""
+        self.command_history = []
+        self.command_history_index = None
+        self.command_history_draft = ""
         self.sock = None
         self.ssh_client = None
         self.connected = False
@@ -219,11 +223,135 @@ class IntegratedTerminal:
     def _mark_dirty(self):
         self._dirty = True
 
+    def _trim_history_locked(self):
+        if len(self.history) > 2500:
+            self.history = self.history[-1800:]
+        if len(self.screen_history) > 2500:
+            self.screen_history = self.screen_history[-1800:]
+
+    def _active_display_lines_locked(self):
+        active_lines = [''.join(r).rstrip() for r in self.grid]
+        last_nonempty = -1
+        for idx, line in enumerate(active_lines):
+            if line:
+                last_nonempty = idx
+        last_visible = max(last_nonempty, min(self.cy, self.rows - 1))
+        return active_lines[:max(1, last_visible + 1)]
+
+    def _display_lines_locked(self):
+        return self.screen_history + self._active_display_lines_locked() + self.history
+
+    def _remember_command(self, command):
+        command = command.rstrip()
+        if not command:
+            self.command_history_index = None
+            self.command_history_draft = ""
+            return
+        if not self.command_history or self.command_history[-1] != command:
+            self.command_history.append(command)
+            if len(self.command_history) > 300:
+                self.command_history = self.command_history[-200:]
+        self.command_history_index = None
+        self.command_history_draft = ""
+
+    def _navigate_command_history(self, step):
+        if not self.command_history:
+            return False
+
+        if self.command_history_index is None:
+            if step > 0:
+                return False
+            self.command_history_draft = self.input_buffer
+            next_index = len(self.command_history) - 1
+        else:
+            next_index = self.command_history_index + step
+
+        if next_index >= len(self.command_history):
+            self.input_buffer = self.command_history_draft
+            self.command_history_index = None
+            self.command_history_draft = ""
+        else:
+            self.command_history_index = max(0, next_index)
+            self.input_buffer = self.command_history[self.command_history_index]
+        return True
+
+    def _delete_previous_word(self):
+        if not self.input_buffer:
+            return False
+
+        trimmed = self.input_buffer.rstrip()
+        if not trimmed:
+            self.input_buffer = ""
+            return True
+
+        boundary = len(trimmed)
+        while boundary > 0 and not trimmed[boundary - 1].isspace():
+            boundary -= 1
+        self.input_buffer = trimmed[:boundary]
+        return True
+
+    def _get_clipboard_text(self):
+        scrap = getattr(pygame, "scrap", None)
+        if scrap is None:
+            return ""
+        try:
+            if not scrap.get_init():
+                scrap.init()
+        except Exception:
+            return ""
+
+        text_types = []
+        scrap_text = getattr(pygame, "SCRAP_TEXT", None)
+        if scrap_text is not None:
+            text_types.append(scrap_text)
+        text_types.extend(["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"])
+
+        for text_type in text_types:
+            try:
+                payload = scrap.get(text_type)
+            except Exception:
+                continue
+            if not payload:
+                continue
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            if isinstance(payload, bytes):
+                try:
+                    text = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = payload.decode("latin-1", errors="replace")
+            else:
+                text = str(payload)
+            return text.replace("\x00", "")
+        return ""
+
+    def _paste_clipboard(self):
+        text = self._get_clipboard_text()
+        if not text:
+            return False
+
+        if self.raw_input_mode:
+            payload = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            try:
+                self.sock.sendall(payload.encode("utf-8"))
+                return True
+            except Exception as exc:
+                self.log(f"[-] Failed to paste clipboard text: {exc}")
+                return False
+
+        pasted = " ".join(part for part in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if part)
+        if not pasted:
+            return False
+        self.input_buffer += pasted
+        self.command_history_index = None
+        self.command_history_draft = ""
+        self._mark_dirty()
+        return True
+
     def log(self, message):
         with self.lock:
             self.history.append(message)
-            if len(self.history) > 2500:
-                self.history = self.history[-1800:]
+            self._trim_history_locked()
         self._mark_dirty()
 
     def _send_shell_bytes(self, payload, description=None):
@@ -505,9 +633,8 @@ class IntegratedTerminal:
     def scroll_up(self):
         top_line = ''.join(self.grid[0]).rstrip()
         if top_line:
-            self.history.append(top_line)
-        if len(self.history) > 2000:
-            self.history = self.history[-1500:]
+            self.screen_history.append(top_line)
+        self._trim_history_locked()
         self.grid.pop(0)
         self.grid.append([' ' for _ in range(self.cols)])
         self.cy = max(0, self.cy - 1)
@@ -583,7 +710,9 @@ class IntegratedTerminal:
         self._mark_dirty()
 
     def scroll(self, amount):
-        max_scroll = max(0, len(self.history))
+        with self.lock:
+            total_lines = len(self._display_lines_locked())
+        max_scroll = max(0, total_lines - self.rows)
         new_offset = max(0, min(self.scroll_offset + amount, max_scroll))
         if new_offset != self.scroll_offset:
             self.scroll_offset = new_offset
@@ -593,11 +722,17 @@ class IntegratedTerminal:
         if not self.connected or event.type != pygame.KEYDOWN: return False
         self.scroll_offset = 0
         ctrl_pressed = bool(event.mod & pygame.KMOD_CTRL)
+        shortcut_pressed = bool(event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META))
 
         if ctrl_pressed and event.key == pygame.K_c:
             self.input_buffer = ""
+            self.command_history_index = None
+            self.command_history_draft = ""
             self._mark_dirty()
             return self._send_shell_interrupt()
+
+        if shortcut_pressed and event.key == pygame.K_v:
+            return self._paste_clipboard()
 
         if event.key == pygame.K_TAB:
             self.raw_input_mode = not self.raw_input_mode
@@ -615,18 +750,38 @@ class IntegratedTerminal:
             return True
 
         if event.key == pygame.K_RETURN:
+            self._remember_command(self.input_buffer)
             cmd = (self.input_buffer + "\r\n").encode('utf-8')
             try: self.sock.sendall(cmd)
             except: pass
             self.input_buffer = ""
             self._mark_dirty()
             return True
+        elif event.key == pygame.K_UP:
+            if self._navigate_command_history(-1):
+                self._mark_dirty()
+                return True
+        elif event.key == pygame.K_DOWN:
+            if self._navigate_command_history(1):
+                self._mark_dirty()
+                return True
         elif event.key == pygame.K_BACKSPACE:
-            self.input_buffer = self.input_buffer[:-1]
-            self._mark_dirty()
-            return True
+            if shortcut_pressed:
+                if self._delete_previous_word():
+                    self.command_history_index = None
+                    self.command_history_draft = ""
+                    self._mark_dirty()
+                    return True
+            else:
+                self.input_buffer = self.input_buffer[:-1]
+                self.command_history_index = None
+                self.command_history_draft = ""
+                self._mark_dirty()
+                return True
         elif event.unicode and event.unicode.isprintable():
             self.input_buffer += event.unicode
+            self.command_history_index = None
+            self.command_history_draft = ""
             self._mark_dirty()
             return True
         return False
@@ -653,8 +808,7 @@ class IntegratedTerminal:
             surf.fill((15, 15, 25))
 
             with self.lock:
-                active_lines = [''.join(r).rstrip() for r in self.grid]
-                all_lines = self.history + active_lines
+                all_lines = self._display_lines_locked()
 
             start_idx = max(0, len(all_lines) - self.rows - self.scroll_offset)
             visible_lines = all_lines[start_idx: start_idx + self.rows]
@@ -713,8 +867,7 @@ class IntegratedTerminal:
     def _current_remote_directory(self):
         prompt_pattern = re.compile(r"([A-Za-z]:(?:\\[^>\r\n]*)?)>")
         with self.lock:
-            active_lines = [''.join(r).rstrip() for r in self.grid]
-            all_lines = self.history + active_lines
+            all_lines = self._display_lines_locked()
 
         for line in reversed(all_lines):
             match = prompt_pattern.search(line)
@@ -876,12 +1029,12 @@ class IntegratedTerminal:
 
         return int(local_entry.get("size", -1)) != int(remote_entry.get("size", -1))
 
-    def _create_install_bundle(self, changed_files, manifest):
+    def _create_install_bundle(self, bundle_files, manifest):
         fd, bundle_path = tempfile.mkstemp(prefix="xbax-install-", suffix=".zip")
         os.close(fd)
         try:
             with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-                for local_path, rel_path in changed_files:
+                for local_path, rel_path in bundle_files:
                     archive.write(local_path, arcname=rel_path)
                 archive.writestr(
                     REMOTE_INSTALL_MANIFEST,
@@ -919,7 +1072,7 @@ class IntegratedTerminal:
     def _local_bootstrap_tool_path(self, tool_name):
         # Search the actual package layout produced by cmake. Some tools land
         # in <name>/bin/<name>.exe (cleng, sarver, cliant), others land in
-        # <name>/<name>.exe (anzipper, gatter). Try both.
+        # <name>/<name>.exe (anzipper, cleener, gatter). Try both.
         candidates = [
             os.path.join(LOCAL_PACKAGE_DIR, tool_name, tool_name + ".exe"),
             os.path.join(LOCAL_PACKAGE_DIR, tool_name, "bin", tool_name + ".exe"),
@@ -931,9 +1084,6 @@ class IntegratedTerminal:
 
     def _local_anzipper_path(self):
         return self._local_bootstrap_tool_path("anzipper")
-
-    def _local_cleener_path(self):
-        return self._local_bootstrap_tool_path("cleener")
 
     def _remote_bootstrap_tool_path(self, remote_dir, tool_name):
         return self._remote_bootstrap_dir(remote_dir).rstrip("/") + "/" + tool_name + ".exe"
@@ -1034,7 +1184,7 @@ class IntegratedTerminal:
                     raise RuntimeError(f"{exc} while uploading {rel_path} -> {remote_path}") from exc
                 uploaded += 1
                 if index == len(changed_files) or index % 25 == 0:
-                    self.log(f"[*] Uploaded {index}/{len(changed_files)} changed file(s) ({skipped} already current)...")
+                    self.log(f"[*] Uploaded {index}/{len(changed_files)} file(s) ({skipped} skipped)...")
             self._write_remote_manifest(sftp, remote_dir, manifest)
         finally:
             sftp.close()
@@ -1057,17 +1207,11 @@ class IntegratedTerminal:
             sftp.close()
 
         changed_files = []
-        next_manifest = dict(remote_manifest) if isinstance(remote_manifest, dict) else {}
         for local_path, rel_path in files:
             local_entry = local_manifest[rel_path]
             remote_entry = remote_manifest.get(rel_path)
             if self._should_upload_manifest_entry(local_entry, remote_entry):
                 changed_files.append((local_path, rel_path))
-                next_manifest[rel_path] = local_entry
-            elif isinstance(remote_entry, dict):
-                next_manifest[rel_path] = remote_entry
-            else:
-                next_manifest[rel_path] = local_entry
         skipped = len(files) - len(changed_files)
 
         if not changed_files:
@@ -1816,6 +1960,7 @@ class HeadlessTerminal(IntegratedTerminal):
         # Skip the pygame.Rect/SysFont calls in the base __init__ — none of
         # the methods we reuse from the CLI touch the rendering state.
         self.history = []
+        self.screen_history = []
         self.lock = threading.Lock()
         self.cols = 140
         self.rows = 40
@@ -1824,6 +1969,9 @@ class HeadlessTerminal(IntegratedTerminal):
         self.cx = 0
         self.cy = 0
         self.input_buffer = ""
+        self.command_history = []
+        self.command_history_index = None
+        self.command_history_draft = ""
 
         self.sock = None
         self.ssh_client = None
