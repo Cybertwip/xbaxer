@@ -40,6 +40,37 @@ CROSS_STAMP="$OUTPUT_DIR/.clang-engine-installed"
 
 mkdir -p "$NATIVE_BUILD" "$CROSS_BUILD" "$OUTPUT_DIR"
 
+cross_cache_var_equals() {
+  local key="$1"
+  local expected="$2"
+  local cache="$CROSS_BUILD/CMakeCache.txt"
+  [[ -f "$cache" ]] || return 1
+  grep -Eq "^${key}(:[A-Z]+)?=${expected}\$" "$cache"
+}
+
+cross_cache_var_contains() {
+  local key="$1"
+  local needle="$2"
+  local cache="$CROSS_BUILD/CMakeCache.txt"
+  [[ -f "$cache" ]] || return 1
+  grep -E "^${key}(:[A-Z]+)?=" "$cache" | grep -Fq "$needle"
+}
+
+has_cross_linker() {
+  local path
+  for path in \
+    "$OUTPUT_DIR/bin/lld.exe" \
+    "$OUTPUT_DIR/bin/ld64.lld.exe" \
+    "$OUTPUT_DIR/bin/ld.lld.exe" \
+    "$CROSS_BUILD/bin/lld.exe" \
+    "$CROSS_BUILD/bin/ld64.lld.exe" \
+    "$CROSS_BUILD/bin/ld.lld.exe"
+  do
+    [[ -f "$path" ]] && return 0
+  done
+  return 1
+}
+
 # Common LLVM cmake flags shared by both stages. We keep the build minimal:
 # just the targets we need for xbax (x86_64 + arm64), no
 # tests/benchmarks/examples, no LTO, no docs.
@@ -99,8 +130,29 @@ fi
 # cleng provides its own driver entry point in Go and links against
 # clang_main from libclangDriver via the C++ shim in
 # cleng/internal/cgobridge/bridge.cpp.
+NEED_CROSS_BUILD=0
 if [[ ! -f "$CROSS_STAMP" ]]; then
+  NEED_CROSS_BUILD=1
+fi
+if ! cross_cache_var_equals LLVM_BUILD_TOOLS ON; then
+  NEED_CROSS_BUILD=1
+fi
+if ! cross_cache_var_equals LLD_BUILD_TOOLS ON; then
+  NEED_CROSS_BUILD=1
+fi
+if ! cross_cache_var_contains LLVM_ENABLE_PROJECTS "lld"; then
+  NEED_CROSS_BUILD=1
+fi
+if ! cross_cache_var_contains LLVM_TARGETS_TO_BUILD "AArch64"; then
+  NEED_CROSS_BUILD=1
+fi
+if ! has_cross_linker; then
+  NEED_CROSS_BUILD=1
+fi
+
+if [[ "$NEED_CROSS_BUILD" -eq 1 ]]; then
   echo "[clang-engine] stage 2: cross-compile clang static libs for windows/amd64"
+  rm -f "$CROSS_STAMP"
   cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \
     "${LLVM_COMMON_FLAGS[@]}" \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
