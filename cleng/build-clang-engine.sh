@@ -112,7 +112,16 @@ if [[ ! -f "$CROSS_STAMP" ]]; then
     -DLLVM_INCLUDE_TOOLS=ON \
     -DCLANG_BUILD_TOOLS=OFF \
     -DLLVM_ENABLE_PIC=OFF
-  cmake --build "$CROSS_BUILD" --target install-clang-libraries install-llvm-libraries install-clang-headers install-llvm-headers
+  # install-clang-resource-headers ships clang's compiler-builtin headers
+  # (stddef.h, stdarg.h, stdint.h, intrinsic wrappers, etc.) into
+  # ${OUTPUT_DIR}/lib/clang/<major>/include. These are NOT platform SDK
+  # headers — they're the freestanding C/C++ subset that the compiler
+  # itself owns and must always be reachable, regardless of GOOS. cleng
+  # locates them automatically via its `<bin>/../lib/clang/<ver>/include`
+  # search rule, so dropping them in the prefix means a stock cleng.exe
+  # can compile any cgo TU that only uses freestanding headers without
+  # needing a platform SDK on the console.
+  cmake --build "$CROSS_BUILD" --target install-clang-libraries install-llvm-libraries install-clang-headers install-llvm-headers install-clang-resource-headers
   : > "$CROSS_STAMP"
 fi
 

@@ -170,6 +170,56 @@ if(NOT MINGW_CC OR NOT MINGW_CXX)
   set(MINGW_CXX "x86_64-w64-mingw32-g++"  CACHE FILEPATH "Windows/amd64 C++ cross compiler")
 endif()
 
+# ---- Locate the mingw-w64 sysroot whose headers we will bundle with cleng --
+#
+# The clang resource directory ships compiler-builtin headers only (stddef.h,
+# intrinsics, …). Standard C headers (stdio.h, string.h) and the C++
+# standard library (vector, sstream, …) are NOT part of the compiler — they
+# come from libc / libstdc++. For the windows/amd64 target we already
+# require Homebrew's mingw-w64 to link cleng itself, so we reuse that same
+# toolchain's include tree as the bundled sysroot. The headers are 0BSD/
+# public-domain (mingw-w64-headers) and the libstdc++ headers are GPL-with-
+# runtime-exception, both of which permit redistribution.
+#
+# Layout we end up shipping at runtime (sibling of cleng/bin/cleng.exe):
+#   cleng/sysroot/x86_64-w64-mingw32/include/                      (C headers)
+#   cleng/sysroot/x86_64-w64-mingw32/include/c++/<ver>/            (libstdc++)
+#   cleng/sysroot/x86_64-w64-mingw32/include/c++/<ver>/x86_64-w64-mingw32/
+#
+# cleng injects these as `-isystem` search paths at runtime when the build
+# target triple is x86_64-w64-mingw32. Other GOOS targets (darwin/linux/…)
+# remain the developer's responsibility — they must supply their own
+# sysroot via `--sysroot=` / `-isystem` cgo flags.
+if(NOT DEFINED CLENG_MINGW_SYSROOT)
+  # Walk back from x86_64-w64-mingw32-gcc to its sibling
+  # x86_64-w64-mingw32/ directory (which contains include/ and lib/).
+  if(MINGW_CC AND EXISTS "${MINGW_CC}")
+    get_filename_component(_mingw_bin "${MINGW_CC}" DIRECTORY)
+    get_filename_component(_mingw_root "${_mingw_bin}" DIRECTORY)
+    if(EXISTS "${_mingw_root}/x86_64-w64-mingw32/include/stdio.h")
+      set(CLENG_MINGW_SYSROOT "${_mingw_root}/x86_64-w64-mingw32"
+          CACHE PATH "mingw-w64 sysroot whose include/ tree is bundled with cleng")
+    endif()
+  endif()
+endif()
+if(NOT DEFINED CLENG_MINGW_SYSROOT)
+  # Homebrew default if auto-detection failed.
+  file(GLOB _mingw_brew "/usr/local/Cellar/mingw-w64/*/toolchain-x86_64/x86_64-w64-mingw32"
+                         "/opt/homebrew/Cellar/mingw-w64/*/toolchain-x86_64/x86_64-w64-mingw32")
+  if(_mingw_brew)
+    list(GET _mingw_brew 0 _mingw_first)
+    if(EXISTS "${_mingw_first}/include/stdio.h")
+      set(CLENG_MINGW_SYSROOT "${_mingw_first}"
+          CACHE PATH "mingw-w64 sysroot whose include/ tree is bundled with cleng")
+    endif()
+  endif()
+endif()
+if(DEFINED CLENG_MINGW_SYSROOT)
+  message(STATUS "cleng sysroot (mingw-w64): ${CLENG_MINGW_SYSROOT}")
+else()
+  message(WARNING "cleng: no mingw-w64 sysroot detected; cleng.exe will ship without standard C/C++ headers for the windows target. Set -DCLENG_MINGW_SYSROOT=/path/to/x86_64-w64-mingw32 to override.")
+endif()
+
 # ---- clang-engine: cross-build LLVM/Clang static libs for windows/amd64 ----
 #
 # Mirrors the way `campiler` consumes the vendored ./go source tree: take the
@@ -260,6 +310,26 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E env ${XBAX_CLENG_BUILD_ENV}
           "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
           -o "${CLENG_OUTPUT}" .
+  # Bundle clang's compiler-builtin headers (stddef.h, stdarg.h, stdint.h,
+  # intrinsics) next to cleng.exe so the deployed driver can resolve them
+  # via its <bin>/../lib/clang/<ver>/include search path. These are the
+  # *compiler's own* freestanding headers — not a platform SDK; the
+  # developer is still responsible for shipping libc/SDK headers for
+  # whichever GOOS they target.
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${XBAX_PACKAGE_DIR}/cleng/lib/clang"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CLENG_CLANG_PREFIX}/lib/clang"
+          "${XBAX_PACKAGE_DIR}/cleng/lib/clang"
+  # Bundle the mingw-w64 sysroot include tree so cleng can find <stdio.h>,
+  # <vector>, <sstream> etc. when targeting x86_64-w64-mingw32 — these are
+  # standard libc / libstdc++ headers, not part of the compiler. cleng
+  # auto-injects the matching `-isystem` paths at runtime when it detects
+  # the mingw target triple. Skipped (with a warning at configure time) if
+  # CLENG_MINGW_SYSROOT was not detected.
+  COMMAND ${CMAKE_COMMAND}
+          -DSYSROOT_SOURCE=${CLENG_MINGW_SYSROOT}
+          -DSYSROOT_DEST=${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-w64-mingw32
+          -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
   DEPENDS
     go-toolchain
     clang-engine

@@ -25,6 +25,22 @@ type buildRequest struct {
 	GOOS       string `json:"goos"`
 	GOARCH     string `json:"goarch"`
 	CGOEnabled string `json:"cgo_enabled"`
+	// Language selects the build dispatcher. "" / "go" runs `go build`
+	// against the uploaded module (the historic xbax behaviour).
+	// "c" / "cpp" / "c++" runs cleng directly against the uploaded
+	// source tree, which is how raw C/C++ work gets distributed onto
+	// the console without involving a Go module.
+	Language string `json:"language,omitempty"`
+	// CompilerArgs are extra flags forwarded to cleng when Language is
+	// c/cpp. Things like -std=c++20, -O2, -DFOO, -I., -L., -lwhatever.
+	// Ignored for Language == go (use cgo CFLAGS in the source for
+	// that case).
+	CompilerArgs []string `json:"compiler_args,omitempty"`
+	// Sources is an optional explicit list of source files (relative
+	// to the uploaded archive root) to compile. When empty in c/cpp
+	// mode, sarver auto-discovers every *.c/*.cc/*.cpp/*.cxx file in
+	// the archive.
+	Sources []string `json:"sources,omitempty"`
 }
 
 type errorResponse struct {
@@ -375,54 +391,43 @@ func (s *server) executeBuild(parent context.Context, req buildRequest, archiveR
 		}
 	}
 
-	target, err := sanitizeBuildTarget(req.Target)
-	if err != nil {
-		_ = os.RemoveAll(workspace)
-		return nil, http.StatusBadRequest, &errorResponse{Error: err.Error()}
-	}
-
 	outputPath := filepath.Join(workspace, outputName)
-	log.Printf("build request from %s: target=%s output=%s goos=%s goarch=%s cgo=%s", requester, target, outputName, req.GOOS, req.GOARCH, req.CGOEnabled)
 
 	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
 
-	args := []string{"build", "-buildvcs=false", "-trimpath", "-o", outputPath, target}
-	cmd := exec.CommandContext(ctx, s.goBinary, args...)
-	cmd.Dir = sourceDir
-	cmd.Env = append(os.Environ(),
-		"GOOS="+req.GOOS,
-		"GOARCH="+req.GOARCH,
-		"CGO_ENABLED="+req.CGOEnabled,
-		"GOTOOLCHAIN=local",
-		"GOCACHE="+s.goCacheDir,
-		"GOMODCACHE="+s.goModCache,
-		"GOPATH="+s.goPathDir,
+	lang := normalizeLanguage(req.Language)
+	log.Printf("build request from %s: lang=%s target=%s output=%s goos=%s goarch=%s cgo=%s", requester, lang, req.Target, outputName, req.GOOS, req.GOARCH, req.CGOEnabled)
+
+	var (
+		cmd      *exec.Cmd
+		buildLog []byte
 	)
-	if s.clengBinary != "" && req.CGOEnabled == "1" {
-		// cleng.exe is a Go-fronted Clang driver. Always wire it as
-		// CC/CXX when cgo is enabled — it's the only C/C++ toolchain
-		// available on the console. Translate GOOS/GOARCH into an LLVM
-		// target triple and pass it to cleng via CGO_*FLAGS so the same
-		// cleng binary can emit PE for windows, Mach-O for darwin, and
-		// ELF for linux. Without an explicit `--target=`, cleng falls
-		// back to its default (mingw) triple and rejects darwin's
-		// `-arch <goarch>` cgo injection with "unsupported option
-		// '-arch'".
-		cmd.Env = append(cmd.Env,
-			"CC="+s.clengBinary,
-			"CXX="+s.clengBinary,
-		)
-		if triple := llvmTripleFor(req.GOOS, req.GOARCH); triple != "" {
-			targetFlag := "--target=" + triple
-			cmd.Env = append(cmd.Env,
-				"CGO_CFLAGS="+targetFlag,
-				"CGO_CXXFLAGS="+targetFlag,
-				"CGO_LDFLAGS="+targetFlag,
-			)
+	switch lang {
+	case "go":
+		target, terr := sanitizeBuildTarget(req.Target)
+		if terr != nil {
+			_ = os.RemoveAll(workspace)
+			return nil, http.StatusBadRequest, &errorResponse{Error: terr.Error()}
 		}
+		cmd = s.buildGoCommand(ctx, sourceDir, outputPath, target, req)
+	case "c", "cpp":
+		if s.clengBinary == "" {
+			_ = os.RemoveAll(workspace)
+			return nil, http.StatusBadRequest, &errorResponse{Error: "language=" + lang + " requires cleng to be configured (-cleng path)"}
+		}
+		var cerr error
+		cmd, cerr = s.buildClengCommand(ctx, sourceDir, outputPath, lang, req)
+		if cerr != nil {
+			_ = os.RemoveAll(workspace)
+			return nil, http.StatusBadRequest, &errorResponse{Error: cerr.Error()}
+		}
+	default:
+		_ = os.RemoveAll(workspace)
+		return nil, http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("unknown language %q (want go, c, or cpp)", req.Language)}
 	}
-	buildLog, err := cmd.CombinedOutput()
+
+	buildLog, err = cmd.CombinedOutput()
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -711,6 +716,163 @@ func llvmTripleFor(goos, goarch string) string {
 	default:
 		return ""
 	}
+}
+
+// normalizeLanguage canonicalises the optional Language field of a build
+// request. Empty defaults to "go" for backward compatibility with the
+// pre-multi-language protocol; "c++"/"cxx" alias to "cpp".
+func normalizeLanguage(lang string) string {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "", "go":
+		return "go"
+	case "c":
+		return "c"
+	case "cpp", "c++", "cxx":
+		return "cpp"
+	default:
+		return strings.ToLower(strings.TrimSpace(lang))
+	}
+}
+
+// buildGoCommand assembles the historic `go build` invocation. Extracted
+// from executeBuild so the language dispatcher in executeBuild can stay
+// readable.
+func (s *server) buildGoCommand(ctx context.Context, sourceDir, outputPath, target string, req buildRequest) *exec.Cmd {
+	args := []string{"build", "-buildvcs=false", "-trimpath", "-o", outputPath, target}
+	cmd := exec.CommandContext(ctx, s.goBinary, args...)
+	cmd.Dir = sourceDir
+	cmd.Env = append(os.Environ(),
+		"GOOS="+req.GOOS,
+		"GOARCH="+req.GOARCH,
+		"CGO_ENABLED="+req.CGOEnabled,
+		"GOTOOLCHAIN=local",
+		"GOCACHE="+s.goCacheDir,
+		"GOMODCACHE="+s.goModCache,
+		"GOPATH="+s.goPathDir,
+	)
+	if s.clengBinary != "" && req.CGOEnabled == "1" {
+		// cleng.exe is a Go-fronted Clang driver. Wire it as CC/CXX
+		// when cgo is enabled — it's the only C/C++ toolchain
+		// available on the console. Translate GOOS/GOARCH into an LLVM
+		// target triple so the same cleng binary can emit PE for
+		// windows, Mach-O for darwin and ELF for linux. Without
+		// `--target=`, cleng would default to mingw and reject
+		// darwin's `-arch <goarch>` cgo injection.
+		cmd.Env = append(cmd.Env,
+			"CC="+s.clengBinary,
+			"CXX="+s.clengBinary,
+		)
+		if triple := llvmTripleFor(req.GOOS, req.GOARCH); triple != "" {
+			targetFlag := "--target=" + triple
+			cmd.Env = append(cmd.Env,
+				"CGO_CFLAGS="+targetFlag,
+				"CGO_CXXFLAGS="+targetFlag,
+				"CGO_LDFLAGS="+targetFlag,
+			)
+		}
+	}
+	return cmd
+}
+
+// buildClengCommand assembles a direct cleng invocation for distributed
+// C/C++ work. Source files come either from req.Sources (an explicit list
+// of archive-relative paths) or, if that list is empty, from a recursive
+// scan of the workspace for .c/.cc/.cpp/.cxx files. Extra compiler args
+// (req.CompilerArgs) are appended verbatim — that is where the developer
+// passes -std=c++20, -O2, -DFOO, -I., -L., -lwhatever, etc.
+//
+// We deliberately keep the wire protocol simple: one input archive plus
+// flags, one output binary. Multi-stage builds (CMake/Make/Ninja) are out
+// of scope — the developer can either pre-process those locally and ship a
+// single-stage compile, or wrap them in a Go cgo build and use the Go
+// dispatcher above.
+func (s *server) buildClengCommand(ctx context.Context, sourceDir, outputPath, lang string, req buildRequest) (*exec.Cmd, error) {
+	sources, err := resolveSources(sourceDir, req.Sources, lang)
+	if err != nil {
+		return nil, err
+	}
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no %s source files found in upload", lang)
+	}
+
+	args := make([]string, 0, len(sources)+len(req.CompilerArgs)+8)
+
+	// xLang tells cleng to treat positional inputs as the requested
+	// language regardless of file extension. Useful when the caller
+	// uploads .h/.inc files with explicit Sources.
+	xLang := "c"
+	if lang == "cpp" {
+		xLang = "c++"
+	}
+	args = append(args, "-x", xLang)
+
+	if triple := llvmTripleFor(req.GOOS, req.GOARCH); triple != "" {
+		args = append(args, "--target="+triple)
+	}
+
+	if lang == "cpp" {
+		// On the windows target we bundle mingw's libstdc++ headers,
+		// not libc++, so default to libstdc++. The user can still
+		// override with `-stdlib=libc++` via CompilerArgs if they
+		// supply their own libc++ sysroot.
+		args = append(args, "-stdlib=libstdc++")
+	}
+
+	args = append(args, req.CompilerArgs...)
+	args = append(args, "-o", outputPath)
+	args = append(args, sources...)
+
+	cmd := exec.CommandContext(ctx, s.clengBinary, args...)
+	cmd.Dir = sourceDir
+	cmd.Env = os.Environ()
+	return cmd, nil
+}
+
+// resolveSources turns the protocol's optional Sources list into absolute
+// paths inside sourceDir, validating that each entry stays within the
+// workspace. When Sources is empty, walks sourceDir for files matching
+// the requested language's extensions.
+func resolveSources(sourceDir string, requested []string, lang string) ([]string, error) {
+	if len(requested) > 0 {
+		out := make([]string, 0, len(requested))
+		for _, rel := range requested {
+			clean := filepath.Clean(filepath.FromSlash(rel))
+			if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+				return nil, fmt.Errorf("source path %q must be relative to the upload root", rel)
+			}
+			abs := filepath.Join(sourceDir, clean)
+			if !isWithinBase(sourceDir, abs) {
+				return nil, fmt.Errorf("source path %q escapes the upload root", rel)
+			}
+			if _, err := os.Stat(abs); err != nil {
+				return nil, fmt.Errorf("source %q: %w", rel, err)
+			}
+			out = append(out, abs)
+		}
+		return out, nil
+	}
+
+	exts := map[string]bool{".c": true}
+	if lang == "cpp" {
+		exts = map[string]bool{".cc": true, ".cpp": true, ".cxx": true, ".c++": true, ".C": true}
+	}
+	var out []string
+	walkErr := filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if exts[filepath.Ext(path)] {
+			out = append(out, path)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("scan sources: %w", walkErr)
+	}
+	return out, nil
 }
 
 func isLoopbackListenAddr(listenAddr string) bool {

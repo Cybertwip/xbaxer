@@ -27,11 +27,14 @@ const relayPullTimeout = 25 * time.Second
 var errUsageRequested = errors.New("usage requested")
 
 type buildRequest struct {
-	Target     string `json:"target"`
-	OutputName string `json:"output_name"`
-	GOOS       string `json:"goos"`
-	GOARCH     string `json:"goarch"`
-	CGOEnabled string `json:"cgo_enabled"`
+	Target       string   `json:"target"`
+	OutputName   string   `json:"output_name"`
+	GOOS         string   `json:"goos"`
+	GOARCH       string   `json:"goarch"`
+	CGOEnabled   string   `json:"cgo_enabled"`
+	Language     string   `json:"language,omitempty"`
+	CompilerArgs []string `json:"compiler_args,omitempty"`
+	Sources      []string `json:"sources,omitempty"`
 }
 
 type errorResponse struct {
@@ -40,14 +43,17 @@ type errorResponse struct {
 }
 
 type buildOptions struct {
-	serverURL  string
-	sourcePath string
-	outputPath string
-	target     string
-	goos       string
-	goarch     string
-	cgoEnabled string
-	timeout    time.Duration
+	serverURL    string
+	sourcePath   string
+	outputPath   string
+	target       string
+	goos         string
+	goarch       string
+	cgoEnabled   string
+	timeout      time.Duration
+	language     string
+	compilerArgs []string
+	sources      []string
 }
 
 type serveOptions struct {
@@ -225,6 +231,33 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 				return opts, errors.New("missing value for -cgo")
 			}
 			opts.cgoEnabled = normalizeCGO(args[i])
+		case "-lang", "--lang":
+			// Selects the dispatcher on the sarver side. "go" runs
+			// `go build`; "c"/"cpp" runs cleng directly against the
+			// uploaded source tree. Auto-detected from the source
+			// extension when omitted.
+			i++
+			if i >= len(args) {
+				return opts, errors.New("missing value for -lang")
+			}
+			opts.language = args[i]
+		case "-X", "--compiler-arg":
+			// Repeatable. Forwarded verbatim to cleng for c/cpp builds
+			// (e.g. -X -std=c++20 -X -O2 -X -DFOO=1 -X -lkernel32).
+			i++
+			if i >= len(args) {
+				return opts, errors.New("missing value for -X")
+			}
+			opts.compilerArgs = append(opts.compilerArgs, args[i])
+		case "-src", "--source":
+			// Repeatable. Explicit upload-relative source files passed
+			// to cleng. When unset, sarver auto-discovers all matching
+			// source files in the upload root.
+			i++
+			if i >= len(args) {
+				return opts, errors.New("missing value for -src")
+			}
+			opts.sources = append(opts.sources, args[i])
 		case "-timeout":
 			i++
 			if i >= len(args) {
@@ -277,6 +310,10 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 		opts.outputPath = defaultOutputPath(opts.sourcePath, opts.target, info, opts.goos)
 	}
 
+	if opts.language == "" {
+		opts.language = detectLanguage(opts.sourcePath, opts.target, info)
+	}
+
 	return opts, nil
 }
 
@@ -313,11 +350,14 @@ func runBuild(opts buildOptions) error {
 	defer os.Remove(archivePath)
 
 	requestBody, contentType, err := makeMultipartBody(archivePath, buildRequest{
-		Target:     opts.target,
-		OutputName: filepath.Base(opts.outputPath),
-		GOOS:       opts.goos,
-		GOARCH:     opts.goarch,
-		CGOEnabled: opts.cgoEnabled,
+		Target:       opts.target,
+		OutputName:   filepath.Base(opts.outputPath),
+		GOOS:         opts.goos,
+		GOARCH:       opts.goarch,
+		CGOEnabled:   opts.cgoEnabled,
+		Language:     opts.language,
+		CompilerArgs: opts.compilerArgs,
+		Sources:      opts.sources,
 	})
 	if err != nil {
 		return err
@@ -871,6 +911,65 @@ func printUsage() {
 
 func init() {
 	mime.AddExtensionType(".exe", "application/octet-stream")
+}
+
+// detectLanguage decides whether to dispatch the build as Go or C/C++
+// based on what the user pointed cliant at. The rules are intentionally
+// simple — explicit `-lang` always wins, this is just the auto-detect:
+//   - if the source path is a single file, use its extension;
+//   - otherwise scan the source directory for go.mod first (Go),
+//     then for any .cpp/.cc/.cxx (cpp), then .c (c);
+//   - default to "go" for backward compatibility.
+func detectLanguage(sourcePath, target string, info os.FileInfo) string {
+	// Single-file builds are unambiguous.
+	if info != nil && !info.IsDir() {
+		switch strings.ToLower(filepath.Ext(sourcePath)) {
+		case ".go":
+			return "go"
+		case ".c":
+			return "c"
+		case ".cpp", ".cc", ".cxx", ".c++":
+			return "cpp"
+		}
+	}
+	if target != "" && target != "." {
+		switch strings.ToLower(filepath.Ext(target)) {
+		case ".go":
+			return "go"
+		case ".c":
+			return "c"
+		case ".cpp", ".cc", ".cxx", ".c++":
+			return "cpp"
+		}
+	}
+	root := sourcePath
+	if info != nil && !info.IsDir() {
+		root = filepath.Dir(sourcePath)
+	}
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+		return "go"
+	}
+	hasCpp, hasC := false, false
+	_ = filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+		if err != nil || fi.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".cpp", ".cc", ".cxx", ".c++":
+			hasCpp = true
+		case ".c":
+			hasC = true
+		}
+		return nil
+	})
+	switch {
+	case hasCpp:
+		return "cpp"
+	case hasC:
+		return "c"
+	default:
+		return "go"
+	}
 }
 
 func defaultOutputPath(sourcePath, target string, sourceInfo os.FileInfo, goos string) string {
