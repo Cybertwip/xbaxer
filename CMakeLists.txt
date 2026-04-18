@@ -163,6 +163,55 @@ set(CLENG_OUTPUT "${CLENG_OUTPUT_DIR}/cleng.exe")
 set(CLENG_CLANG_PREFIX "${CMAKE_BINARY_DIR}/engine/clang-windows-amd64"
     CACHE PATH "Prefix containing prebuilt Clang/LLVM static libs and headers for windows/amd64")
 
+function(cleng_real_parent_dir out_var in_path)
+  if(NOT in_path OR in_path STREQUAL "" OR NOT EXISTS "${in_path}")
+    set(${out_var} "" PARENT_SCOPE)
+    return()
+  endif()
+  get_filename_component(_real "${in_path}" REALPATH)
+  get_filename_component(_dir "${_real}" DIRECTORY)
+  get_filename_component(_parent "${_dir}" DIRECTORY)
+  set(${out_var} "${_parent}" PARENT_SCOPE)
+endfunction()
+
+function(cleng_set_first_existing_dir out_var)
+  foreach(_dir IN LISTS ARGN)
+    if(EXISTS "${_dir}")
+      set(${out_var} "${_dir}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${out_var} "" PARENT_SCOPE)
+endfunction()
+
+function(cleng_find_existing_child_dir out_var base)
+  if(NOT base OR base STREQUAL "" OR NOT EXISTS "${base}")
+    set(${out_var} "" PARENT_SCOPE)
+    return()
+  endif()
+  foreach(_rel IN LISTS ARGN)
+    if(EXISTS "${base}/${_rel}")
+      set(${out_var} "${base}/${_rel}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${out_var} "" PARENT_SCOPE)
+endfunction()
+
+set(CLENG_RUNTIME_BUNDLE_COMMANDS)
+function(cleng_append_runtime_bundle_command source dest marker components)
+  string(REPLACE ";" "\\;" _components_escaped "${components}")
+  list(APPEND CLENG_RUNTIME_BUNDLE_COMMANDS
+    COMMAND ${CMAKE_COMMAND}
+            -DSYSROOT_SOURCE=${source}
+            -DSYSROOT_DEST=${dest}
+            -DSYSROOT_MARKER=${marker}
+            -DSYSROOT_COMPONENTS=${_components_escaped}
+            -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
+  )
+  set(CLENG_RUNTIME_BUNDLE_COMMANDS "${CLENG_RUNTIME_BUNDLE_COMMANDS}" PARENT_SCOPE)
+endfunction()
+
 find_program(MINGW_CC  x86_64-w64-mingw32-gcc)
 find_program(MINGW_CXX x86_64-w64-mingw32-g++)
 if(NOT MINGW_CC OR NOT MINGW_CXX)
@@ -170,55 +219,198 @@ if(NOT MINGW_CC OR NOT MINGW_CXX)
   set(MINGW_CXX "x86_64-w64-mingw32-g++"  CACHE FILEPATH "Windows/amd64 C++ cross compiler")
 endif()
 
-# ---- Locate the mingw-w64 sysroot whose headers we will bundle with cleng --
+# ---- Locate the per-triplet headers / runtime libs we will bundle ----------
 #
 # The clang resource directory ships compiler-builtin headers only (stddef.h,
 # intrinsics, …). Standard C headers (stdio.h, string.h) and the C++
 # standard library (vector, sstream, …) are NOT part of the compiler — they
-# come from libc / libstdc++. For the windows/amd64 target we already
-# require Homebrew's mingw-w64 to link cleng itself, so we reuse that same
-# toolchain's include tree as the bundled sysroot. The headers are 0BSD/
-# public-domain (mingw-w64-headers) and the libstdc++ headers are GPL-with-
-# runtime-exception, both of which permit redistribution.
+# come from the target libc / libstdc++ / libc++ / SDK. We therefore bundle
+# the target-facing, redistributable pieces we can harvest on the build host:
+#
+#   * windows/amd64: mingw-w64 headers + import libs + GCC runtime archives
+#   * darwin/{amd64,arm64}: the active Apple SDK's headers/framework stubs
+#     when we are configuring on an Apple host with xcrun available
+#   * linux/{amd64,arm64}: glibc/libstdc++ headers + runtime archives from the
+#     GNU cross toolchains, when those toolchains are installed on the host
 #
 # Layout we end up shipping at runtime (sibling of cleng/bin/cleng.exe):
-#   cleng/sysroot/x86_64-w64-mingw32/include/                      (C headers)
-#   cleng/sysroot/x86_64-w64-mingw32/include/c++/<ver>/            (libstdc++)
-#   cleng/sysroot/x86_64-w64-mingw32/include/c++/<ver>/x86_64-w64-mingw32/
+#   cleng/sysroot/x86_64-w64-mingw32/include/                      (C/C++)
+#   cleng/sysroot/x86_64-w64-mingw32/lib/                          (PE import libs)
+#   cleng/sysroot/x86_64-w64-mingw32/lib/gcc/...                   (libgcc, crt*)
+#   cleng/sysroot/x86_64-apple-darwin/usr + /System + /Library     (macOS SDK)
+#   cleng/sysroot/aarch64-apple-darwin/usr + /System + /Library
+#   cleng/sysroot/x86_64-linux-gnu/sysroot/usr/...                 (glibc sysroot)
+#   cleng/sysroot/x86_64-linux-gnu/include/c++/...                 (libstdc++)
+#   cleng/sysroot/x86_64-linux-gnu/lib/gcc/...                     (libgcc, crt*)
+#   cleng/sysroot/aarch64-linux-gnu/...
 #
-# cleng injects these as `-isystem` search paths at runtime when the build
-# target triple is x86_64-w64-mingw32. Other GOOS targets (darwin/linux/…)
-# remain the developer's responsibility — they must supply their own
-# sysroot via `--sysroot=` / `-isystem` cgo flags.
+# cleng injects the matching sysroot / search-path flags at runtime based on
+# the target triple. When a bundle is absent for a given target, we leave the
+# driver untouched and the developer can still provide their own sysroot via
+# explicit `--sysroot=` / `-isysroot` / `-L` / `-isystem` flags.
+if(DEFINED CLENG_MINGW_SYSROOT AND (NOT DEFINED CLENG_MINGW_TOOLCHAIN_ROOT OR CLENG_MINGW_TOOLCHAIN_ROOT STREQUAL ""))
+  get_filename_component(CLENG_MINGW_TOOLCHAIN_ROOT "${CLENG_MINGW_SYSROOT}" DIRECTORY)
+endif()
 if(NOT DEFINED CLENG_MINGW_SYSROOT)
   # Walk back from x86_64-w64-mingw32-gcc to its sibling
   # x86_64-w64-mingw32/ directory (which contains include/ and lib/).
-  if(MINGW_CC AND EXISTS "${MINGW_CC}")
-    get_filename_component(_mingw_bin "${MINGW_CC}" DIRECTORY)
-    get_filename_component(_mingw_root "${_mingw_bin}" DIRECTORY)
+  cleng_real_parent_dir(_mingw_root "${MINGW_CC}")
+  if(_mingw_root)
     if(EXISTS "${_mingw_root}/x86_64-w64-mingw32/include/stdio.h")
       set(CLENG_MINGW_SYSROOT "${_mingw_root}/x86_64-w64-mingw32"
           CACHE PATH "mingw-w64 sysroot whose include/ tree is bundled with cleng")
+      set(CLENG_MINGW_TOOLCHAIN_ROOT "${_mingw_root}"
+          CACHE PATH "mingw-w64 toolchain root whose runtime archives are bundled with cleng")
     endif()
   endif()
 endif()
 if(NOT DEFINED CLENG_MINGW_SYSROOT)
   # Homebrew default if auto-detection failed.
-  file(GLOB _mingw_brew "/usr/local/Cellar/mingw-w64/*/toolchain-x86_64/x86_64-w64-mingw32"
-                         "/opt/homebrew/Cellar/mingw-w64/*/toolchain-x86_64/x86_64-w64-mingw32")
+  file(GLOB _mingw_brew "/usr/local/Cellar/mingw-w64/*/toolchain-x86_64"
+                         "/opt/homebrew/Cellar/mingw-w64/*/toolchain-x86_64")
   if(_mingw_brew)
     list(GET _mingw_brew 0 _mingw_first)
-    if(EXISTS "${_mingw_first}/include/stdio.h")
-      set(CLENG_MINGW_SYSROOT "${_mingw_first}"
+    if(EXISTS "${_mingw_first}/x86_64-w64-mingw32/include/stdio.h")
+      set(CLENG_MINGW_SYSROOT "${_mingw_first}/x86_64-w64-mingw32"
           CACHE PATH "mingw-w64 sysroot whose include/ tree is bundled with cleng")
+      set(CLENG_MINGW_TOOLCHAIN_ROOT "${_mingw_first}"
+          CACHE PATH "mingw-w64 toolchain root whose runtime archives are bundled with cleng")
     endif()
   endif()
 endif()
 if(DEFINED CLENG_MINGW_SYSROOT)
   message(STATUS "cleng sysroot (mingw-w64): ${CLENG_MINGW_SYSROOT}")
 else()
-  message(WARNING "cleng: no mingw-w64 sysroot detected; cleng.exe will ship without standard C/C++ headers for the windows target. Set -DCLENG_MINGW_SYSROOT=/path/to/x86_64-w64-mingw32 to override.")
+  message(WARNING "cleng: no mingw-w64 sysroot detected; cleng.exe will ship without bundled Windows headers/runtime libs. Set -DCLENG_MINGW_SYSROOT=/path/to/x86_64-w64-mingw32 to override.")
 endif()
+
+if(APPLE AND NOT DEFINED CLENG_APPLE_SDKROOT)
+  find_program(CLENG_XCRUN_EXECUTABLE xcrun)
+  if(CLENG_XCRUN_EXECUTABLE)
+    execute_process(
+      COMMAND "${CLENG_XCRUN_EXECUTABLE}" --sdk macosx --show-sdk-path
+      OUTPUT_VARIABLE _cleng_apple_sdk
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(EXISTS "${_cleng_apple_sdk}/usr/include/stdio.h")
+      set(CLENG_APPLE_SDKROOT "${_cleng_apple_sdk}"
+          CACHE PATH "Apple SDK root whose headers/framework stubs are bundled with cleng")
+    endif()
+  endif()
+endif()
+if(APPLE)
+  if(DEFINED CLENG_APPLE_SDKROOT AND EXISTS "${CLENG_APPLE_SDKROOT}/usr/include/stdio.h")
+    message(STATUS "cleng sysroot (apple sdk): ${CLENG_APPLE_SDKROOT}")
+  else()
+    message(WARNING "cleng: no Apple SDK detected; darwin targets will ship without a bundled SDK. Set -DCLENG_APPLE_SDKROOT=/path/to/MacOSX.sdk to override.")
+  endif()
+endif()
+
+find_program(CLENG_LINUX_AMD64_GCC NAMES x86_64-linux-gnu-gcc x86_64-unknown-linux-gnu-gcc)
+if(NOT DEFINED CLENG_LINUX_AMD64_TOOLCHAIN_ROOT)
+  cleng_real_parent_dir(_linux_amd64_toolchain "${CLENG_LINUX_AMD64_GCC}")
+  if(NOT _linux_amd64_toolchain)
+    cleng_set_first_existing_dir(_linux_amd64_toolchain
+      "/usr/local/opt/x86_64-unknown-linux-gnu/toolchain"
+      "/opt/homebrew/opt/x86_64-unknown-linux-gnu/toolchain")
+  endif()
+  if(_linux_amd64_toolchain)
+    set(CLENG_LINUX_AMD64_TOOLCHAIN_ROOT "${_linux_amd64_toolchain}"
+        CACHE PATH "Linux/amd64 GNU cross toolchain root whose headers/runtime libs are bundled with cleng")
+  endif()
+endif()
+if(DEFINED CLENG_LINUX_AMD64_TOOLCHAIN_ROOT AND NOT DEFINED CLENG_LINUX_AMD64_TARGET_ROOT)
+  cleng_find_existing_child_dir(_linux_amd64_target "${CLENG_LINUX_AMD64_TOOLCHAIN_ROOT}"
+    "x86_64-linux-gnu"
+    "x86_64-unknown-linux-gnu")
+  if(_linux_amd64_target AND EXISTS "${_linux_amd64_target}/sysroot/usr/include/stdio.h")
+    set(CLENG_LINUX_AMD64_TARGET_ROOT "${_linux_amd64_target}"
+        CACHE PATH "Linux/amd64 target-data root whose glibc/libstdc++ headers are bundled with cleng")
+  endif()
+endif()
+if(DEFINED CLENG_LINUX_AMD64_TARGET_ROOT)
+  message(STATUS "cleng sysroot (linux/amd64): ${CLENG_LINUX_AMD64_TARGET_ROOT}")
+else()
+  message(STATUS "cleng sysroot (linux/amd64): not detected; install x86_64-unknown-linux-gnu to bundle Linux/amd64 headers/runtime libs")
+endif()
+
+find_program(CLENG_LINUX_ARM64_GCC NAMES aarch64-linux-gnu-gcc aarch64-unknown-linux-gnu-gcc)
+if(NOT DEFINED CLENG_LINUX_ARM64_TOOLCHAIN_ROOT)
+  cleng_real_parent_dir(_linux_arm64_toolchain "${CLENG_LINUX_ARM64_GCC}")
+  if(NOT _linux_arm64_toolchain)
+    cleng_set_first_existing_dir(_linux_arm64_toolchain
+      "/usr/local/opt/aarch64-unknown-linux-gnu/toolchain"
+      "/opt/homebrew/opt/aarch64-unknown-linux-gnu/toolchain")
+  endif()
+  if(_linux_arm64_toolchain)
+    set(CLENG_LINUX_ARM64_TOOLCHAIN_ROOT "${_linux_arm64_toolchain}"
+        CACHE PATH "Linux/arm64 GNU cross toolchain root whose headers/runtime libs are bundled with cleng")
+  endif()
+endif()
+if(DEFINED CLENG_LINUX_ARM64_TOOLCHAIN_ROOT AND NOT DEFINED CLENG_LINUX_ARM64_TARGET_ROOT)
+  cleng_find_existing_child_dir(_linux_arm64_target "${CLENG_LINUX_ARM64_TOOLCHAIN_ROOT}"
+    "aarch64-linux-gnu"
+    "aarch64-unknown-linux-gnu")
+  if(_linux_arm64_target AND EXISTS "${_linux_arm64_target}/sysroot/usr/include/stdio.h")
+    set(CLENG_LINUX_ARM64_TARGET_ROOT "${_linux_arm64_target}"
+        CACHE PATH "Linux/arm64 target-data root whose glibc/libstdc++ headers are bundled with cleng")
+  endif()
+endif()
+if(DEFINED CLENG_LINUX_ARM64_TARGET_ROOT)
+  message(STATUS "cleng sysroot (linux/arm64): ${CLENG_LINUX_ARM64_TARGET_ROOT}")
+else()
+  message(STATUS "cleng sysroot (linux/arm64): not detected; install aarch64-unknown-linux-gnu to bundle Linux/arm64 headers/runtime libs")
+endif()
+
+cleng_append_runtime_bundle_command(
+  "${CLENG_MINGW_SYSROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-w64-mingw32"
+  "include/stdio.h"
+  "include;lib"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_MINGW_TOOLCHAIN_ROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-w64-mingw32"
+  "lib/gcc/x86_64-w64-mingw32"
+  "lib/gcc"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_APPLE_SDKROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-apple-darwin"
+  "usr/include/stdio.h"
+  "usr;System;Library"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_APPLE_SDKROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/aarch64-apple-darwin"
+  "usr/include/stdio.h"
+  "usr;System;Library"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_LINUX_AMD64_TARGET_ROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-linux-gnu"
+  "sysroot/usr/include/stdio.h"
+  "include;lib;lib32;lib64;sysroot"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_LINUX_AMD64_TOOLCHAIN_ROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-linux-gnu"
+  "lib/gcc"
+  "lib/gcc"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_LINUX_ARM64_TARGET_ROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/aarch64-linux-gnu"
+  "sysroot/usr/include/stdio.h"
+  "include;lib;lib32;lib64;sysroot"
+)
+cleng_append_runtime_bundle_command(
+  "${CLENG_LINUX_ARM64_TOOLCHAIN_ROOT}"
+  "${XBAX_PACKAGE_DIR}/cleng/sysroot/aarch64-linux-gnu"
+  "lib/gcc"
+  "lib/gcc"
+)
 
 # ---- clang-engine: cross-build LLVM/Clang static libs for windows/amd64 ----
 #
@@ -320,16 +512,13 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CLENG_CLANG_PREFIX}/lib/clang"
           "${XBAX_PACKAGE_DIR}/cleng/lib/clang"
-  # Bundle the mingw-w64 sysroot include tree so cleng can find <stdio.h>,
-  # <vector>, <sstream> etc. when targeting x86_64-w64-mingw32 — these are
-  # standard libc / libstdc++ headers, not part of the compiler. cleng
-  # auto-injects the matching `-isystem` paths at runtime when it detects
-  # the mingw target triple. Skipped (with a warning at configure time) if
-  # CLENG_MINGW_SYSROOT was not detected.
-  COMMAND ${CMAKE_COMMAND}
-          -DSYSROOT_SOURCE=${CLENG_MINGW_SYSROOT}
-          -DSYSROOT_DEST=${XBAX_PACKAGE_DIR}/cleng/sysroot/x86_64-w64-mingw32
-          -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
+  # Bundle the target-facing headers/framework stubs/runtime archives that
+  # Clang itself does not own: mingw-w64 for windows, the active Apple SDK
+  # for darwin when available on Apple hosts, and GNU glibc/libstdc++
+  # payloads for linux triplets when the matching cross toolchains are
+  # installed. The runtime Go wrapper picks the right bundle by target
+  # triple and injects the corresponding sysroot/search flags.
+  ${CLENG_RUNTIME_BUNDLE_COMMANDS}
   DEPENDS
     go-toolchain
     clang-engine

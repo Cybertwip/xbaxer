@@ -57,13 +57,13 @@ type reverseJob struct {
 }
 
 type server struct {
-	goBinary   string
+	goBinary    string
 	clengBinary string
-	goCacheDir string
-	goModCache string
-	goPathDir  string
-	timeout    time.Duration
-	reverseURL string
+	goCacheDir  string
+	goModCache  string
+	goPathDir   string
+	timeout     time.Duration
+	reverseURL  string
 }
 
 type buildExecution struct {
@@ -808,14 +808,6 @@ func (s *server) buildClengCommand(ctx context.Context, sourceDir, outputPath, l
 
 	if triple := llvmTripleFor(req.GOOS, req.GOARCH); triple != "" {
 		args = append(args, "--target="+triple)
-	}
-
-	if lang == "cpp" {
-		// On the windows target we bundle mingw's libstdc++ headers,
-		// not libc++, so default to libstdc++. The user can still
-		// override with `-stdlib=libc++` via CompilerArgs if they
-		// supply their own libc++ sysroot.
-		args = append(args, "-stdlib=libstdc++")
 	}
 
 	args = append(args, req.CompilerArgs...)

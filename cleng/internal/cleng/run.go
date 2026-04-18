@@ -23,7 +23,7 @@ import (
 // clang binary.
 func Run(argv []string) (int, error) {
 	argv = injectResourceDir(argv)
-	argv = injectSysrootIncludes(argv)
+	argv = injectBundledTargetRuntime(argv)
 	return cgobridge.ClangMain(argv)
 }
 
@@ -54,42 +54,218 @@ func injectResourceDir(argv []string) []string {
 	return insertAfterArgv0(argv, "-resource-dir", dir)
 }
 
-// injectSysrootIncludes appends `-isystem <path>` entries pointing at the
-// bundled mingw-w64 sysroot (libc + libstdc++ headers) when the build's
-// effective target triple is x86_64-w64-mingw32. These are *standard*
-// C/C++ headers — stdio.h, vector, sstream — that the compiler itself
-// does not own. They are bundled at build time by CMake (see
-// cleng/scripts/copy_sysroot.cmake) at <exe-dir>/../sysroot/<triple>/.
+var bundleRootsFunc = exeRelativeRoots
+
+// injectBundledTargetRuntime wires in the packaged target-facing SDK/sysroot
+// data when the caller selected a known target triple and did not already
+// provide an explicit stdlib/sysroot override of their own.
 //
-// We only inject them when the user is actually targeting mingw; cross-
-// builds for darwin/linux/etc. need their own sysroot supplied by the
-// developer (via `--sysroot=` or explicit `-isystem` cgo flags), as the
-// xbax toolchain only commits to bundling the windows target's stdlib.
+// The build packages these next to cleng under <prefix>/sysroot/<triple>/:
+//   - mingw-w64 headers/import libs/libgcc runtime pieces for windows
+//   - the active Apple SDK for darwin (when captured on an Apple host)
+//   - glibc/libstdc++/libgcc payloads for linux triplets (when installed)
 //
-// Adding `-isystem` (rather than replacing the search path with
-// `-nostdinc`) is intentional: the bundled sysroot then layers on top of
-// whatever clang would have searched, which keeps user-supplied
-// `-I`/`-isystem` flags first (correct precedence) while still resolving
-// stdio.h/vector when nothing else does.
-func injectSysrootIncludes(argv []string) []string {
+// Darwin is the simplest case: `-isysroot` against the bundled SDK is enough
+// for Clang to recover libc++, libc and framework search paths. GNU-ish
+// targets still benefit from some manual hints, so alongside `--sysroot=` we
+// add `-isystem` / `-L` / `-B` pointing at the bundled C++ and libgcc trees.
+//
+// Explicit user flags always win. If the argv already contains its own
+// `--sysroot=` / `-isysroot` / `-syslibroot` or an opt-out like `-nostdlib`,
+// we leave the command line untouched.
+func injectBundledTargetRuntime(argv []string) []string {
 	triple := effectiveTargetTriple(argv)
+	if triple == "" || hasExplicitRuntimeOverride(argv) {
+		return argv
+	}
+
+	if isAppleTriple(triple) {
+		if sdk := findBundledAppleSDK(triple); sdk != "" {
+			return insertAfterArgv0(argv, "-isysroot", sdk)
+		}
+		return argv
+	}
+
+	if extra := findBundledGNUFlags(triple); len(extra) != 0 {
+		return insertAfterArgv0(argv, extra...)
+	}
+
+	// Backward compatibility with packages built before we started bundling
+	// per-target runtime libraries. Those only shipped the mingw include tree.
 	if !isMingwTriple(triple) {
 		return argv
 	}
-	root := findSysrootDir(triple)
+	return injectLegacyMingwIncludes(argv, triple)
+}
+
+func hasExplicitRuntimeOverride(argv []string) bool {
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		switch {
+		case arg == "-isysroot",
+			arg == "-syslibroot",
+			arg == "--sysroot",
+			arg == "-nostdinc",
+			arg == "-nostdinc++",
+			arg == "-nostdlib",
+			arg == "-nostdlib++",
+			arg == "-nodefaultlibs":
+			return true
+		case strings.HasPrefix(arg, "--sysroot="),
+			strings.HasPrefix(arg, "-syslibroot="),
+			strings.HasPrefix(arg, "-isysroot="):
+			return true
+		}
+	}
+	return false
+}
+
+func findBundledAppleSDK(triple string) string {
+	root := findTargetBundleDir(triple)
+	if root == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(root, "usr", "include", "stdio.h")); err != nil {
+		return ""
+	}
+	return root
+}
+
+func findBundledGNUFlags(triple string) []string {
+	root := findTargetBundleDir(triple)
+	if root == "" {
+		return nil
+	}
+	sysroot := findBundledGNUSysroot(root)
+	if sysroot == "" {
+		return nil
+	}
+
+	extra := []string{"--sysroot=" + sysroot}
+	if gccLib := findHighestGCCLibDir(root, triple); gccLib != "" {
+		extra = append(extra, "-B"+gccLib, "-L", gccLib)
+	}
+	for _, dir := range findBundledGNUIncludeDirs(root, sysroot, triple) {
+		extra = append(extra, "-isystem", dir)
+	}
+	for _, dir := range findBundledGNULibraryDirs(root, sysroot, triple) {
+		extra = append(extra, "-L", dir)
+	}
+	return extra
+}
+
+func findBundledGNUIncludeDirs(root, sysroot, triple string) []string {
+	var includes []string
+	for _, cxxParent := range []string{
+		filepath.Join(root, "include", "c++"),
+		filepath.Join(sysroot, "include", "c++"),
+		filepath.Join(sysroot, "usr", "include", "c++"),
+	} {
+		if cxxVerDir := findHighestVersionDir(cxxParent); cxxVerDir != "" {
+			includes = appendUniqueDir(includes, cxxVerDir)
+			for _, alias := range tripleAliases(triple) {
+				includes = appendUniqueDir(includes, filepath.Join(cxxVerDir, alias))
+			}
+			includes = appendUniqueDir(includes, filepath.Join(cxxVerDir, "backward"))
+		}
+	}
+	for _, include := range []string{
+		filepath.Join(root, "include"),
+		filepath.Join(sysroot, "include"),
+		filepath.Join(sysroot, "usr", "include"),
+	} {
+		if hasHeader(include, "stdio.h") {
+			includes = appendUniqueDir(includes, include)
+		}
+	}
+	return includes
+}
+
+func findBundledGNULibraryDirs(root, sysroot, triple string) []string {
+	var libs []string
+	for _, dir := range []string{
+		filepath.Join(root, "lib"),
+		filepath.Join(root, "lib64"),
+		filepath.Join(sysroot, "lib"),
+		filepath.Join(sysroot, "lib64"),
+		filepath.Join(sysroot, "usr", "lib"),
+		filepath.Join(sysroot, "usr", "lib64"),
+	} {
+		libs = appendUniqueDir(libs, dir)
+	}
+	for _, alias := range tripleAliases(triple) {
+		libs = appendUniqueDir(libs, filepath.Join(sysroot, "lib", alias))
+		libs = appendUniqueDir(libs, filepath.Join(sysroot, "usr", "lib", alias))
+	}
+	return libs
+}
+
+func findBundledGNUSysroot(root string) string {
+	for _, candidate := range []string{root, filepath.Join(root, "sysroot")} {
+		switch {
+		case hasHeader(filepath.Join(candidate, "include"), "stdio.h"):
+			return candidate
+		case hasHeader(filepath.Join(candidate, "usr", "include"), "stdio.h"):
+			return candidate
+		}
+	}
+	return ""
+}
+
+func findHighestGCCLibDir(root, triple string) string {
+	for _, alias := range tripleAliases(triple) {
+		if dir := findHighestVersionDir(filepath.Join(root, "lib", "gcc", alias)); dir != "" {
+			return dir
+		}
+	}
+	return ""
+}
+
+func appendUniqueDir(list []string, dir string) []string {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return list
+	}
+	for _, existing := range list {
+		if existing == dir {
+			return list
+		}
+	}
+	return append(list, dir)
+}
+
+func hasHeader(parent, name string) bool {
+	_, err := os.Stat(filepath.Join(parent, name))
+	return err == nil
+}
+
+func tripleAliases(triple string) []string {
+	aliases := []string{triple}
+	switch {
+	case strings.HasSuffix(triple, "-linux-gnu"):
+		aliases = append(aliases, strings.Replace(triple, "-linux-gnu", "-unknown-linux-gnu", 1))
+	case strings.HasSuffix(triple, "-w64-mingw32"):
+		aliases = append(aliases, strings.Replace(triple, "-w64-mingw32", "-w64-windows-gnu", 1))
+	}
+	return aliases
+}
+
+func isAppleTriple(triple string) bool {
+	return strings.Contains(triple, "-apple-")
+}
+
+func injectLegacyMingwIncludes(argv []string, triple string) []string {
+	root := findLegacySysrootDir(triple)
 	if root == "" {
 		return argv
 	}
 	include := filepath.Join(root, "include")
-	if _, err := os.Stat(filepath.Join(include, "stdio.h")); err != nil {
-		return argv
-	}
 
 	// Order matters: C++ headers first (so <cstdio> wraps <stdio.h>
 	// correctly), then the target-specific bits/, then the plain C
 	// include dir. We pick the highest GCC version present.
 	var includes []string
-	if cxxVerDir := findHighestCxxVersionDir(filepath.Join(include, "c++")); cxxVerDir != "" {
+	if cxxVerDir := findHighestVersionDir(filepath.Join(include, "c++")); cxxVerDir != "" {
 		includes = append(includes, cxxVerDir)
 		// libstdc++ pulls bits/ from a target subdir.
 		targetSub := filepath.Join(cxxVerDir, triple)
@@ -164,24 +340,36 @@ func findResourceDir() string {
 	return ""
 }
 
-// findSysrootDir locates <exe-dir>[/..]/sysroot/<triple>/ — the directory
-// whose include/ subtree contains stdio.h.
-func findSysrootDir(triple string) string {
-	for _, root := range exeRelativeRoots() {
+func findTargetBundleDir(triple string) string {
+	for _, root := range bundleRootsFunc() {
 		candidate := filepath.Join(root, "sysroot", triple)
-		if _, err := os.Stat(filepath.Join(candidate, "include", "stdio.h")); err == nil {
+		info, err := os.Stat(candidate)
+		if err == nil && info.IsDir() {
 			return candidate
 		}
 	}
 	return ""
 }
 
-// findHighestCxxVersionDir scans a directory like include/c++/ for
-// numeric-named version subdirectories and returns the highest one (lexical
+// findLegacySysrootDir locates the older include-only mingw layout:
+// <exe-dir>[/..]/sysroot/<triple>/include/stdio.h.
+func findLegacySysrootDir(triple string) string {
+	candidate := findTargetBundleDir(triple)
+	if candidate == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(candidate, "include", "stdio.h")); err != nil {
+		return ""
+	}
+	return candidate
+}
+
+// findHighestVersionDir scans a directory like include/c++/ or lib/gcc/<triple>/
+// and returns the highest numeric-named version subdirectory (lexical
 // sort works for libstdc++'s "<major>.<minor>.<patch>" naming so long as
 // majors stay below 10; otherwise version-aware comparison kicks in via
 // length-then-lex).
-func findHighestCxxVersionDir(parent string) string {
+func findHighestVersionDir(parent string) string {
 	entries, err := os.ReadDir(parent)
 	if err != nil {
 		return ""

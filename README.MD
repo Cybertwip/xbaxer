@@ -22,7 +22,10 @@ It currently contains:
 A `Brewfile` at the repo root captures every native dependency — CMake +
 Ninja, the host clang/clang++ used to bootstrap the LLVM cross-build, the
 mingw-w64 cross toolchain used to target Windows, an existing `go` for
-`GOROOT_BOOTSTRAP`, and Python 3.12 for the streaming client.
+`GOROOT_BOOTSTRAP`, the Linux GNU cross toolchains used to harvest bundled
+glibc/libstdc++ payloads for the `linux` triplets, and Python 3.12 for the
+streaming client. On Apple hosts, the active macOS SDK is detected from
+`xcrun` and bundled alongside `cleng` for the darwin triplets.
 
 ```bash
 brew bundle
