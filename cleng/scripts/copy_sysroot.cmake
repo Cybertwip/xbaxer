@@ -42,12 +42,16 @@ message(STATUS "cleng target bundle: staging ${SYSROOT_SOURCE} -> ${SYSROOT_DEST
 file(REMOVE_RECURSE "${SYSROOT_DEST}")
 file(MAKE_DIRECTORY "${SYSROOT_DEST}")
 
+# Apple SDKs and GNU sysroots often expose public headers through symlink
+# chains (for example Tcl headers under the macOS SDK). Follow those links
+# while staging so the packaged bundle contains real files rather than broken
+# links into the original host toolchain.
 if(DEFINED SYSROOT_COMPONENTS AND NOT SYSROOT_COMPONENTS STREQUAL "")
   foreach(_rel IN LISTS SYSROOT_COMPONENTS)
     if(EXISTS "${SYSROOT_SOURCE}/${_rel}")
-      file(COPY "${SYSROOT_SOURCE}/${_rel}" DESTINATION "${SYSROOT_DEST}")
+      file(COPY "${SYSROOT_SOURCE}/${_rel}" DESTINATION "${SYSROOT_DEST}" FOLLOW_SYMLINK_CHAIN)
     endif()
   endforeach()
 else()
-  file(COPY "${SYSROOT_SOURCE}/" DESTINATION "${SYSROOT_DEST}")
+  file(COPY "${SYSROOT_SOURCE}/" DESTINATION "${SYSROOT_DEST}" FOLLOW_SYMLINK_CHAIN)
 endif()

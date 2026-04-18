@@ -790,8 +790,13 @@ class IntegratedTerminal:
             for filename in filenames:
                 local_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(local_path, local_dir).replace(os.sep, "/")
-                local_stat = os.stat(local_path)
-                files.append((local_path, rel_path))
+                # Package installs should upload the real file bytes even when
+                # the package tree exposes SDK headers via symlinks.
+                resolved_path = os.path.realpath(local_path)
+                if os.path.islink(local_path) and not os.path.exists(resolved_path):
+                    raise RuntimeError(f"packaged symlink is broken: {local_path} -> {os.readlink(local_path)}")
+                local_stat = os.stat(resolved_path)
+                files.append((resolved_path, rel_path))
                 manifest[rel_path] = {
                     "size": local_stat.st_size,
                     "mtime": int(local_stat.st_mtime),
