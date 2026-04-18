@@ -181,7 +181,10 @@ func parseBuildOptions(serverURL string, args []string) (buildOptions, error) {
 		sourcePath: ".",
 		goos:       runtime.GOOS,
 		goarch:     runtime.GOARCH,
-		cgoEnabled: "0",
+		cgoEnabled: "1",
+		// cgo defaults to ON because most builds pull in cleng-driven C/C++
+		// wrappers. Override with -cgo 0 for pure-Go builds, and -goos /
+		// -goarch when you really mean to cross-compile.
 		timeout:    10 * time.Minute,
 	}
 
@@ -832,6 +835,13 @@ func decodeServerError(response *http.Response) error {
 	var structured errorResponse
 	if json.Unmarshal(payload, &structured) == nil && structured.Error != "" {
 		if structured.Log != "" {
+			// Surface the remote build log on stderr immediately so the user
+			// sees the compiler/cgo diagnostics even if the wrapping caller
+			// only inspects the exit code. We still embed it in the returned
+			// error so anything that captures stderr+err sees it once.
+			fmt.Fprintln(os.Stderr, "--- remote build log ---")
+			fmt.Fprintln(os.Stderr, strings.TrimSpace(structured.Log))
+			fmt.Fprintln(os.Stderr, "------------------------")
 			return fmt.Errorf("%s\n%s", structured.Error, structured.Log)
 		}
 		return errors.New(structured.Error)

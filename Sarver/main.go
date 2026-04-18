@@ -57,6 +57,25 @@ type buildExecution struct {
 }
 
 func main() {
+	// Subcommand sugar: `sarver.exe reverse <url> [flags...]` is equivalent
+	// to `sarver.exe -reverse <url> [flags...]`. Same for `probe`. We
+	// rewrite os.Args before flag.Parse so the rest of the code path is
+	// unchanged.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "reverse":
+			if len(os.Args) < 3 || strings.HasPrefix(os.Args[2], "-") {
+				fmt.Fprintln(os.Stderr, "usage: sarver.exe reverse <relay-url> [flags...]")
+				os.Exit(2)
+			}
+			rest := append([]string{os.Args[0], "-reverse", os.Args[2]}, os.Args[3:]...)
+			os.Args = rest
+		case "probe":
+			rest := append([]string{os.Args[0], "-probe"}, os.Args[2:]...)
+			os.Args = rest
+		}
+	}
+
 	listenAddr := flag.String("listen", "0.0.0.0:17777", "listen address")
 	reverseURL := flag.String("reverse", "", "reverse relay URL to pull build jobs from")
 	probeMode := flag.Bool("probe", false, "run the Xbox-firewall probe (binds every allowlisted port and logs inbound connections); pair with `cliant probe <xbox-ip>` from the host")
@@ -78,13 +97,13 @@ func main() {
 	}
 
 	srv := &server{
-		goBinary:   *goBinary,
+		goBinary:    *goBinary,
 		clengBinary: *clengBinary,
-		goCacheDir: goCacheDir,
-		goModCache: goModCache,
-		goPathDir:  goPathDir,
-		timeout:    *timeout,
-		reverseURL: strings.TrimRight(*reverseURL, "/"),
+		goCacheDir:  goCacheDir,
+		goModCache:  goModCache,
+		goPathDir:   goPathDir,
+		timeout:     *timeout,
+		reverseURL:  normalizeReverseURL(*reverseURL),
 	}
 
 	log.Printf("sarver go binary: %s", *goBinary)
@@ -381,13 +400,27 @@ func (s *server) executeBuild(parent context.Context, req buildRequest, archiveR
 		"GOPATH="+s.goPathDir,
 	)
 	if s.clengBinary != "" && req.CGOEnabled == "1" {
-		// cleng.exe is a Go-fronted Clang driver. Pointing CC/CXX at it lets
-		// cgo compile any .c / .cpp / .cxx file in the source tree without
-		// requiring a separate mingw toolchain on the console.
+		// cleng.exe is a Go-fronted Clang driver. Always wire it as
+		// CC/CXX when cgo is enabled — it's the only C/C++ toolchain
+		// available on the console. Translate GOOS/GOARCH into an LLVM
+		// target triple and pass it to cleng via CGO_*FLAGS so the same
+		// cleng binary can emit PE for windows, Mach-O for darwin, and
+		// ELF for linux. Without an explicit `--target=`, cleng falls
+		// back to its default (mingw) triple and rejects darwin's
+		// `-arch <goarch>` cgo injection with "unsupported option
+		// '-arch'".
 		cmd.Env = append(cmd.Env,
 			"CC="+s.clengBinary,
 			"CXX="+s.clengBinary,
 		)
+		if triple := llvmTripleFor(req.GOOS, req.GOARCH); triple != "" {
+			targetFlag := "--target=" + triple
+			cmd.Env = append(cmd.Env,
+				"CGO_CFLAGS="+targetFlag,
+				"CGO_CXXFLAGS="+targetFlag,
+				"CGO_LDFLAGS="+targetFlag,
+			)
+		}
 	}
 	buildLog, err := cmd.CombinedOutput()
 	if err != nil {
@@ -627,6 +660,57 @@ func defaultClengBinaryPath() string {
 		}
 	}
 	return ""
+}
+
+// normalizeReverseURL accepts the relay address in the forms users
+// actually type into a console: `http://host:port`, `https://host:port`,
+// `host:port`, and even the common typo `http:host:port` (missing
+// slashes). Returns "" unchanged so callers can detect "not in reverse
+// mode".
+func normalizeReverseURL(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	for _, scheme := range []string{"http", "https"} {
+		prefix := scheme + ":"
+		if strings.HasPrefix(v, prefix) && !strings.HasPrefix(v, prefix+"//") {
+			v = scheme + "://" + strings.TrimPrefix(v, prefix)
+		}
+	}
+	if !strings.Contains(v, "://") {
+		v = "http://" + v
+	}
+	return strings.TrimRight(v, "/")
+}
+
+// llvmTripleFor maps Go's GOOS/GOARCH onto an LLVM target triple suitable
+// for clang's `--target=` flag. Returns "" when the combination has no
+// well-known triple, in which case sarver leaves cleng on its default
+// (mingw) triple. Triples are kept minimal — clang fills in the rest from
+// its built-in defaults.
+func llvmTripleFor(goos, goarch string) string {
+	arch := goarch
+	switch arch {
+	case "amd64":
+		arch = "x86_64"
+	case "386":
+		arch = "i386"
+	case "arm64":
+		arch = "aarch64"
+	}
+	switch goos {
+	case "darwin":
+		return arch + "-apple-darwin"
+	case "linux":
+		return arch + "-linux-gnu"
+	case "windows":
+		return arch + "-w64-mingw32"
+	case "freebsd", "openbsd", "netbsd":
+		return arch + "-unknown-" + goos
+	default:
+		return ""
+	}
 }
 
 func isLoopbackListenAddr(listenAddr string) bool {
