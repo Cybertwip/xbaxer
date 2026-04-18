@@ -16,6 +16,7 @@ import paramiko
 import io
 import re
 import json
+import subprocess
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -27,6 +28,15 @@ CONFIG_FILE = "xbox_config.json"
 TELNET_CONNECT_TIMEOUT = 15
 TELNET_KEEPALIVE_INTERVAL = 10
 SSH_KEEPALIVE_INTERVAL = 20
+HEADER_HEIGHT = 80
+DEFAULT_TERMINAL_HEIGHT = 290
+MIN_TERMINAL_HEIGHT = 180
+MIN_VIDEO_HEIGHT = 180
+SPLITTER_HEIGHT = 10
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+BUILD_DIR = os.path.join(REPO_ROOT, "build")
+LOCAL_PACKAGE_DIR = os.path.join(BUILD_DIR, "package", "Xbax")
+REMOTE_INSTALL_DIR = "D:/DevelopmentFiles/Xbax"
 
 # ================== PIN STORAGE ==================
 def load_pin(ip):
@@ -122,10 +132,12 @@ def scan_network_async(result_list, callback):
 
 # ================== UI ==================
 class Button:
-    def __init__(self, x, y, w, h, text, color=(0, 120, 215), hover=(0, 160, 255)):
+    def __init__(self, x, y, w, h, text, color=(0, 120, 215), hover=(0, 160, 255), disabled=(60, 70, 80)):
         self.text = text
         self.color = color
         self.hover = hover
+        self.disabled = disabled
+        self.enabled = True
         self.font = pygame.font.SysFont("consolas", 20, bold=True)
         # Measure text ONCE at construction — no runtime overflow
         txt_w = self.font.size(text)[0]
@@ -133,13 +145,18 @@ class Button:
         self.rect = pygame.Rect(x, y, actual_w, h)
 
     def draw(self, surf):
-        col = self.hover if self.rect.collidepoint(pygame.mouse.get_pos()) else self.color
+        if not self.enabled:
+            col = self.disabled
+            txt_color = (185, 185, 185)
+        else:
+            col = self.hover if self.rect.collidepoint(pygame.mouse.get_pos()) else self.color
+            txt_color = (255, 255, 255)
         pygame.draw.rect(surf, col, self.rect, border_radius=8)
-        txt = self.font.render(self.text, True, (255, 255, 255))
+        txt = self.font.render(self.text, True, txt_color)
         surf.blit(txt, txt.get_rect(center=self.rect.center))
 
     def clicked(self, pos):
-        return self.rect.collidepoint(pos)
+        return self.enabled and self.rect.collidepoint(pos)
 
 # ================== TRUE VT100 TERMINAL EMULATOR ==================
 class IntegratedTerminal:
@@ -175,6 +192,7 @@ class IntegratedTerminal:
         self.retry_count = 0
         self.ip = None
         self.pin = None
+        self.installing = False
 
         # Dirty-cache: only re-render the body surface when content changes
         self._dirty = True
@@ -185,6 +203,20 @@ class IntegratedTerminal:
 
     def _mark_dirty(self):
         self._dirty = True
+
+    def log(self, message):
+        with self.lock:
+            self.history.append(message)
+            if len(self.history) > 2500:
+                self.history = self.history[-1800:]
+        self._mark_dirty()
+
+    def has_active_ssh(self):
+        transport = self.ssh_client.get_transport() if self.ssh_client else None
+        return bool(transport and transport.is_active())
+
+    def can_install(self):
+        return self.connected and self.has_active_ssh() and not self.installing
 
     def resize_grid(self, new_rows):
         if new_rows <= 0 or new_rows == self.rows: return
@@ -397,6 +429,119 @@ class IntegratedTerminal:
             if self.connected: self.sock.sendall(b"dir\r\n")
         except Exception as e:
             with self.lock: self.history.append(f"[-] Upload failed: {e}")
+            self._mark_dirty()
+
+    def _run_local_command(self, cmd, cwd):
+        self.log(f"[*] Running: {' '.join(cmd)}")
+        try:
+            process = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"missing build tool: {exc.filename}") from exc
+
+        if process.stdout:
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    self.log(f"    {line}")
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"command failed with exit code {return_code}: {' '.join(cmd)}")
+
+    def _remote_mkdirs(self, sftp, remote_dir):
+        remote_dir = remote_dir.replace("\\", "/").rstrip("/")
+        if not remote_dir:
+            return
+
+        if ":/" in remote_dir:
+            drive, tail = remote_dir.split(":/", 1)
+            current = drive + ":/"
+            parts = [part for part in tail.split("/") if part]
+        else:
+            current = ""
+            parts = [part for part in remote_dir.split("/") if part]
+
+        for part in parts:
+            if current.endswith("/"):
+                current = current + part
+            elif current:
+                current = current + "/" + part
+            else:
+                current = part
+            try:
+                sftp.stat(current)
+            except IOError:
+                sftp.mkdir(current)
+
+    def _upload_tree(self, local_dir, remote_dir):
+        files = []
+        for root, _, filenames in os.walk(local_dir):
+            for filename in filenames:
+                local_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(local_path, local_dir)
+                remote_path = remote_dir.rstrip("/") + "/" + rel_path.replace(os.sep, "/")
+                files.append((local_path, remote_path))
+
+        self.log(f"[*] Uploading {len(files)} packaged file(s) to {remote_dir}...")
+        sftp = self.ssh_client.open_sftp()
+        try:
+            self._remote_mkdirs(sftp, remote_dir)
+            for index, (local_path, remote_path) in enumerate(files, start=1):
+                self._remote_mkdirs(sftp, os.path.dirname(remote_path))
+                sftp.put(local_path, remote_path)
+                if index == len(files) or index % 25 == 0:
+                    self.log(f"[*] Uploaded {index}/{len(files)} files...")
+        finally:
+            sftp.close()
+
+    def _open_remote_install_dir(self):
+        if not self.connected or not self.sock:
+            return
+        commands = [
+            b"d:\r\n",
+            b"cd \\DevelopmentFiles\\Xbax\r\n",
+            b"dir\r\n",
+        ]
+        for cmd in commands:
+            try:
+                self.sock.sendall(cmd)
+                time.sleep(0.15)
+            except Exception:
+                break
+
+    def install_package(self):
+        if self.installing:
+            self.log("[-] Install already running.")
+            return
+        if not self.has_active_ssh():
+            self.log("[-] Connect Dev Shell first to install Xbax.")
+            return
+
+        self.installing = True
+        self._mark_dirty()
+        try:
+            self.log("[*] Configuring Xbax package build...")
+            self._run_local_command(["cmake", "-S", REPO_ROOT, "-B", BUILD_DIR], REPO_ROOT)
+            self.log("[*] Building Xbax package artifacts...")
+            self._run_local_command(["cmake", "--build", BUILD_DIR, "--target", "package-xbax", "-j4"], REPO_ROOT)
+
+            if not os.path.isdir(LOCAL_PACKAGE_DIR):
+                raise RuntimeError(f"package directory not found: {LOCAL_PACKAGE_DIR}")
+
+            self._upload_tree(LOCAL_PACKAGE_DIR, REMOTE_INSTALL_DIR)
+            self.log(f"[+] Install complete. Artifacts uploaded to {REMOTE_INSTALL_DIR}")
+            self._open_remote_install_dir()
+        except Exception as exc:
+            self.log(f"[-] Install failed: {exc}")
+        finally:
+            self.installing = False
             self._mark_dirty()
 
     def start_telnet(self, ip, pin, ssh_client, port=24):
@@ -725,16 +870,20 @@ def run_stream(screen, clock, ip):
 
     # Buttons auto-size their width from text at construction
     shell_btn     = Button(0, 18, 0, 52, "Connect Dev Shell",    (0, 120, 215), (0, 160, 255))
+    install_btn   = Button(0, 18, 0, 52, "Install",              (35, 145, 85), (55, 185, 110))
     full_term_btn = Button(0, 18, 0, 52, "Toggle Full Terminal", (60, 60, 80),  (90, 90, 110))
 
-    terminal = IntegratedTerminal(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
+    terminal_height = DEFAULT_TERMINAL_HEIGHT
+    terminal = IntegratedTerminal(0, STREAM_SIZE[1] - terminal_height, STREAM_SIZE[0], terminal_height)
 
-    vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
+    vid_rect = (0, HEADER_HEIGHT, STREAM_SIZE[0], STREAM_SIZE[1] - terminal_height - HEADER_HEIGHT)
     target_size = (vid_rect[2], vid_rect[3])
     active_vid_rect = vid_rect
     active_keys = set()
     running = True
     force_resize = True
+    separator_rect = pygame.Rect(0, 0, STREAM_SIZE[0], SPLITTER_HEIGHT)
+    dragging_separator = False
 
     prompting_pin = False
     pin_buffer = ""
@@ -748,6 +897,26 @@ def run_stream(screen, clock, ip):
     reboot_sub_f    = pygame.font.SysFont("consolas", 17)
     header_font     = pygame.font.SysFont("consolas", 26, bold=True)
 
+    def layout_panels():
+        nonlocal vid_rect, target_size, separator_rect, terminal_height, active_vid_rect
+        if terminal.fullscreen_mode:
+            terminal.rect = pygame.Rect(0, HEADER_HEIGHT, STREAM_SIZE[0], STREAM_SIZE[1] - HEADER_HEIGHT)
+            vid_rect = (0, 0, 0, 0)
+            target_size = (0, 0)
+            separator_rect = pygame.Rect(0, 0, 0, 0)
+            active_vid_rect = vid_rect
+            return
+
+        available_height = max(HEADER_HEIGHT + MIN_VIDEO_HEIGHT + MIN_TERMINAL_HEIGHT + SPLITTER_HEIGHT, STREAM_SIZE[1]) - HEADER_HEIGHT
+        max_terminal_height = max(MIN_TERMINAL_HEIGHT, available_height - MIN_VIDEO_HEIGHT - SPLITTER_HEIGHT)
+        terminal_height = max(MIN_TERMINAL_HEIGHT, min(terminal_height, max_terminal_height))
+        terminal_top = STREAM_SIZE[1] - terminal_height
+        separator_rect = pygame.Rect(0, terminal_top - SPLITTER_HEIGHT, STREAM_SIZE[0], SPLITTER_HEIGHT)
+        terminal.rect = pygame.Rect(0, terminal_top, STREAM_SIZE[0], terminal_height)
+        vid_rect = (0, HEADER_HEIGHT, STREAM_SIZE[0], max(1, separator_rect.top - HEADER_HEIGHT))
+        target_size = (max(1, vid_rect[2]), max(1, vid_rect[3]))
+        active_vid_rect = vid_rect
+
     while running:
         cur_size = screen.get_size()
         if cur_size != STREAM_SIZE or force_resize:
@@ -755,17 +924,12 @@ def run_stream(screen, clock, ip):
             dim_surf = pygame.Surface(STREAM_SIZE, pygame.SRCALPHA)
             dim_surf.fill((0, 0, 0, 120))
 
-            if terminal.fullscreen_mode:
-                terminal.rect = pygame.Rect(0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 80)
-                vid_rect = (0, 0, 0, 0)
-            else:
-                vid_rect = (0, 80, STREAM_SIZE[0], STREAM_SIZE[1] - 290 - 80)
-                target_size = (max(1, vid_rect[2]), max(1, vid_rect[3]))
-                terminal.rect = pygame.Rect(0, STREAM_SIZE[1] - 290, STREAM_SIZE[0], 290)
+            layout_panels()
 
             # Right-align buttons — guaranteed no overlap
-            shell_btn.rect.x     = STREAM_SIZE[0] - shell_btn.rect.w - 12
-            full_term_btn.rect.x = shell_btn.rect.x - full_term_btn.rect.w - 10
+            full_term_btn.rect.x = STREAM_SIZE[0] - full_term_btn.rect.w - 12
+            install_btn.rect.x   = full_term_btn.rect.x - install_btn.rect.w - 10
+            shell_btn.rect.x     = install_btn.rect.x - shell_btn.rect.w - 10
 
             terminal._mark_dirty()
             force_resize = False
@@ -774,6 +938,8 @@ def run_stream(screen, clock, ip):
         if terminal.needs_pin_prompt:
             prompting_pin = True; pin_buffer = ""
             terminal.needs_pin_prompt = False
+
+        install_btn.enabled = terminal.can_install()
 
         # ── Video ────────────────────────────────────────────────────────
         if not terminal.fullscreen_mode:
@@ -801,10 +967,19 @@ def run_stream(screen, clock, ip):
                     screen.blit(frame_surf, (ox,oy))
 
         # ── Header ───────────────────────────────────────────────────────
-        pygame.draw.rect(screen, (28,28,35), (0,0,STREAM_SIZE[0],80))
+        pygame.draw.rect(screen, (28,28,35), (0,0,STREAM_SIZE[0],HEADER_HEIGHT))
         screen.blit(header_font.render(f"Xbox Devkit • {ip} • {mode} mode", True, (0,200,255)), (20,20))
         shell_btn.draw(screen)
+        install_btn.draw(screen)
         full_term_btn.draw(screen)
+
+        if not terminal.fullscreen_mode:
+            sep_color = (0, 170, 215) if dragging_separator else (55, 75, 95)
+            pygame.draw.rect(screen, sep_color, separator_rect)
+            handle = pygame.Rect(0, 0, 120, 4)
+            handle.center = separator_rect.center
+            pygame.draw.rect(screen, (190, 210, 225), handle, border_radius=3)
+
         terminal.draw(screen)
 
         # ── PIN overlay ──────────────────────────────────────────────────
@@ -852,18 +1027,16 @@ def run_stream(screen, clock, ip):
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         terminal.needs_reboot_prompt = False
-                        with terminal.lock: terminal.history.append("[-] Reboot dismissed.")
-                        terminal._mark_dirty()
+                        terminal.log("[-] Reboot dismissed.")
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         terminal.needs_reboot_prompt = False
                         terminal.retry_count = 0
                         def do_reboot(tgt):
                             try:
                                 requests.post(f"https://{tgt}:11443/ext/power?action=reboot", verify=False, timeout=3)
-                                with terminal.lock: terminal.history.append("[+] Reboot command sent! Waiting for console to restart...")
+                                terminal.log("[+] Reboot command sent! Waiting for console to restart...")
                             except Exception as ex:
-                                with terminal.lock: terminal.history.append(f"[-] Reboot failed: {ex}")
-                            terminal._mark_dirty()
+                                terminal.log(f"[-] Reboot failed: {ex}")
                         threading.Thread(target=do_reboot, args=(ip,), daemon=True).start()
                 continue
 
@@ -872,19 +1045,16 @@ def run_stream(screen, clock, ip):
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         prompting_pin = False
-                        with terminal.lock: terminal.history.append("[-] PIN entry cancelled.")
-                        terminal._mark_dirty()
+                        terminal.log("[-] PIN entry cancelled.")
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         clean_pin = pin_buffer.strip()
                         if clean_pin:
                             prompting_pin = False
-                            with terminal.lock: terminal.history.append("[*] Connecting via SSH...")
-                            terminal._mark_dirty()
+                            terminal.log("[*] Connecting via SSH...")
                             threading.Thread(target=connect_ssh, args=(ip,clean_pin,terminal,True), daemon=True).start()
                             pin_buffer = ""
                         else:
-                            with terminal.lock: terminal.history.append("[-] PIN required.")
-                            terminal._mark_dirty(); prompting_pin = False
+                            terminal.log("[-] PIN required."); prompting_pin = False
                     elif event.key == pygame.K_BACKSPACE:
                         pin_buffer = pin_buffer[:-1]
                     elif event.unicode.isalnum() and len(pin_buffer) < 12:
@@ -899,21 +1069,33 @@ def run_stream(screen, clock, ip):
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 mx,my = pygame.mouse.get_pos()
+                if event.button == 1 and not terminal.fullscreen_mode and separator_rect.collidepoint(mx, my):
+                    dragging_separator = True
+                    continue
                 terminal.focused = terminal.rect.collidepoint(mx,my)
                 if event.button == 1:
                     if shell_btn.clicked((mx,my)) and not terminal.connected:
                         saved_pin = load_pin(ip)
                         if saved_pin:
-                            with terminal.lock: terminal.history.append("[*] Found saved PIN. Authenticating in background...")
-                            terminal._mark_dirty()
+                            terminal.log("[*] Found saved PIN. Authenticating in background...")
                             threading.Thread(target=connect_ssh, args=(ip,saved_pin,terminal,False), daemon=True).start()
                         else:
                             prompting_pin = True; pin_buffer = ""
                         for k in list(active_keys): input_client.send_key(k,False)
                         active_keys.clear()
+                    elif install_btn.clicked((mx,my)):
+                        threading.Thread(target=terminal.install_package, daemon=True).start()
                     elif full_term_btn.clicked((mx,my)):
                         terminal.fullscreen_mode = not terminal.fullscreen_mode
                         force_resize = True
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                dragging_separator = False
+
+            elif event.type == pygame.MOUSEMOTION and dragging_separator:
+                terminal_height = STREAM_SIZE[1] - max(HEADER_HEIGHT + MIN_VIDEO_HEIGHT + SPLITTER_HEIGHT, min(event.pos[1], STREAM_SIZE[1] - MIN_TERMINAL_HEIGHT))
+                force_resize = True
+                continue
 
             if event.type == pygame.KEYDOWN:
                 if terminal.focused and terminal.connected:
