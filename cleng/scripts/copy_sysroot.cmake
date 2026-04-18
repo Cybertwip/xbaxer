@@ -42,16 +42,49 @@ message(STATUS "cleng target bundle: staging ${SYSROOT_SOURCE} -> ${SYSROOT_DEST
 file(REMOVE_RECURSE "${SYSROOT_DEST}")
 file(MAKE_DIRECTORY "${SYSROOT_DEST}")
 
+function(cleng_copy_resolved_tree source_root rel_path dest_root)
+  if(rel_path STREQUAL "")
+    set(_source_path "${source_root}")
+    set(_dest_path "${dest_root}")
+  else()
+    set(_source_path "${source_root}/${rel_path}")
+    set(_dest_path "${dest_root}/${rel_path}")
+  endif()
+
+  if(NOT EXISTS "${_source_path}")
+    return()
+  endif()
+
+  file(REAL_PATH "${_source_path}" _resolved_source)
+  if(IS_DIRECTORY "${_resolved_source}")
+    file(MAKE_DIRECTORY "${_dest_path}")
+    file(GLOB _children RELATIVE "${_source_path}" "${_source_path}/*")
+    foreach(_child IN LISTS _children)
+      if(rel_path STREQUAL "")
+        set(_child_rel "${_child}")
+      else()
+        set(_child_rel "${rel_path}/${_child}")
+      endif()
+      cleng_copy_resolved_tree("${source_root}" "${_child_rel}" "${dest_root}")
+    endforeach()
+    return()
+  endif()
+
+  get_filename_component(_dest_dir "${_dest_path}" DIRECTORY)
+  file(MAKE_DIRECTORY "${_dest_dir}")
+  file(COPY_FILE "${_resolved_source}" "${_dest_path}" ONLY_IF_DIFFERENT)
+endfunction()
+
 # Apple SDKs and GNU sysroots often expose public headers through symlink
-# chains (for example Tcl headers under the macOS SDK). Follow those links
-# while staging so the packaged bundle contains real files rather than broken
-# links into the original host toolchain.
+# chains (for example Tcl headers under the macOS SDK). Flatten those links
+# while staging so the packaged bundle contains concrete files only.
 if(DEFINED SYSROOT_COMPONENTS AND NOT SYSROOT_COMPONENTS STREQUAL "")
   foreach(_rel IN LISTS SYSROOT_COMPONENTS)
-    if(EXISTS "${SYSROOT_SOURCE}/${_rel}")
-      file(COPY "${SYSROOT_SOURCE}/${_rel}" DESTINATION "${SYSROOT_DEST}" FOLLOW_SYMLINK_CHAIN)
-    endif()
+    cleng_copy_resolved_tree("${SYSROOT_SOURCE}" "${_rel}" "${SYSROOT_DEST}")
   endforeach()
 else()
-  file(COPY "${SYSROOT_SOURCE}/" DESTINATION "${SYSROOT_DEST}" FOLLOW_SYMLINK_CHAIN)
+  file(GLOB _sysroot_entries RELATIVE "${SYSROOT_SOURCE}" "${SYSROOT_SOURCE}/*")
+  foreach(_rel IN LISTS _sysroot_entries)
+    cleng_copy_resolved_tree("${SYSROOT_SOURCE}" "${_rel}" "${SYSROOT_DEST}")
+  endforeach()
 endif()
