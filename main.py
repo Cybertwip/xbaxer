@@ -1009,6 +1009,27 @@ def get_xbox_coords(mx, my, active_rect):
     ry = max(0, min(my - vy, vh))
     return int((rx / vw) * 65535), int((ry / vh) * 65535)
 
+def fetch_dev_credentials(ip, timeout=5):
+    """Fetch Visual Studio dev-shell credentials from the devkit's web service.
+
+    The console exposes the auto-generated DevToolsUser password at
+    `https://<ip>:11443/ext/smb/developerfolder` as JSON of the form:
+
+        {"Path":"D:\\\\DevelopmentFiles","Username":"DevToolsUser","Password":"..."}
+
+    Returns (username, password) on success, or (None, None) on any failure.
+    Same trust model as the other 11443 endpoints: TLS verification disabled
+    because the devkit ships a self-signed certificate.
+    """
+    try:
+        res = requests.get(f"https://{ip}:11443/ext/smb/developerfolder",
+                           verify=False, timeout=timeout)
+        res.raise_for_status()
+        data = res.json()
+        return data.get("Username"), data.get("Password")
+    except Exception:
+        return None, None
+
 def connect_ssh(ip, pin, terminal, save_on_success=False):
     try:
         ssh = paramiko.SSHClient()
@@ -1318,11 +1339,22 @@ def run_stream(screen, clock, ip):
                 terminal.focused = terminal.rect.collidepoint(mx,my)
                 if event.button == 1:
                     if shell_btn.clicked((mx,my)) and not terminal.connected:
-                        # Always prompt for PIN; xbox_config is updated only when a
-                        # new PIN is successfully entered, never auto-loaded.
-                        prompting_pin = True; pin_buffer = ""
+                        # Try to grab the auto-generated DevToolsUser password
+                        # from the devkit's developerfolder endpoint. If that
+                        # works, skip the manual PIN prompt entirely; otherwise
+                        # fall back to the legacy Visual Studio PIN flow.
                         for k in list(active_keys): input_client.send_key(k,False)
                         active_keys.clear()
+                        def auto_connect(target_ip):
+                            terminal.log("[*] Fetching dev-shell credentials...")
+                            user, pwd = fetch_dev_credentials(target_ip)
+                            if pwd:
+                                terminal.log(f"[+] Got credentials for {user or 'DevToolsUser'}; connecting via SSH...")
+                                connect_ssh(target_ip, pwd, terminal, True)
+                            else:
+                                terminal.log("[-] Could not fetch credentials; falling back to manual PIN.")
+                                terminal.needs_pin_prompt = True
+                        threading.Thread(target=auto_connect, args=(ip,), daemon=True).start()
                     elif install_btn.clicked((mx,my)):
                         threading.Thread(target=terminal.install_package, daemon=True).start()
                     elif full_term_btn.clicked((mx,my)):
