@@ -202,15 +202,17 @@ endfunction()
 
 set(CLENG_RUNTIME_BUNDLE_COMMANDS)
 function(cleng_append_runtime_bundle_command source dest marker components)
-  string(REPLACE ";" "\\;" _components_escaped "${components}")
-  list(APPEND CLENG_RUNTIME_BUNDLE_COMMANDS
-    COMMAND ${CMAKE_COMMAND}
-            -DSYSROOT_SOURCE=${source}
-            -DSYSROOT_DEST=${dest}
-            -DSYSROOT_MARKER=${marker}
-            -DSYSROOT_COMPONENTS=${_components_escaped}
-            -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
-  )
+  foreach(_component IN LISTS components)
+    list(APPEND CLENG_RUNTIME_BUNDLE_COMMANDS
+      COMMAND ${CMAKE_COMMAND}
+              -DSYSROOT_SOURCE=${source}
+              -DSYSROOT_DEST=${dest}
+              -DSYSROOT_MARKER=${marker}
+              -DSYSROOT_COMPONENTS=${_component}
+              -DSYSROOT_PRESERVE_DEST=ON
+              -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
+    )
+  endforeach()
   set(CLENG_RUNTIME_BUNDLE_COMMANDS "${CLENG_RUNTIME_BUNDLE_COMMANDS}" PARENT_SCOPE)
 endfunction()
 
@@ -540,6 +542,7 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CLENG_CLANG_PREFIX}/lib/clang"
           "${XBAX_PACKAGE_DIR}/cleng/lib/clang"
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${XBAX_PACKAGE_DIR}/cleng/sysroot"
   # Bundle the linker backends that led.exe dispatches to. These are built
   # from LLVM's lld project and live next to cleng.exe in the deployed tree
   # so the wrapper can resolve them relative to itself.
