@@ -160,6 +160,8 @@ add_xbax_host_go_tool(cliant Cliant)
 set(CLENG_SOURCE_DIR "${CMAKE_SOURCE_DIR}/cleng")
 set(CLENG_OUTPUT_DIR "${XBAX_PACKAGE_DIR}/cleng/bin")
 set(CLENG_OUTPUT "${CLENG_OUTPUT_DIR}/cleng.exe")
+set(LED_SOURCE_DIR "${CMAKE_SOURCE_DIR}/led")
+set(LED_OUTPUT "${CLENG_OUTPUT_DIR}/led.exe")
 set(CLENG_CLANG_PREFIX "${CMAKE_BINARY_DIR}/engine/clang-windows-amd64"
     CACHE PATH "Prefix containing prebuilt Clang/LLVM static libs and headers for windows/amd64")
 
@@ -496,6 +498,27 @@ set(XBAX_CLENG_BUILD_ENV
 # sets, so it appears later in the list above (CMake env wins on last value).
 
 add_custom_command(
+  OUTPUT "${LED_OUTPUT}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-mod-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-path"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CLENG_OUTPUT_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E env ${XBAX_GO_BUILD_ENV}
+          "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
+          -o "${LED_OUTPUT}" .
+  DEPENDS
+    go-toolchain
+    "${LED_SOURCE_DIR}/go.mod"
+    "${LED_SOURCE_DIR}/main.go"
+  WORKING_DIRECTORY "${LED_SOURCE_DIR}"
+  COMMENT "Building led.exe (bundled linker wrapper) for windows/amd64"
+  VERBATIM
+)
+
+add_custom_target(led DEPENDS "${LED_OUTPUT}")
+set_target_properties(led PROPERTIES FOLDER "Apps")
+
+add_custom_command(
   OUTPUT "${CLENG_OUTPUT}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-cache"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/go-mod-cache"
@@ -514,6 +537,14 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CLENG_CLANG_PREFIX}/lib/clang"
           "${XBAX_PACKAGE_DIR}/cleng/lib/clang"
+  # Bundle the linker backends that led.exe dispatches to. These are built
+  # from LLVM's lld project and live next to cleng.exe in the deployed tree
+  # so the wrapper can resolve them relative to itself.
+  COMMAND ${CMAKE_COMMAND}
+          -DSYSROOT_SOURCE=${CLENG_CLANG_PREFIX}/bin
+          -DSYSROOT_DEST=${CLENG_OUTPUT_DIR}
+          -DSYSROOT_MARKER=lld.exe
+          -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
   # Bundle the target-facing headers/framework stubs/runtime archives that
   # Clang itself does not own: mingw-w64 for windows, the active Apple SDK
   # for darwin when available on Apple hosts, and GNU glibc/libstdc++
@@ -541,10 +572,10 @@ add_custom_command(
   VERBATIM
 )
 
-add_custom_target(cleng DEPENDS "${CLENG_OUTPUT}")
+add_custom_target(cleng DEPENDS "${CLENG_OUTPUT}" "${LED_OUTPUT}")
 set_target_properties(cleng PROPERTIES FOLDER "Apps")
 
-add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper gatter sarver cliant cleng)
+add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper gatter sarver cliant cleng led)
 set_target_properties(package-xbax PROPERTIES FOLDER "Apps")
 
 add_custom_target(host-tools ALL DEPENDS host-cliant)

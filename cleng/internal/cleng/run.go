@@ -15,6 +15,8 @@ import (
 	"cleng/internal/cgobridge"
 )
 
+const clengTargetTripleEnv = "CLENG_TARGET_TRIPLE"
+
 // Run invokes the Clang driver with the given argv (argv[0] is the program
 // name, as expected by Clang). It returns the driver exit code.
 //
@@ -23,6 +25,8 @@ import (
 // clang binary.
 func Run(argv []string) (int, error) {
 	argv = prepareArgv(argv)
+	restoreEnv := setBundledToolEnv(argv)
+	defer restoreEnv()
 	return cgobridge.ClangMain(argv)
 }
 
@@ -37,6 +41,7 @@ func prepareArgv(argv []string) []string {
 	}
 	argv = injectResourceDir(argv)
 	argv = injectBundledTargetRuntime(argv)
+	argv = injectBundledLinker(argv)
 	return argv
 }
 
@@ -171,6 +176,69 @@ func findBundledGNUFlags(triple string) []string {
 	return extra
 }
 
+func injectBundledLinker(argv []string) []string {
+	if hasExplicitLinkerOverride(argv) {
+		return argv
+	}
+	triple := effectiveTargetTriple(argv)
+	if triple == "" {
+		return argv
+	}
+
+	linkerPath := findBundledLinkerPath(triple)
+	if linkerPath == "" {
+		return argv
+	}
+	return insertAfterArgv0(argv, "-fuse-ld=lld", "--ld-path="+linkerPath)
+}
+
+func setBundledToolEnv(argv []string) func() {
+	triple := effectiveTargetTriple(argv)
+	if triple == "" {
+		return func() {}
+	}
+
+	prev, hadPrev := os.LookupEnv(clengTargetTripleEnv)
+	_ = os.Setenv(clengTargetTripleEnv, triple)
+	return func() {
+		if hadPrev {
+			_ = os.Setenv(clengTargetTripleEnv, prev)
+			return
+		}
+		_ = os.Unsetenv(clengTargetTripleEnv)
+	}
+}
+
+func hasExplicitLinkerOverride(argv []string) bool {
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		switch {
+		case arg == "-fuse-ld", arg == "--ld-path":
+			return true
+		case strings.HasPrefix(arg, "-fuse-ld="), strings.HasPrefix(arg, "--ld-path="):
+			return true
+		}
+	}
+	return false
+}
+
+func findBundledLinkerPath(triple string) string {
+	for _, root := range bundleRootsFunc() {
+		for _, candidate := range []string{
+			filepath.Join(root, "bin", "led.exe"),
+			filepath.Join(root, "bin", "led"),
+			filepath.Join(root, "led.exe"),
+			filepath.Join(root, "led"),
+		} {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
 func findBundledGNUIncludeDirs(root, sysroot, triple string) []string {
 	var includes []string
 	for _, cxxParent := range []string{
@@ -261,8 +329,12 @@ func tripleAliases(triple string) []string {
 	switch {
 	case strings.HasSuffix(triple, "-linux-gnu"):
 		aliases = append(aliases, strings.Replace(triple, "-linux-gnu", "-unknown-linux-gnu", 1))
+	case strings.HasSuffix(triple, "-unknown-linux-gnu"):
+		aliases = append(aliases, strings.Replace(triple, "-unknown-linux-gnu", "-linux-gnu", 1))
 	case strings.HasSuffix(triple, "-w64-mingw32"):
 		aliases = append(aliases, strings.Replace(triple, "-w64-mingw32", "-w64-windows-gnu", 1))
+	case strings.HasSuffix(triple, "-w64-windows-gnu"):
+		aliases = append(aliases, strings.Replace(triple, "-w64-windows-gnu", "-w64-mingw32", 1))
 	}
 	return aliases
 }
@@ -358,11 +430,13 @@ func findResourceDir() string {
 }
 
 func findTargetBundleDir(triple string) string {
-	for _, root := range bundleRootsFunc() {
-		candidate := filepath.Join(root, "sysroot", triple)
-		info, err := os.Stat(candidate)
-		if err == nil && info.IsDir() {
-			return candidate
+	for _, alias := range tripleAliases(triple) {
+		for _, root := range bundleRootsFunc() {
+			candidate := filepath.Join(root, "sysroot", alias)
+			info, err := os.Stat(candidate)
+			if err == nil && info.IsDir() {
+				return candidate
+			}
 		}
 	}
 	return ""

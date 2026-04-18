@@ -41,12 +41,13 @@ CROSS_STAMP="$OUTPUT_DIR/.clang-engine-installed"
 mkdir -p "$NATIVE_BUILD" "$CROSS_BUILD" "$OUTPUT_DIR"
 
 # Common LLVM cmake flags shared by both stages. We keep the build minimal:
-# only the X86 backend, no tests/benchmarks/examples, no LTO, no docs.
+# just the targets we need for xbax (x86_64 + arm64), no
+# tests/benchmarks/examples, no LTO, no docs.
 LLVM_COMMON_FLAGS=(
   -G Ninja
   -DCMAKE_BUILD_TYPE=Release
-  -DLLVM_ENABLE_PROJECTS=clang
-  -DLLVM_TARGETS_TO_BUILD=X86
+  -DLLVM_ENABLE_PROJECTS=clang\;lld
+  -DLLVM_TARGETS_TO_BUILD=X86\;AArch64
   -DLLVM_INCLUDE_TESTS=OFF
   -DLLVM_INCLUDE_BENCHMARKS=OFF
   -DLLVM_INCLUDE_EXAMPLES=OFF
@@ -93,7 +94,8 @@ fi
 
 # ---- Stage 2: cross-compile to windows/amd64 -------------------------------
 #
-# We install only the static libs + headers (no clang.exe, no llvm-* tools).
+# We install the static libs + headers that cleng links against, plus the
+# lld linker executables that led.exe dispatches to at runtime.
 # cleng provides its own driver entry point in Go and links against
 # clang_main from libclangDriver via the C++ shim in
 # cleng/internal/cgobridge/bridge.cpp.
@@ -121,7 +123,7 @@ if [[ ! -f "$CROSS_STAMP" ]]; then
   # search rule, so dropping them in the prefix means a stock cleng.exe
   # can compile any cgo TU that only uses freestanding headers without
   # needing a platform SDK on the console.
-  cmake --build "$CROSS_BUILD" --target install-clang-libraries install-llvm-libraries install-clang-headers install-llvm-headers install-clang-resource-headers
+  cmake --build "$CROSS_BUILD" --target install-clang-libraries install-llvm-libraries install-clang-headers install-llvm-headers install-clang-resource-headers install-lld
   : > "$CROSS_STAMP"
 fi
 
