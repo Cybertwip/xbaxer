@@ -168,5 +168,8 @@ package cgobridge
 #cgo windows,amd64 LDFLAGS: -lLLVMXRay
 #cgo windows,amd64 LDFLAGS: -lLLVMipo
 #cgo windows,amd64 LDFLAGS: -Wl,--end-group
+#cgo windows,amd64 LDFLAGS: -lversion -luuid -lole32 -loleaut32
+#cgo windows,amd64 LDFLAGS: -lws2_32 -lntdll -ladvapi32 -lpsapi
+#cgo windows,amd64 LDFLAGS: -lshell32 -limagehlp -lshlwapi
 */
 import "C"

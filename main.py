@@ -655,18 +655,61 @@ class IntegratedTerminal:
     def _powershell_quote(self, value):
         return value.replace("'", "''")
 
+    def _cmd_quote(self, value):
+        # cmd.exe quoting: wrap in double quotes and escape any embedded ones.
+        return '"' + value.replace('"', '\\"') + '"'
+
+    def _local_anzipper_path(self):
+        return os.path.join(LOCAL_PACKAGE_DIR, "anzipper", "bin", "anzipper.exe")
+
+    def _remote_anzipper_path(self, remote_dir):
+        # Drop anzipper.exe at the install-dir root so the same path works
+        # regardless of which subdirectory the bundle restores into.
+        return remote_dir.rstrip("/") + "/anzipper.exe"
+
+    def _ensure_remote_anzipper(self, remote_dir):
+        """Upload anzipper.exe via SFTP if it isn't already present remotely.
+
+        The Xbox dev image ships without PowerShell, so we use our own Go
+        unzipper as the canonical extraction tool. anzipper.exe is part of
+        the package we're installing, but we need it *before* the bundle is
+        expanded — hence this bootstrap step.
+        """
+        local_anzipper = self._local_anzipper_path()
+        if not os.path.isfile(local_anzipper):
+            raise RuntimeError(
+                f"anzipper.exe not found at {local_anzipper}; "
+                "run `cmake --build build --target anzipper` first"
+            )
+        remote_anzipper = self._remote_anzipper_path(remote_dir)
+        sftp = self.ssh_client.open_sftp()
+        try:
+            self._remote_mkdirs(sftp, remote_dir)
+            local_size = os.path.getsize(local_anzipper)
+            try:
+                remote_stat = sftp.stat(remote_anzipper)
+            except IOError:
+                remote_stat = None
+            if remote_stat is None or remote_stat.st_size != local_size:
+                self.log("[*] Bootstrapping anzipper.exe on the remote machine...")
+                sftp.put(local_anzipper, remote_anzipper)
+        finally:
+            sftp.close()
+        return remote_anzipper
+
     def _extract_remote_bundle(self, remote_dir):
         remote_bundle_path = self._remote_bundle_path(remote_dir).replace("/", "\\")
         remote_dir_windows = remote_dir.replace("/", "\\")
-        ps_script = (
-            "$ErrorActionPreference = 'Stop'; "
-            f"Expand-Archive -LiteralPath '{self._powershell_quote(remote_bundle_path)}' "
-            f"-DestinationPath '{self._powershell_quote(remote_dir_windows)}' -Force; "
-            f"Remove-Item -LiteralPath '{self._powershell_quote(remote_bundle_path)}' -Force"
-        )
+        remote_anzipper = self._ensure_remote_anzipper(remote_dir).replace("/", "\\")
+
+        # anzipper handles directory creation, zip-slip protection, and
+        # symlink/irregular-entry rejection. Two commands chained with `&&`
+        # so we only delete the bundle on a successful extract.
         command = (
-            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass '
-            f'-Command "{ps_script}"'
+            f"{self._cmd_quote(remote_anzipper)} "
+            f"-zip {self._cmd_quote(remote_bundle_path)} "
+            f"-out {self._cmd_quote(remote_dir_windows)} "
+            f"&& del /Q {self._cmd_quote(remote_bundle_path)}"
         )
         exit_status, output, error = self._run_remote_command(command)
         if exit_status != 0:
