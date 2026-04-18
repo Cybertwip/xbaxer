@@ -211,6 +211,18 @@ class IntegratedTerminal:
                 self.history = self.history[-1800:]
         self._mark_dirty()
 
+    def _send_shell_bytes(self, payload, description=None):
+        if not self.connected or not self.sock:
+            return False
+        try:
+            self.sock.sendall(payload)
+            if description:
+                self.log(description)
+            return True
+        except Exception as exc:
+            self.log(f"[-] Failed to send shell input: {exc}")
+            return False
+
     def has_active_ssh(self):
         transport = self.ssh_client.get_transport() if self.ssh_client else None
         return bool(transport and transport.is_active())
@@ -325,6 +337,12 @@ class IntegratedTerminal:
     def handle_key(self, event):
         if not self.connected or event.type != pygame.KEYDOWN: return False
         self.scroll_offset = 0
+        ctrl_pressed = bool(event.mod & pygame.KMOD_CTRL)
+
+        if ctrl_pressed and event.key == pygame.K_c:
+            self.input_buffer = ""
+            self._mark_dirty()
+            return self._send_shell_bytes(b"\x03", "[*] Sent Ctrl+C interrupt to remote shell.")
 
         if event.key == pygame.K_TAB:
             self.raw_input_mode = not self.raw_input_mode
@@ -332,9 +350,12 @@ class IntegratedTerminal:
 
         if self.raw_input_mode:
             try:
-                if event.key == pygame.K_RETURN:   self.sock.sendall(b"\r\n")
-                elif event.key == pygame.K_BACKSPACE: self.sock.sendall(b"\x08")
-                elif event.unicode: self.sock.sendall(event.unicode.encode('utf-8'))
+                if event.key == pygame.K_RETURN:
+                    self.sock.sendall(b"\r\n")
+                elif event.key == pygame.K_BACKSPACE:
+                    self.sock.sendall(b"\x08")
+                elif event.unicode:
+                    self.sock.sendall(event.unicode.encode('utf-8'))
             except: pass
             return True
 
