@@ -1,30 +1,29 @@
-// bridge_link.go centralises the cgo linker flags for the prebuilt
-// LLVM/Clang static libraries. Keeping them in their own file (rather than
-// in bridge.go) makes it easy for the CMake build to regenerate or override
-// this file when the Clang prefix moves.
+// bridge_link.go — hand-curated cgo flags for the cleng bridge.
 //
-// The default flags assume the layout produced by the `clang-windows-amd64`
-// CMake target:
+// The full list of -L/-l flags for the prebuilt LLVM/Clang archives lives
+// in bridge_link_generated.go, which CMake regenerates after the
+// clang-engine target finishes (see cleng/scripts/gen_bridge_link.cmake).
+// Keep this file limited to flags that don't depend on the on-disk lib
+// inventory: include paths, language standard, and system libraries the
+// driver pulls in via WIN32 calls.
 //
-//	${CMAKE_BINARY_DIR}/engine/clang-windows-amd64/
-//	    include/
-//	    lib/libclang*.a, libLLVM*.a
-//
-// Override at build time with:
-//
-//	CGO_LDFLAGS="-L/path/to/clang/lib -lclangDriver ..." \
-//	CGO_CXXFLAGS="-I/path/to/clang/include" \
-//	go build ./...
+// LLVM is built with -fno-rtti -fno-exceptions, so anything we compile
+// against its headers (driver.cpp, cc1*_main.cpp, bridge.cpp) must match
+// or the vtable layouts won't line up at link time.
 
 package cgobridge
 
 /*
-#cgo windows,amd64 LDFLAGS: -L${SRCDIR}/../../../build/engine/clang-windows-amd64/lib
-#cgo windows,amd64 LDFLAGS: -lclangDriver -lclangFrontend -lclangFrontendTool
-#cgo windows,amd64 LDFLAGS: -lclangCodeGen -lclangSerialization -lclangSema
-#cgo windows,amd64 LDFLAGS: -lclangAnalysis -lclangEdit -lclangAST -lclangASTMatchers
-#cgo windows,amd64 LDFLAGS: -lclangParse -lclangLex -lclangBasic
-#cgo windows,amd64 LDFLAGS: -lLLVMOption -lLLVMSupport -lLLVMDemangle
-#cgo windows,amd64 LDFLAGS: -lstdc++ -lpthread
+#cgo windows,amd64 CXXFLAGS: -std=c++17 -fno-rtti -fno-exceptions -DNDEBUG
+#cgo windows,amd64 CXXFLAGS: -Wno-deprecated-declarations -Wno-unused-parameter
+#cgo windows,amd64 CXXFLAGS: -Wno-attributes -Wno-class-memaccess
+#cgo windows,amd64 CXXFLAGS: -Wno-comment -Wno-unused-function
+
+// Win32 system libraries that Clang's driver, libSupport, and libDebugInfo
+// link against (registry, COM, version info, sockets, debug help, etc.).
+#cgo windows,amd64 LDFLAGS: -lversion -luuid -lole32 -loleaut32
+#cgo windows,amd64 LDFLAGS: -lws2_32 -lntdll -ladvapi32 -lpsapi
+#cgo windows,amd64 LDFLAGS: -lshell32 -limagehlp -lshlwapi -lmsvcrt
+#cgo windows,amd64 LDFLAGS: -static -lstdc++ -lpthread
 */
 import "C"

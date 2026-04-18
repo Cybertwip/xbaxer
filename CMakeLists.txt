@@ -221,14 +221,33 @@ add_custom_command(
 add_custom_target(clang-engine DEPENDS "${CLANG_ENGINE_STAMP}")
 set_target_properties(clang-engine PROPERTIES FOLDER "Toolchain")
 
+# Generate bridge_link_generated.go listing every libclang*.a / libLLVM*.a in
+# the cleng prefix. The Go tooling parses #cgo LDFLAGS at compile time, so the
+# generated file must be on disk before the cleng go-build step runs. We
+# regenerate on every build (cheap — a single CMake glob) so newly installed
+# archives are picked up without a manual reconfigure.
+set(CLENG_LINK_GENERATED "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge_link_generated.go")
+add_custom_command(
+  OUTPUT "${CLENG_LINK_GENERATED}"
+  COMMAND ${CMAKE_COMMAND}
+          -DCLENG_PREFIX=${CLENG_CLANG_PREFIX}
+          -DOUT_FILE=${CLENG_LINK_GENERATED}
+          -P "${CLENG_SOURCE_DIR}/scripts/gen_bridge_link.cmake"
+  DEPENDS
+    "${CLANG_ENGINE_STAMP}"
+    "${CLENG_SOURCE_DIR}/scripts/gen_bridge_link.cmake"
+  COMMENT "Generating cleng cgo link list from ${CLENG_CLANG_PREFIX}/lib"
+  VERBATIM
+)
+
 set(XBAX_CLENG_BUILD_ENV
   ${XBAX_GO_BUILD_ENV}
   "CGO_ENABLED=1"
   "CC=${MINGW_CC}"
   "CXX=${MINGW_CXX}"
-  "CGO_CXXFLAGS=-I${CLENG_CLANG_PREFIX}/include -std=c++17"
-  "CGO_LDFLAGS=-L${CLENG_CLANG_PREFIX}/lib"
 )
+# CXXFLAGS / LDFLAGS for the LLVM prefix come from bridge_link_generated.go;
+# anything extra goes through the #cgo directives in bridge_link.go.
 # CGO_ENABLED=1 must override the CGO_ENABLED=0 that XBAX_GO_BUILD_ENV
 # sets, so it appears later in the list above (CMake env wins on last value).
 
@@ -245,12 +264,17 @@ add_custom_command(
     go-toolchain
     clang-engine
     "${CLANG_ENGINE_STAMP}"
+    "${CLENG_LINK_GENERATED}"
     "${CLENG_SOURCE_DIR}/go.mod"
     "${CLENG_SOURCE_DIR}/main.go"
     "${CLENG_SOURCE_DIR}/internal/cleng/run.go"
     "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge.go"
     "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge.cpp"
     "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge_link.go"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_driver_inc.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1_main_inc.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1as_main_inc.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1gen_reproducer_main_inc.cpp"
   WORKING_DIRECTORY "${CLENG_SOURCE_DIR}"
   COMMENT "Building cleng.exe (Go-fronted Clang driver) for windows/amd64"
   VERBATIM
