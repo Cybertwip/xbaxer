@@ -17,6 +17,8 @@ import io
 import re
 import json
 import subprocess
+import tempfile
+import zipfile
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -37,6 +39,8 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(REPO_ROOT, "build")
 LOCAL_PACKAGE_DIR = os.path.join(BUILD_DIR, "package", "Xbax")
 REMOTE_INSTALL_DIR = "D:/DevelopmentFiles/Xbax"
+REMOTE_INSTALL_MANIFEST = ".xbax-install-manifest.json"
+REMOTE_INSTALL_BUNDLE = ".xbax-install-bundle.zip"
 
 # ================== PIN STORAGE ==================
 def load_pin(ip):
@@ -223,6 +227,37 @@ class IntegratedTerminal:
             self.log(f"[-] Failed to send shell input: {exc}")
             return False
 
+    def _send_shell_interrupt(self):
+        if not self.connected or not self.sock:
+            return False
+
+        sent_parts = []
+
+        for payload, label in (
+            (b"\xff\xf4", "telnet IP"),
+            (b"\xff\xf2", "telnet DM"),
+            (b"\x03", "Ctrl+C"),
+        ):
+            try:
+                self.sock.sendall(payload)
+                sent_parts.append(label)
+            except Exception:
+                pass
+
+        try:
+            if hasattr(socket, "MSG_OOB"):
+                self.sock.send(b"\xf2", socket.MSG_OOB)
+                sent_parts.append("urgent DM")
+        except Exception:
+            pass
+
+        if sent_parts:
+            self.log(f"[*] Sent interrupt to remote shell ({', '.join(sent_parts)}).")
+            return True
+
+        self.log("[-] Failed to send Ctrl+C interrupt to remote shell.")
+        return False
+
     def has_active_ssh(self):
         transport = self.ssh_client.get_transport() if self.ssh_client else None
         return bool(transport and transport.is_active())
@@ -342,7 +377,7 @@ class IntegratedTerminal:
         if ctrl_pressed and event.key == pygame.K_c:
             self.input_buffer = ""
             self._mark_dirty()
-            return self._send_shell_bytes(b"\x03", "[*] Sent Ctrl+C interrupt to remote shell.")
+            return self._send_shell_interrupt()
 
         if event.key == pygame.K_TAB:
             self.raw_input_mode = not self.raw_input_mode
@@ -507,46 +542,194 @@ class IntegratedTerminal:
         except IOError:
             return None
 
-    def _remote_file_is_current(self, sftp, local_path, remote_path):
-        remote_stat = self._remote_path_exists(sftp, remote_path)
-        if remote_stat is None:
-            return False
+    def _remote_manifest_path(self, remote_dir):
+        return remote_dir.rstrip("/") + "/" + REMOTE_INSTALL_MANIFEST
 
-        local_stat = os.stat(local_path)
-        if remote_stat.st_size != local_stat.st_size:
-            return False
+    def _remote_bundle_path(self, remote_dir):
+        return remote_dir.rstrip("/") + "/" + REMOTE_INSTALL_BUNDLE
 
-        local_mtime = int(local_stat.st_mtime)
-        remote_mtime = int(getattr(remote_stat, "st_mtime", 0))
-        return remote_mtime >= local_mtime
-
-    def _upload_tree(self, local_dir, remote_dir):
+    def _collect_local_package_files(self, local_dir):
         files = []
+        manifest = {}
         for root, _, filenames in os.walk(local_dir):
+            filenames.sort()
             for filename in filenames:
                 local_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(local_path, local_dir)
-                remote_path = remote_dir.rstrip("/") + "/" + rel_path.replace(os.sep, "/")
-                files.append((local_path, remote_path))
+                rel_path = os.path.relpath(local_path, local_dir).replace(os.sep, "/")
+                local_stat = os.stat(local_path)
+                files.append((local_path, rel_path))
+                manifest[rel_path] = {
+                    "size": local_stat.st_size,
+                    "mtime": int(local_stat.st_mtime),
+                }
+        return files, manifest
 
-        self.log(f"[*] Syncing {len(files)} packaged file(s) to {remote_dir}...")
-        sftp = self.ssh_client.open_sftp()
+    def _read_remote_manifest(self, sftp, remote_dir):
+        remote_manifest_path = self._remote_manifest_path(remote_dir)
+        try:
+            with sftp.file(remote_manifest_path, "rb") as remote_file:
+                payload = remote_file.read()
+        except IOError:
+            return {}
+        except Exception as exc:
+            self.log(f"[*] Ignoring unreadable remote install manifest: {exc}")
+            return {}
+
+        try:
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8")
+            manifest = json.loads(payload)
+        except Exception as exc:
+            self.log(f"[*] Ignoring invalid remote install manifest: {exc}")
+            return {}
+
+        return manifest if isinstance(manifest, dict) else {}
+
+    def _write_remote_manifest(self, sftp, remote_dir, manifest):
+        remote_manifest_path = self._remote_manifest_path(remote_dir)
+        with sftp.file(remote_manifest_path, "wb") as remote_file:
+            remote_file.write(json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+    def _should_upload_manifest_entry(self, local_entry, remote_entry):
+        if not isinstance(remote_entry, dict):
+            return True
+
+        local_mtime = int(local_entry.get("mtime", 0))
+        remote_mtime = int(remote_entry.get("mtime", 0))
+        if local_mtime > remote_mtime:
+            return True
+        if local_mtime < remote_mtime:
+            return False
+
+        return int(local_entry.get("size", -1)) != int(remote_entry.get("size", -1))
+
+    def _create_install_bundle(self, changed_files, manifest):
+        fd, bundle_path = tempfile.mkstemp(prefix="xbax-install-", suffix=".zip")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for local_path, rel_path in changed_files:
+                    archive.write(local_path, arcname=rel_path)
+                archive.writestr(
+                    REMOTE_INSTALL_MANIFEST,
+                    json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+                )
+            return bundle_path
+        except Exception:
+            try:
+                os.remove(bundle_path)
+            except OSError:
+                pass
+            raise
+
+    def _format_size(self, size_bytes):
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        if size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KiB"
+        return f"{size_bytes / (1024 * 1024):.1f} MiB"
+
+    def _run_remote_command(self, command):
+        stdin, stdout, stderr = self.ssh_client.exec_command(command)
+        output = stdout.read().decode("utf-8", errors="ignore")
+        error = stderr.read().decode("utf-8", errors="ignore")
+        exit_status = stdout.channel.recv_exit_status()
+        return exit_status, output, error
+
+    def _powershell_quote(self, value):
+        return value.replace("'", "''")
+
+    def _extract_remote_bundle(self, remote_dir):
+        remote_bundle_path = self._remote_bundle_path(remote_dir).replace("/", "\\")
+        remote_dir_windows = remote_dir.replace("/", "\\")
+        ps_script = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"Expand-Archive -LiteralPath '{self._powershell_quote(remote_bundle_path)}' "
+            f"-DestinationPath '{self._powershell_quote(remote_dir_windows)}' -Force; "
+            f"Remove-Item -LiteralPath '{self._powershell_quote(remote_bundle_path)}' -Force"
+        )
+        command = (
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass '
+            f'-Command "{ps_script}"'
+        )
+        exit_status, output, error = self._run_remote_command(command)
+        if exit_status != 0:
+            raise RuntimeError((error or output or "unknown extraction error").strip())
+        if output.strip():
+            self.log(f"[*] {output.strip()}")
+
+    def _upload_files_individually(self, remote_dir, changed_files, manifest, skipped):
         uploaded = 0
-        skipped = 0
+        sftp = self.ssh_client.open_sftp()
         try:
             self._remote_mkdirs(sftp, remote_dir)
-            for index, (local_path, remote_path) in enumerate(files, start=1):
+            for index, (local_path, rel_path) in enumerate(changed_files, start=1):
+                remote_path = remote_dir.rstrip("/") + "/" + rel_path
                 self._remote_mkdirs(sftp, os.path.dirname(remote_path))
-                if self._remote_file_is_current(sftp, local_path, remote_path):
-                    skipped += 1
-                else:
-                    sftp.put(local_path, remote_path)
-                    uploaded += 1
-                if index == len(files) or index % 25 == 0:
-                    self.log(f"[*] Processed {index}/{len(files)} files ({uploaded} uploaded, {skipped} skipped)...")
+                sftp.put(local_path, remote_path)
+                uploaded += 1
+                if index == len(changed_files) or index % 25 == 0:
+                    self.log(f"[*] Uploaded {index}/{len(changed_files)} changed file(s) ({skipped} already current)...")
+            self._write_remote_manifest(sftp, remote_dir, manifest)
         finally:
             sftp.close()
         return uploaded, skipped
+
+    def _upload_tree(self, local_dir, remote_dir):
+        files, local_manifest = self._collect_local_package_files(local_dir)
+        self.log(f"[*] Scanning {len(files)} packaged file(s) for install sync...")
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            self._remote_mkdirs(sftp, remote_dir)
+            remote_manifest = self._read_remote_manifest(sftp, remote_dir)
+        finally:
+            sftp.close()
+
+        changed_files = []
+        next_manifest = dict(remote_manifest) if isinstance(remote_manifest, dict) else {}
+        for local_path, rel_path in files:
+            local_entry = local_manifest[rel_path]
+            remote_entry = remote_manifest.get(rel_path)
+            if self._should_upload_manifest_entry(local_entry, remote_entry):
+                changed_files.append((local_path, rel_path))
+                next_manifest[rel_path] = local_entry
+            elif isinstance(remote_entry, dict):
+                next_manifest[rel_path] = remote_entry
+            else:
+                next_manifest[rel_path] = local_entry
+        skipped = len(files) - len(changed_files)
+
+        if not changed_files:
+            self.log(f"[+] Remote install already current. Skipped all {skipped} packaged file(s).")
+            return 0, skipped
+
+        bundle_path = self._create_install_bundle(changed_files, next_manifest)
+        bundle_size = os.path.getsize(bundle_path)
+        remote_bundle_path = self._remote_bundle_path(remote_dir)
+        try:
+            self.log(
+                f"[*] Uploading {len(changed_files)} changed file(s) as one compressed bundle "
+                f"({self._format_size(bundle_size)}); {skipped} already current..."
+            )
+            sftp = self.ssh_client.open_sftp()
+            try:
+                self._remote_mkdirs(sftp, remote_dir)
+                sftp.put(bundle_path, remote_bundle_path)
+            finally:
+                sftp.close()
+
+            self.log("[*] Expanding install bundle on the remote machine...")
+            self._extract_remote_bundle(remote_dir)
+            return len(changed_files), skipped
+        except Exception as exc:
+            self.log(f"[*] Bundle install fallback activated: {exc}")
+            return self._upload_files_individually(remote_dir, changed_files, next_manifest, skipped)
+        finally:
+            try:
+                os.remove(bundle_path)
+            except OSError:
+                pass
 
     def _open_remote_install_dir(self):
         if not self.connected or not self.sock:
