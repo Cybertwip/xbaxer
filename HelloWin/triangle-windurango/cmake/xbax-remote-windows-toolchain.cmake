@@ -12,6 +12,12 @@ set(CMAKE_C_COMPILER_WORKS TRUE CACHE BOOL "" FORCE)
 set(CMAKE_CXX_COMPILER_WORKS TRUE CACHE BOOL "" FORCE)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
+if(DEFINED ENV{XBAX_WINDOWS_SYSROOT} AND NOT "$ENV{XBAX_WINDOWS_SYSROOT}" STREQUAL "")
+  file(TO_CMAKE_PATH "$ENV{XBAX_WINDOWS_SYSROOT}" XBAX_WINDOWS_SYSROOT)
+  set(CMAKE_SYSROOT "${XBAX_WINDOWS_SYSROOT}" CACHE PATH "" FORCE)
+  list(PREPEND CMAKE_FIND_ROOT_PATH "${XBAX_WINDOWS_SYSROOT}")
+endif()
+
 # Keep the locally generated Ninja graph simple. The real compile/link work is
 # replayed remotely through cliant -> sarver -> cleng, so configure only needs
 # to describe the graph and target triple.

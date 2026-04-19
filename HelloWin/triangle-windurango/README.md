@@ -12,6 +12,8 @@ against WinDurango-shaped DLL names instead of the usual GameCore libraries.
 Local configure + build:
 
 ```sh
+export XBAX_WINDOWS_SYSROOT=/path/to/your/windows-cross-sysroot
+
 cmake -S HelloWin/triangle-windurango \
   -B HelloWin/triangle-windurango/build-local \
   -G Ninja \
@@ -20,6 +22,11 @@ cmake -S HelloWin/triangle-windurango \
 
 cmake --build HelloWin/triangle-windurango/build-local --target TriangleWinDurango
 ```
+
+`XBAX_WINDOWS_SYSROOT` should point at a MinGW or Windows SDK style sysroot that
+contains the Windows headers and import libraries for `x86_64-w64-mingw32`.
+Without that sysroot, local configure still works, but the actual compile will
+stop at `windows.h` lookup.
 
 That produces:
 
