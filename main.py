@@ -59,7 +59,7 @@ REMOTE_BOOTSTRAP_DIRNAME = ".xbax-bootstrap"
 BS_RELAY_LISTEN = "0.0.0.0:17777"
 BS_RELAY_PORT = 17777
 REMOTE_SARVER_DIR = REMOTE_INSTALL_DIR + "/sarver"
-APPX_UTIL_SOURCE_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "appx-util-main")
+APPX_UTIL_SOURCE_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "appx-util")
 APPX_UTIL_BUILD_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "build")
 APPX_UTIL_BINARY = os.path.join(APPX_UTIL_BUILD_DIR, "appx.exe" if os.name == "nt" else "appx")
 DEVICE_PORTAL_PACKAGE_APIS = [
