@@ -19,7 +19,17 @@ import re
 import json
 import subprocess
 import tempfile
+import shutil
 import zipfile
+from datetime import datetime
+import xml.etree.ElementTree as ET
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception:
+    tk = None
+    filedialog = None
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -49,6 +59,52 @@ REMOTE_BOOTSTRAP_DIRNAME = ".xbax-bootstrap"
 BS_RELAY_LISTEN = "0.0.0.0:17777"
 BS_RELAY_PORT = 17777
 REMOTE_SARVER_DIR = REMOTE_INSTALL_DIR + "/sarver"
+APPX_UTIL_SOURCE_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "appx-util-main")
+APPX_UTIL_BUILD_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "build")
+APPX_UTIL_BINARY = os.path.join(APPX_UTIL_BUILD_DIR, "appx.exe" if os.name == "nt" else "appx")
+DEVICE_PORTAL_PACKAGE_APIS = [
+    "/api/app/packagemanager/package",
+    "/api/appx/packagemanager/package",
+]
+DEVICE_PORTAL_PACKAGE_STATE_APIS = [
+    "/api/app/packagemanager/state",
+    "/api/appx/packagemanager/state",
+]
+
+APPX_MANIFEST_NS = {
+    "pkg": "http://schemas.microsoft.com/appx/manifest/foundation/windows10",
+    "uap": "http://schemas.microsoft.com/appx/manifest/uap/windows10",
+}
+
+APPX_DEFAULT_ASSETS = {
+    "Assets/StoreLogo.png": (50, 50),
+    "Assets/Square44x44Logo.png": (44, 44),
+    "Assets/Square150x150Logo.png": (150, 150),
+    "Assets/Square310x310Logo.png": (310, 310),
+    "Assets/Wide310x150Logo.png": (310, 150),
+    "Assets/SplashScreen.png": (620, 300),
+}
+
+
+def choose_directory_dialog(title, initial_dir=None, must_exist=True):
+    if tk is None or filedialog is None:
+        raise RuntimeError("tkinter is unavailable, so folder picking is not available in this environment")
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    root.update_idletasks()
+    selected = filedialog.askdirectory(
+        title=title,
+        initialdir=initial_dir or REPO_ROOT,
+        mustexist=must_exist,
+        parent=root,
+    )
+    root.destroy()
+    return selected or None
 
 # ================== PIN STORAGE ==================
 def load_pin(ip):
@@ -209,6 +265,7 @@ class IntegratedTerminal:
         self.ip = None
         self.pin = None
         self.installing = False
+        self.package_busy = False
         self.bs_running = False
         self.bs_busy = False
         self.bs_stop_requested = False
@@ -437,8 +494,17 @@ class IntegratedTerminal:
         transport = self.ssh_client.get_transport() if self.ssh_client else None
         return bool(transport and transport.is_active())
 
+    def is_package_busy(self):
+        return self.package_busy
+
+    def can_package_appx(self):
+        return not self.installing and not self.package_busy
+
+    def can_deploy_appx(self):
+        return not self.installing and not self.package_busy
+
     def can_install(self):
-        return self.connected and self.has_active_ssh() and not self.installing
+        return self.connected and self.has_active_ssh() and not self.installing and not self.package_busy
 
     def is_bs_running(self):
         with self.bs_lock:
@@ -450,7 +516,7 @@ class IntegratedTerminal:
                 return False
             if self.bs_running:
                 return True
-        return self.connected and self.has_active_ssh() and not self.installing
+        return self.connected and self.has_active_ssh() and not self.installing and not self.package_busy
 
     def _local_cliant_path(self):
         candidates = [
@@ -931,6 +997,418 @@ class IntegratedTerminal:
         return_code = process.wait()
         if return_code != 0:
             raise RuntimeError(f"command failed with exit code {return_code}: {' '.join(cmd)}")
+
+    def _sanitize_package_token(self, value, fallback="HelloWin"):
+        token = re.sub(r"[^A-Za-z0-9]+", "", value or "")
+        if not token:
+            token = fallback
+        if not token[0].isalpha():
+            token = fallback + token
+        return token[:40]
+
+    def _default_appx_name(self, source_dir):
+        base_name = os.path.basename(os.path.abspath(source_dir)) or "hellowin"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", base_name).strip("._-") or "hellowin"
+        return safe_name + ".appx"
+
+    def _default_appx_version(self):
+        now = datetime.now()
+        minute_of_day = (now.hour * 60) + now.minute
+        return f"{now.year}.{now.month}.{now.day}.{minute_of_day}"
+
+    def _find_entry_executable(self, root_dir, preferred_token=None):
+        candidates = []
+        folder_token = self._sanitize_package_token(preferred_token or os.path.basename(root_dir), fallback="App").lower()
+        for walk_root, _, filenames in os.walk(root_dir):
+            filenames.sort()
+            for filename in filenames:
+                if not filename.lower().endswith(".exe"):
+                    continue
+                rel_path = os.path.relpath(os.path.join(walk_root, filename), root_dir).replace(os.sep, "/")
+                exe_token = self._sanitize_package_token(os.path.splitext(filename)[0], fallback="App").lower()
+                candidates.append((rel_path, exe_token))
+
+        if not candidates:
+            raise RuntimeError(f"no .exe was found under {root_dir}")
+
+        candidates.sort(
+            key=lambda item: (
+                item[0].count("/"),
+                0 if item[1] == folder_token else 1,
+                len(item[0]),
+                item[0].lower(),
+            )
+        )
+        return candidates[0][0]
+
+    def _guess_asset_size(self, rel_path):
+        normalized = rel_path.replace("\\", "/")
+        if normalized in APPX_DEFAULT_ASSETS:
+            return APPX_DEFAULT_ASSETS[normalized]
+
+        lower_name = os.path.basename(normalized).lower()
+        if "44x44" in lower_name:
+            return (44, 44)
+        if "150x150" in lower_name:
+            return (150, 150)
+        if "310x310" in lower_name:
+            return (310, 310)
+        if "310x150" in lower_name or "wide" in lower_name:
+            return (310, 150)
+        if "splash" in lower_name:
+            return (620, 300)
+        return (64, 64)
+
+    def _create_placeholder_asset(self, path, size):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        surface = pygame.Surface(size)
+        surface.fill((14, 18, 28))
+        pygame.draw.rect(surface, (0, 180, 120), surface.get_rect(), width=max(2, min(size) // 18))
+        pygame.draw.line(surface, (0, 120, 215), (0, 0), (size[0] - 1, size[1] - 1), max(2, min(size) // 22))
+        pygame.draw.line(surface, (0, 120, 215), (size[0] - 1, 0), (0, size[1] - 1), max(2, min(size) // 22))
+        pygame.image.save(surface, path)
+
+    def _normalize_manifest_text(self, manifest_text, exe_rel_path):
+        exe_name = os.path.splitext(os.path.basename(exe_rel_path))[0]
+        return manifest_text.lstrip("\ufeff").replace("$targetnametoken$", exe_name)
+
+    def _generated_manifest_text(self, exe_rel_path, package_name, display_name):
+        executable = exe_rel_path.replace("/", "\\")
+        display = (
+            display_name.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+        version = self._default_appx_version()
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<Package IgnorableNamespaces="uap uap10 rescap"
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+  <Identity Name="{package_name}" Publisher="CN=Xbax" Version="{version}" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>{display}</DisplayName>
+    <PublisherDisplayName>Xbax</PublisherDisplayName>
+    <Logo>Assets\\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="x-generate" />
+  </Resources>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+  <Applications>
+    <Application Id="App" Executable="{executable}" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements DisplayName="{display}" Description="{display}" BackgroundColor="transparent"
+        Square150x150Logo="Assets\\Square150x150Logo.png" Square44x44Logo="Assets\\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\\Wide310x150Logo.png" Square310x310Logo="Assets\\Square310x310Logo.png" />
+        <uap:SplashScreen Image="Assets\\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+</Package>
+"""
+
+    def _manifest_asset_paths(self, manifest_path):
+        asset_paths = set(APPX_DEFAULT_ASSETS.keys())
+        try:
+            tree = ET.parse(manifest_path)
+        except ET.ParseError:
+            return asset_paths
+
+        root = tree.getroot()
+        properties_logo = root.find("pkg:Properties/pkg:Logo", APPX_MANIFEST_NS)
+        if properties_logo is not None and properties_logo.text:
+            asset_paths.add(properties_logo.text.strip().replace("\\", "/"))
+
+        visual = root.find(".//uap:VisualElements", APPX_MANIFEST_NS)
+        if visual is not None:
+            for attr_name in ("Square150x150Logo", "Square44x44Logo", "Wide310x150Logo", "Square310x310Logo"):
+                attr_value = visual.attrib.get(attr_name)
+                if attr_value:
+                    asset_paths.add(attr_value.strip().replace("\\", "/"))
+            splash = visual.find("uap:SplashScreen", APPX_MANIFEST_NS)
+            if splash is not None:
+                image = splash.attrib.get("Image")
+                if image:
+                    asset_paths.add(image.strip().replace("\\", "/"))
+
+        return asset_paths
+
+    def _ensure_manifest_assets(self, stage_dir, manifest_path):
+        for rel_path in sorted(self._manifest_asset_paths(manifest_path)):
+            normalized = rel_path.replace("\\", "/").lstrip("/")
+            if not normalized:
+                continue
+            asset_path = os.path.join(stage_dir, *normalized.split("/"))
+            if os.path.exists(asset_path):
+                continue
+            self._create_placeholder_asset(asset_path, self._guess_asset_size(normalized))
+
+    def _prepare_appx_staging(self, source_dir):
+        source_dir = os.path.abspath(source_dir)
+        if not os.path.isdir(source_dir):
+            raise RuntimeError(f"package source directory not found: {source_dir}")
+
+        stage_dir = tempfile.mkdtemp(prefix="xbax-appx-stage-")
+        shutil.copytree(source_dir, stage_dir, dirs_exist_ok=True)
+
+        exe_rel_path = self._find_entry_executable(stage_dir, preferred_token=os.path.basename(source_dir))
+        manifest_candidates = [
+            os.path.join(stage_dir, "AppxManifest.xml"),
+            os.path.join(stage_dir, "Package.appxmanifest"),
+        ]
+        manifest_target = os.path.join(stage_dir, "AppxManifest.xml")
+
+        manifest_source = next((path for path in manifest_candidates if os.path.isfile(path)), None)
+        if manifest_source:
+            with open(manifest_source, "r", encoding="utf-8-sig") as manifest_file:
+                manifest_text = self._normalize_manifest_text(manifest_file.read(), exe_rel_path)
+        else:
+            folder_name = os.path.basename(source_dir.rstrip(os.sep)) or "HelloWin"
+            display_name = folder_name.replace("_", " ").replace("-", " ").strip() or "HelloWin"
+            package_name = "Xbax." + self._sanitize_package_token(folder_name)
+            manifest_text = self._generated_manifest_text(exe_rel_path, package_name, display_name)
+
+        with open(manifest_target, "w", encoding="utf-8") as manifest_file:
+            manifest_file.write(manifest_text)
+
+        self._ensure_manifest_assets(stage_dir, manifest_target)
+        return stage_dir
+
+    def _ensure_appx_tool(self):
+        if os.path.isfile(APPX_UTIL_BINARY):
+            return APPX_UTIL_BINARY
+        if not os.path.isdir(APPX_UTIL_SOURCE_DIR):
+            raise RuntimeError(
+                f"appx-util source was not found at {APPX_UTIL_SOURCE_DIR}; "
+                f"download https://github.com/OSInside/appx-util and extract it under third_party/appx-util"
+            )
+
+        self.log("[*] Configuring local appx-util...")
+        self._run_local_command(["cmake", "-S", APPX_UTIL_SOURCE_DIR, "-B", APPX_UTIL_BUILD_DIR], REPO_ROOT)
+        self.log("[*] Building local appx-util...")
+        self._run_local_command(["cmake", "--build", APPX_UTIL_BUILD_DIR, "-j4"], REPO_ROOT)
+
+        if not os.path.isfile(APPX_UTIL_BINARY):
+            raise RuntimeError(f"appx-util build did not produce {APPX_UTIL_BINARY}")
+        return APPX_UTIL_BINARY
+
+    def _package_directory_to_appx(self, source_dir, output_path):
+        source_dir = os.path.abspath(source_dir)
+        output_path = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        appx_tool = self._ensure_appx_tool()
+        stage_dir = None
+        packaged = False
+        try:
+            stage_dir = self._prepare_appx_staging(source_dir)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            self.log(f"[*] Packing {source_dir} into {output_path}...")
+            self._run_local_command([appx_tool, "-o", output_path, stage_dir], REPO_ROOT)
+            if not os.path.isfile(output_path):
+                raise RuntimeError(f"appx output was not created: {output_path}")
+            packaged = True
+            return output_path
+        finally:
+            if stage_dir and packaged:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            elif stage_dir and not packaged:
+                self.log(f"[*] Appx staging folder kept at {stage_dir}")
+
+    def _device_portal_auth(self, ip):
+        username, password = fetch_dev_credentials(ip)
+        if password:
+            return (username or "DevToolsUser", password)
+        return None
+
+    def _decode_device_portal_payload(self, response):
+        try:
+            return response.json()
+        except ValueError:
+            text = response.text.strip()
+            return text or None
+
+    def _summarize_device_portal_payload(self, payload):
+        if isinstance(payload, dict):
+            summary_parts = []
+            error_code = None
+            error_text = None
+            success = None
+            for key, value in payload.items():
+                lowered = key.lower()
+                if lowered in ("success", "succeeded", "issuccess"):
+                    success = bool(value)
+                elif "errorcode" in lowered or lowered in ("hresult", "extendederror"):
+                    try:
+                        error_code = int(str(value), 0)
+                    except Exception:
+                        if value not in (None, "", 0, "0"):
+                            error_text = f"{key}={value}"
+                elif lowered in ("message", "status", "phase", "packagename", "packagefullname"):
+                    if value not in (None, ""):
+                        summary_parts.append(f"{key}={value}")
+                elif "error" in lowered and value not in (None, "", 0, "0"):
+                    error_text = f"{key}={value}"
+
+            summary = ", ".join(summary_parts) if summary_parts else json.dumps(payload, sort_keys=True)
+            return summary, error_code, error_text, success
+
+        text = str(payload).strip() if payload is not None else ""
+        return text, None, None, None
+
+    def _device_portal_post_package(self, ip, endpoint, appx_path, auth):
+        package_name = os.path.basename(appx_path)
+        mime = "application/vnd.ms-appx"
+        last_response = None
+
+        for active_auth in (auth, None) if auth else (None,):
+            with open(appx_path, "rb") as package_file:
+                response = requests.post(
+                    f"https://{ip}:11443{endpoint}",
+                    params={"package": package_name},
+                    files=[("", (package_name, package_file, mime))],
+                    auth=active_auth,
+                    verify=False,
+                    timeout=180,
+                )
+            last_response = response
+            if response.status_code not in (401, 403):
+                return response, active_auth
+
+        return last_response, auth
+
+    def _device_portal_get(self, ip, endpoint, auth, timeout=10):
+        last_response = None
+        for active_auth in (auth, None) if auth else (None,):
+            response = requests.get(
+                f"https://{ip}:11443{endpoint}",
+                auth=active_auth,
+                verify=False,
+                timeout=timeout,
+            )
+            last_response = response
+            if response.status_code not in (401, 403):
+                return response, active_auth
+        return last_response, auth
+
+    def _deploy_appx_to_console(self, ip, appx_path):
+        auth = self._device_portal_auth(ip)
+        accepted_index = None
+        active_auth = auth
+        last_error = None
+
+        # Use the package-manager endpoint that backs the Device Portal Apps
+        # tab. `/ext/update/remote` is for system updates, not app deploys.
+        for index, endpoint in enumerate(DEVICE_PORTAL_PACKAGE_APIS):
+            response, used_auth = self._device_portal_post_package(ip, endpoint, appx_path, active_auth)
+            active_auth = used_auth
+            if response is None:
+                continue
+            if response.status_code == 404:
+                last_error = RuntimeError(f"{endpoint} returned HTTP 404")
+                continue
+            if response.status_code >= 400:
+                payload = self._decode_device_portal_payload(response)
+                raise RuntimeError(
+                    f"device portal rejected deploy request at {endpoint}: HTTP {response.status_code} "
+                    f"{payload if payload is not None else ''}".rstrip()
+                )
+            accepted_index = index
+            self.log(f"[*] Deploy accepted by {endpoint}. Waiting for install status...")
+            break
+
+        if accepted_index is None:
+            raise last_error or RuntimeError("no compatible device-portal package endpoint accepted the deploy request")
+
+        state_endpoint = DEVICE_PORTAL_PACKAGE_STATE_APIS[accepted_index]
+        deadline = time.time() + 300
+        next_progress_log = 0.0
+
+        while time.time() < deadline:
+            response, active_auth = self._device_portal_get(ip, state_endpoint, active_auth, timeout=15)
+            if response is None:
+                time.sleep(1.0)
+                continue
+            if response.status_code == 204:
+                if time.time() >= next_progress_log:
+                    self.log("[*] Deploy still running on the console...")
+                    next_progress_log = time.time() + 2.0
+                time.sleep(1.0)
+                continue
+            if response.status_code == 404:
+                time.sleep(1.0)
+                continue
+            if response.status_code >= 400:
+                payload = self._decode_device_portal_payload(response)
+                raise RuntimeError(
+                    f"device portal status request failed at {state_endpoint}: HTTP {response.status_code} "
+                    f"{payload if payload is not None else ''}".rstrip()
+                )
+
+            payload = self._decode_device_portal_payload(response)
+            summary, error_code, error_text, success = self._summarize_device_portal_payload(payload)
+            if error_code not in (None, 0) or success is False or error_text:
+                detail = error_text or summary or f"error code {error_code}"
+                raise RuntimeError(f"deploy failed: {detail}")
+            if summary:
+                self.log(f"[+] Deploy completed. {summary}")
+            else:
+                self.log("[+] Deploy completed.")
+            return
+
+        raise RuntimeError("deploy timed out while waiting for the package-manager status to finish")
+
+    def package_directory(self, source_dir, output_dir):
+        if self.package_busy:
+            self.log("[-] Packaging is already running.")
+            return
+
+        self.package_busy = True
+        self._mark_dirty()
+        try:
+            source_dir = os.path.abspath(source_dir)
+            output_dir = os.path.abspath(output_dir)
+            output_path = os.path.join(output_dir, self._default_appx_name(source_dir))
+            packaged_path = self._package_directory_to_appx(source_dir, output_path)
+            self.log(f"[+] Package complete: {packaged_path}")
+        except Exception as exc:
+            self.log(f"[-] Package failed: {exc}")
+        finally:
+            self.package_busy = False
+            self._mark_dirty()
+
+    def deploy_directory(self, source_dir, ip):
+        if self.package_busy:
+            self.log("[-] Packaging or deploy is already running.")
+            return
+
+        self.package_busy = True
+        self._mark_dirty()
+        temp_output_dir = None
+        try:
+            source_dir = os.path.abspath(source_dir)
+            temp_output_dir = tempfile.mkdtemp(prefix="xbax-appx-output-")
+            appx_path = os.path.join(temp_output_dir, self._default_appx_name(source_dir))
+            packaged_path = self._package_directory_to_appx(source_dir, appx_path)
+            self.log(f"[*] Deploying {os.path.basename(packaged_path)} to {ip}...")
+            self._deploy_appx_to_console(ip, packaged_path)
+        except Exception as exc:
+            self.log(f"[-] Deploy failed: {exc}")
+        finally:
+            if temp_output_dir:
+                shutil.rmtree(temp_output_dir, ignore_errors=True)
+            self.package_busy = False
+            self._mark_dirty()
 
     def _remote_mkdirs(self, sftp, remote_dir):
         remote_dir = remote_dir.replace("\\", "/").rstrip("/")
@@ -1676,6 +2154,8 @@ def run_stream(screen, clock, ip):
     # Buttons auto-size their width from text at construction
     shell_btn     = Button(0, 18, 0, 52, "Connect Dev Shell",    (0, 120, 215), (0, 160, 255))
     install_btn   = Button(0, 18, 0, 52, "Install",              (35, 145, 85), (55, 185, 110))
+    package_btn   = Button(0, 18, 0, 52, "Package",              (70, 105, 170), (95, 135, 210))
+    deploy_btn    = Button(0, 18, 0, 52, "Deploy",               (150, 55, 60),  (195, 80, 90))
     bs_btn        = Button(0, 18, 0, 52, "Start BS",             (170, 95, 25), (205, 125, 40))
     full_term_btn = Button(0, 18, 0, 52, "Toggle Full Terminal", (60, 60, 80),  (90, 90, 110))
 
@@ -1735,7 +2215,9 @@ def run_stream(screen, clock, ip):
             # Right-align buttons — guaranteed no overlap
             full_term_btn.rect.x = STREAM_SIZE[0] - full_term_btn.rect.w - 12
             bs_btn.rect.x        = full_term_btn.rect.x - bs_btn.rect.w - 10
-            install_btn.rect.x   = bs_btn.rect.x - install_btn.rect.w - 10
+            deploy_btn.rect.x    = bs_btn.rect.x - deploy_btn.rect.w - 10
+            package_btn.rect.x   = deploy_btn.rect.x - package_btn.rect.w - 10
+            install_btn.rect.x   = package_btn.rect.x - install_btn.rect.w - 10
             shell_btn.rect.x     = install_btn.rect.x - shell_btn.rect.w - 10
 
             terminal._mark_dirty()
@@ -1747,6 +2229,8 @@ def run_stream(screen, clock, ip):
             terminal.needs_pin_prompt = False
 
         install_btn.enabled = terminal.can_install()
+        package_btn.enabled = terminal.can_package_appx()
+        deploy_btn.enabled = terminal.can_deploy_appx()
         bs_btn.enabled = terminal.can_toggle_bs()
         bs_btn.text = "Stop BS" if terminal.is_bs_running() else "Start BS"
 
@@ -1780,6 +2264,8 @@ def run_stream(screen, clock, ip):
         screen.blit(header_font.render(f"Xbox Devkit • {ip} • {mode} mode", True, (0,200,255)), (20,20))
         shell_btn.draw(screen)
         install_btn.draw(screen)
+        package_btn.draw(screen)
+        deploy_btn.draw(screen)
         bs_btn.draw(screen)
         full_term_btn.draw(screen)
 
@@ -1903,6 +2389,47 @@ def run_stream(screen, clock, ip):
                         threading.Thread(target=auto_connect, args=(ip,), daemon=True).start()
                     elif install_btn.clicked((mx,my)):
                         threading.Thread(target=terminal.install_package, daemon=True).start()
+                    elif package_btn.clicked((mx,my)):
+                        try:
+                            source_dir = choose_directory_dialog(
+                                "Pick the folder to package into an .appx",
+                                initial_dir=REPO_ROOT,
+                            )
+                            if not source_dir:
+                                terminal.log("[*] Package cancelled.")
+                                continue
+                            output_dir = choose_directory_dialog(
+                                "Pick the output folder for the packaged .appx",
+                                initial_dir=source_dir,
+                            )
+                            if not output_dir:
+                                terminal.log("[*] Package cancelled.")
+                                continue
+                        except Exception as exc:
+                            terminal.log(f"[-] Folder picker failed: {exc}")
+                            continue
+                        threading.Thread(
+                            target=terminal.package_directory,
+                            args=(source_dir, output_dir),
+                            daemon=True,
+                        ).start()
+                    elif deploy_btn.clicked((mx,my)):
+                        try:
+                            source_dir = choose_directory_dialog(
+                                "Pick the folder to package and deploy",
+                                initial_dir=REPO_ROOT,
+                            )
+                            if not source_dir:
+                                terminal.log("[*] Deploy cancelled.")
+                                continue
+                        except Exception as exc:
+                            terminal.log(f"[-] Folder picker failed: {exc}")
+                            continue
+                        threading.Thread(
+                            target=terminal.deploy_directory,
+                            args=(source_dir, ip),
+                            daemon=True,
+                        ).start()
                     elif bs_btn.clicked((mx,my)):
                         if terminal.is_bs_running():
                             threading.Thread(target=terminal.stop_bs, daemon=True).start()
@@ -2240,5 +2767,5 @@ def main():
     pygame.quit()
 
 if __name__ == "__main__":
-    print("[INFO] Required: pip install pygame opencv-python numpy websocket-client requests paramiko")
+    print("[INFO] Required: pip install pygame opencv-python numpy websocket-client requests urllib3 paramiko")
     main()
