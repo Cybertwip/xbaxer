@@ -500,6 +500,9 @@ func (s *relayServer) handleBuild(maxUploadMiB int64) http.HandlerFunc {
 			return
 		}
 
+		maxBytes := maxUploadMiB * 1024 * 1024
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
 		req, archivePath, status, errResp := receiveBuildRequest(r, maxUploadMiB)
 		if errResp != nil {
 			writeJSON(w, status, *errResp)
@@ -758,9 +761,13 @@ func (s *relayServer) completeJob(jobID string, result relayResult) error {
 }
 
 func receiveBuildRequest(r *http.Request, maxUploadMiB int64) (buildRequest, string, int, *errorResponse) {
-	maxBytes := maxUploadMiB * 1024 * 1024
-	r.Body = io.NopCloser(io.LimitReader(r.Body, maxBytes+1))
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return buildRequest{}, "", http.StatusRequestEntityTooLarge, &errorResponse{
+				Error: fmt.Sprintf("source archive exceeds %d MiB upload limit", maxUploadMiB),
+			}
+		}
 		return buildRequest{}, "", http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("invalid multipart request: %v", err)}
 	}
 
@@ -819,8 +826,7 @@ func createSourceArchive(sourcePath string) (string, error) {
 			if relPath == "." {
 				return nil
 			}
-			name := info.Name()
-			if shouldSkip(name, info.IsDir()) {
+			if shouldSkipArchivePath(relPath, info) {
 				if info.IsDir() {
 					return filepath.SkipDir
 				}
@@ -874,17 +880,61 @@ func addFileToZip(zipWriter *zip.Writer, sourcePath, archivePath string, mode os
 	return err
 }
 
-func shouldSkip(name string, isDir bool) bool {
+func shouldSkipArchivePath(relPath string, info os.FileInfo) bool {
+	name := info.Name()
+	isDir := info.IsDir()
 	switch name {
-	case ".git", ".pycache", "build":
-		return true
-	case ".DS_Store":
+	case ".git", ".hg", ".svn", ".pycache", "__pycache__", "build", ".DS_Store":
 		return true
 	}
-	if isDir && strings.HasPrefix(name, ".") && name != "." {
-		return false
+	if isDir && strings.HasPrefix(name, "cmake-build-") {
+		return true
+	}
+
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	if underGeneratedBuildTree(parts) && containsBuildOutputComponent(parts) {
+		return true
+	}
+	if underGeneratedBuildTree(parts) && shouldSkipGeneratedBuildFile(name, info) {
+		return true
+	}
+
+	return false
+}
+
+func underGeneratedBuildTree(parts []string) bool {
+	for _, part := range parts {
+		switch {
+		case part == ".cliant-cmake", part == "build", part == "CMakeFiles":
+			return true
+		case strings.HasPrefix(part, "cmake-build-"):
+			return true
+		}
 	}
 	return false
+}
+
+func containsBuildOutputComponent(parts []string) bool {
+	for _, part := range parts {
+		switch part {
+		case "bin", "lib", "obj", "objs":
+			return true
+		}
+	}
+	return false
+}
+
+func shouldSkipGeneratedBuildFile(name string, info os.FileInfo) bool {
+	if info.IsDir() {
+		return false
+	}
+
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".a", ".appx", ".dll", ".dylib", ".exe", ".ilk", ".lib", ".obj", ".o", ".pdb", ".so", ".xvd":
+		return true
+	default:
+		return false
+	}
 }
 
 func makeMultipartBody(archivePath string, request buildRequest) (io.Reader, string, error) {

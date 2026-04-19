@@ -61,6 +61,9 @@ func (s *server) buildPlanStepCommand(ctx context.Context, sourceDir string, ste
 			return nil, err
 		}
 	}
+	if err := preparePlanStepFilesystem(sourceDir, workingDirectory, step); err != nil {
+		return nil, err
+	}
 
 	executablePath, err := s.resolvePlanExecutable(step.Args[0])
 	if err != nil {
@@ -90,6 +93,100 @@ func (s *server) resolvePlanExecutable(raw string) (string, error) {
 		return s.clengBinary, nil
 	}
 	return "", fmt.Errorf("unsupported plan executable %q", raw)
+}
+
+func preparePlanStepFilesystem(sourceDir, workingDirectory string, step buildStep) error {
+	if err := os.MkdirAll(workingDirectory, 0o755); err != nil {
+		return fmt.Errorf("create plan working directory: %w", err)
+	}
+
+	for _, rawPath := range collectPlanOutputPaths(step.Args[1:]) {
+		absolutePath, err := resolvePlanStepPath(sourceDir, workingDirectory, rawPath)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(absolutePath), 0o755); err != nil {
+			return fmt.Errorf("create plan output directory for %q: %w", rawPath, err)
+		}
+	}
+
+	return nil
+}
+
+func collectPlanOutputPaths(args []string) []string {
+	var paths []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-o" || arg == "-MF":
+			if i+1 < len(args) {
+				paths = append(paths, args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "-o") && len(arg) > 2:
+			paths = append(paths, arg[2:])
+		case strings.HasPrefix(arg, "-MF") && len(arg) > 3:
+			paths = append(paths, arg[3:])
+		case strings.HasPrefix(arg, "-Wl,"):
+			paths = append(paths, collectLinkerOutputPaths(arg)...)
+		}
+	}
+
+	return paths
+}
+
+func collectLinkerOutputPaths(arg string) []string {
+	parts := strings.Split(arg, ",")
+	var paths []string
+	expectPath := false
+
+	for i := 1; i < len(parts); i++ {
+		part := parts[i]
+		if expectPath {
+			paths = append(paths, part)
+			expectPath = false
+			continue
+		}
+
+		if option, value, found := strings.Cut(part, "="); found {
+			if linkerOptionWritesFile(option) && strings.TrimSpace(value) != "" {
+				paths = append(paths, value)
+			}
+			continue
+		}
+
+		if linkerOptionWritesFile(part) {
+			expectPath = true
+		}
+	}
+
+	return paths
+}
+
+func linkerOptionWritesFile(option string) bool {
+	switch option {
+	case "--out-implib", "--output-def", "--pdb":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolvePlanStepPath(sourceDir, workingDirectory, raw string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimSpace(raw)))
+	if clean == "" || clean == "." {
+		return "", fmt.Errorf("path %q must stay within the uploaded workspace", raw)
+	}
+	if filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path %q must stay within the uploaded workspace", raw)
+	}
+
+	absolutePath := filepath.Join(workingDirectory, clean)
+	if !isWithinBase(sourceDir, absolutePath) {
+		return "", fmt.Errorf("path %q escapes the uploaded workspace", raw)
+	}
+	return absolutePath, nil
 }
 
 func resolveWorkspacePath(sourceDir, raw string) (string, error) {
