@@ -1,2 +1,0 @@
-EXPORTS
-GetActivationFactory = WINRT_GetActivationFactory   PRIVATE
