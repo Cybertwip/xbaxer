@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+#
+# Copyright (c) 2016-present, Facebook, Inc.
+# Copyright (c) 2021, Neal Gompa
+# All rights reserved.
+#
+# This source code is licensed under the Mozilla Public License, version 2.0.
+# For details, see the LICENSE file in the root directory of this source tree.
+# Portions of this code was previously licensed under a BSD-style license.
+# See the LICENSE-BSD file in the root directory of this source tree for details.
+
+from appx.util import appx_exe
+import appx.util
+import os
+import subprocess
+import unittest
+import urllib.parse
+import zipfile
+
+class TestZIPEscaping(unittest.TestCase):
+    '''
+    Ensures file names inside the ZIP are correctly URL-encoded.
+    '''
+
+    def _get_escaped_filename(self, filename):
+        return urllib.parse.quote(filename, safe='~/')
+
+    def _create_appx_with_file(self, d, filename):
+        file_path = os.path.join(d, filename)
+        with open(file_path, 'w') as test_file:
+            pass # os.mknod requires super-user on OS X
+        output_appx = os.path.join(d, 'test.appx')
+        subprocess.check_call([appx_exe(),
+                               '-o', output_appx,
+                               file_path])
+        return output_appx
+
+    def test_regular_file(self):
+        with appx.util.temp_dir() as d:
+            filename = 'foo.txt'
+            appx_path = self._create_appx_with_file(d, filename)
+            with zipfile.ZipFile(appx_path) as test_appx:
+                self.assertIn(filename, test_appx.namelist())
+
+    def test_special_characters(self):
+        with appx.util.temp_dir() as d:
+            filename = "~hello!world&%@'[foo]"
+            appx_path = self._create_appx_with_file(d, filename)
+            with zipfile.ZipFile(appx_path) as test_appx:
+                escaped_filename = self._get_escaped_filename(filename)
+                self.assertIn(escaped_filename, test_appx.namelist())
+
+    def test_content_types(self):
+        with appx.util.temp_dir() as d:
+            appx_path = self._create_appx_with_file(d, 'ignore.txt')
+            with zipfile.ZipFile(appx_path) as test_appx:
+                self.assertIn('[Content_Types].xml', test_appx.namelist())
+
+    def test_unicode_filename(self):
+        with appx.util.temp_dir() as d:
+            filename = u'\u00c0\u0800\U00010000'
+            appx_path = self._create_appx_with_file(d, filename)
+            with zipfile.ZipFile(appx_path) as test_appx:
+                escaped_filename = self._get_escaped_filename(filename)
+                self.assertIn(escaped_filename, test_appx.namelist())
+
+if __name__ == '__main__':
+    unittest.main()
