@@ -2117,22 +2117,96 @@ class IntegratedTerminal:
         if not os.path.isfile(package_path):
             raise RuntimeError(f"packaged build not found: {package_path}")
 
-        remote_package_path = self._upload_remote_file(package_path, REMOTE_PACKAGE_STAGING_DIR)
+        package_name = os.path.basename(package_path)
+        package_dir = os.path.dirname(package_path)
+
+        # If this is a GameOS/XVC-style deploy, also stage MicrosoftGame.Config
+        # from the same local directory, because wdapp expects the config to sit
+        # alongside the package on the target.
+        sibling_config_path = os.path.join(package_dir, "MicrosoftGame.Config")
+        has_sibling_config = os.path.isfile(sibling_config_path)
+
+        remote_stage_dir = REMOTE_PACKAGE_STAGING_DIR.replace("\\", "/").rstrip("/")
+
+        # Keep the package and config together in a dedicated staging folder so the
+        # remote layout matches the local layout:
+        #
+        #   <remote_stage>/<package_stem>/gameos.xvd
+        #   <remote_stage>/<package_stem>/MicrosoftGame.Config
+        #
+        package_stem = os.path.splitext(package_name)[0] or "package"
+        remote_package_dir = f"{remote_stage_dir}/{package_stem}"
+
+        self.log(
+            f"[*] Staging packaged build {package_name} to {remote_package_dir} on {ip}..."
+        )
+
+        # Upload the main package.
+        remote_package_path = self._upload_remote_file(package_path, remote_package_dir)
+
+        # Upload MicrosoftGame.Config if it exists next to gameos.xvd.
+        remote_config_path = None
+        if has_sibling_config:
+            remote_config_path = self._upload_remote_file(sibling_config_path, remote_package_dir)
+            self.log(
+                f"[*] Included sibling config {os.path.basename(sibling_config_path)} "
+                f"for packaged build deployment."
+            )
+        else:
+            self.log(
+                "[*] No sibling MicrosoftGame.Config found next to the packaged build; "
+                "continuing with package-only install."
+            )
+
         wdapp_path = REMOTE_WDAPP_PATH.replace("/", "\\")
         remote_package_windows = remote_package_path.replace("/", "\\")
-        command = f"cmd /c {wdapp_path} install {remote_package_windows} /drive={drive}"
-        self.log(
-            f"[*] Installing packaged build {os.path.basename(package_path)} "
-            f"on {ip} with wdApp (/drive={drive})..."
+        remote_package_dir_windows = remote_package_dir.replace("/", "\\")
+
+        combined_lines = []
+
+        def _run_and_log(command, description):
+            self.log(description)
+            exit_status, output, error = self._run_remote_command(command)
+            combined = "\n".join(
+                part.strip() for part in (output, error) if part and part.strip()
+            )
+            if combined:
+                for line in combined.splitlines():
+                    line = line.strip()
+                    if line:
+                        self.log(f"[*] {line}")
+                        combined_lines.append(line)
+            if exit_status != 0:
+                raise RuntimeError(
+                    combined or f"remote command failed with exit code {exit_status}: {command}"
+                )
+
+        lower_name = package_name.lower()
+
+        # For gameos.xvd, prefer installing from the folder that contains both
+        # gameos.xvd and MicrosoftGame.Config when the config is present.
+        #
+        # This keeps the exact sibling relationship intact on the devkit.
+        if lower_name == "gameos.xvd" and has_sibling_config:
+            install_cmd = (
+                f'cmd /c pushd "{remote_package_dir_windows}" '
+                f'&& "{wdapp_path}" install "gameos.xvd" /drive={drive} '
+                f'&& popd'
+            )
+            _run_and_log(
+                install_cmd,
+                f"[*] Installing packaged build {package_name} on {ip} with sibling "
+                f"MicrosoftGame.Config present (/drive={drive}).",
+            )
+            return
+
+        # Fallback: original behavior for other packaged artifacts (.xvc/.xvd/etc.)
+        install_cmd = f'cmd /c "{wdapp_path}" install "{remote_package_windows}" /drive={drive}'
+        _run_and_log(
+            install_cmd,
+            f"[*] Installing packaged build {package_name} on {ip} with wdapp "
+            f"(/drive={drive}).",
         )
-        exit_status, output, error = self._run_remote_command(command)
-        combined = "\n".join(part.strip() for part in (output, error) if part and part.strip())
-        if exit_status != 0:
-            raise RuntimeError(combined or f"wdApp install failed with exit code {exit_status}")
-        for line in combined.splitlines():
-            line = line.strip()
-            if line:
-                self.log(f"[*] {line}")
 
     def _is_windows_safe_relpath(self, rel_path):
         invalid_chars = set('<>:"|?*')
