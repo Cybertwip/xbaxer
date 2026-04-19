@@ -73,3 +73,13 @@ func TestRewriteBuildStepForRemoteRelativisesAbsoluteProjectPaths(t *testing.T) 
 		t.Fatalf("step.WorkingDirectory = %q", step.WorkingDirectory)
 	}
 }
+
+func TestIsCompilerDriverCommandRecognizesClengWrappers(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"cleng", "cleng++", "/tmp/build/host/cleng/bin/cleng"} {
+		if !isCompilerDriverCommand(raw) {
+			t.Fatalf("isCompilerDriverCommand(%q) = false, want true", raw)
+		}
+	}
+}

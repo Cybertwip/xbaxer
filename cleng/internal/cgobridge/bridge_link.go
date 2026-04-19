@@ -1,3 +1,5 @@
+//go:build windows && amd64
+
 // bridge_link.go — hand-curated cgo flags for the cleng bridge.
 //
 // The full list of -L/-l flags for the prebuilt LLVM/Clang archives lives
@@ -8,7 +10,7 @@
 // driver pulls in via WIN32 calls.
 //
 // LLVM is built with -fno-rtti -fno-exceptions, so anything we compile
-// against its headers (driver.cpp, cc1*_main.cpp, bridge.cpp) must match
+// against its headers (driver.cpp, cc1*_main.cpp, bridge_windows_amd64.cpp) must match
 // or the vtable layouts won't line up at link time.
 
 package cgobridge

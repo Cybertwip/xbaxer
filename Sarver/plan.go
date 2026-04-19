@@ -76,7 +76,14 @@ func (s *server) buildPlanStepCommand(ctx context.Context, sourceDir string, ste
 
 func (s *server) resolvePlanExecutable(raw string) (string, error) {
 	name := strings.ToLower(filepath.Base(raw))
-	if name == "clang" || name == "clang++" || name == "cc" || name == "c++" || strings.Contains(name, "clang") {
+	if name == "clang" ||
+		name == "clang++" ||
+		name == "cleng" ||
+		name == "cleng++" ||
+		name == "cc" ||
+		name == "c++" ||
+		strings.Contains(name, "clang") ||
+		strings.HasPrefix(name, "cleng") {
 		if s.clengBinary == "" {
 			return "", fmt.Errorf("plan step %q requires cleng to be configured", raw)
 		}

@@ -198,6 +198,11 @@ set(CLENG_OUTPUT_DIR "${XBAX_PACKAGE_DIR}/cleng/bin")
 set(CLENG_OUTPUT "${CLENG_OUTPUT_DIR}/cleng.exe")
 set(LED_SOURCE_DIR "${CMAKE_SOURCE_DIR}/led")
 set(LED_OUTPUT "${CLENG_OUTPUT_DIR}/led.exe")
+set(XBAX_HOST_CLENG_DIR "${XBAX_HOST_DIR}/cleng")
+set(HOST_CLENG_OUTPUT_DIR "${XBAX_HOST_CLENG_DIR}/bin")
+set(HOST_CLENG_OUTPUT "${HOST_CLENG_OUTPUT_DIR}/cleng${HOST_GO_EXECUTABLE_SUFFIX}")
+set(HOST_CLENG_CXX_ALIAS "${HOST_CLENG_OUTPUT_DIR}/cleng++${HOST_GO_EXECUTABLE_SUFFIX}")
+set(HOST_LED_OUTPUT "${HOST_CLENG_OUTPUT_DIR}/led${HOST_GO_EXECUTABLE_SUFFIX}")
 set(CLENG_CLANG_PREFIX "${CMAKE_BINARY_DIR}/engine/clang-windows-amd64"
     CACHE PATH "Prefix containing prebuilt Clang/LLVM static libs and headers for windows/amd64")
 
@@ -606,12 +611,12 @@ add_custom_command(
     "${CLENG_SOURCE_DIR}/main.go"
     "${CLENG_SOURCE_DIR}/internal/cleng/run.go"
     "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge.go"
-    "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge_windows_amd64.cpp"
     "${CLENG_SOURCE_DIR}/internal/cgobridge/bridge_link.go"
-    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_driver_inc.cpp"
-    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1_main_inc.cpp"
-    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1as_main_inc.cpp"
-    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1gen_reproducer_main_inc.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_driver_inc_windows_amd64.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1_main_inc_windows_amd64.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1as_main_inc_windows_amd64.cpp"
+    "${CLENG_SOURCE_DIR}/internal/cgobridge/cleng_cc1gen_reproducer_main_inc_windows_amd64.cpp"
   WORKING_DIRECTORY "${CLENG_SOURCE_DIR}"
   COMMENT "Building cleng.exe (Go-fronted Clang driver) for windows/amd64"
   VERBATIM
@@ -620,8 +625,81 @@ add_custom_command(
 add_custom_target(cleng DEPENDS "${CLENG_OUTPUT}" "${LED_OUTPUT}")
 set_target_properties(cleng PROPERTIES FOLDER "Apps")
 
+xbax_collect_go_module_sources(HOST_LED_SOURCE_DEPS "${LED_SOURCE_DIR}")
+add_custom_command(
+  OUTPUT "${HOST_LED_OUTPUT}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-mod-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-path"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${HOST_CLENG_OUTPUT_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E env ${XBAX_HOST_GO_BUILD_ENV}
+          "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
+          -o "${HOST_LED_OUTPUT}" .
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HOST_LED_OUTPUT}" "${HOST_CLENG_OUTPUT_DIR}/ld.lld${HOST_GO_EXECUTABLE_SUFFIX}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HOST_LED_OUTPUT}" "${HOST_CLENG_OUTPUT_DIR}/ld64.lld${HOST_GO_EXECUTABLE_SUFFIX}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HOST_LED_OUTPUT}" "${HOST_CLENG_OUTPUT_DIR}/dsymutil${HOST_GO_EXECUTABLE_SUFFIX}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HOST_LED_OUTPUT}" "${HOST_CLENG_OUTPUT_DIR}/strip${HOST_GO_EXECUTABLE_SUFFIX}"
+  COMMAND ${CMAKE_COMMAND}
+          -DSYSROOT_SOURCE=${CLENG_LINKER_BIN_SOURCE}
+          -DSYSROOT_DEST=${HOST_CLENG_OUTPUT_DIR}
+          -DSYSROOT_MARKERS=lld\;lld.exe\;ld64.lld\;ld64.lld.exe\;ld.lld\;ld.lld.exe
+          -DSYSROOT_PRESERVE_DEST=ON
+          -P "${CLENG_SOURCE_DIR}/scripts/copy_sysroot.cmake"
+  DEPENDS
+    go-toolchain
+    clang-engine
+    "${CLANG_ENGINE_STAMP}"
+    ${HOST_LED_SOURCE_DEPS}
+    "${LED_SOURCE_DIR}/go.mod"
+    "${LED_SOURCE_DIR}/main.go"
+  WORKING_DIRECTORY "${LED_SOURCE_DIR}"
+  COMMENT "Building host led${HOST_GO_EXECUTABLE_SUFFIX} (bundled linker wrapper)"
+  VERBATIM
+)
+
+add_custom_target(host-led DEPENDS "${HOST_LED_OUTPUT}")
+set_target_properties(host-led PROPERTIES FOLDER "Apps")
+
+set(HOST_CLENG_RUNTIME_BUNDLE_COMMANDS "${CLENG_RUNTIME_BUNDLE_COMMANDS}")
+string(REPLACE "${XBAX_PACKAGE_DIR}/cleng" "${XBAX_HOST_CLENG_DIR}" HOST_CLENG_RUNTIME_BUNDLE_COMMANDS "${HOST_CLENG_RUNTIME_BUNDLE_COMMANDS}")
+
+xbax_collect_go_module_sources(HOST_CLENG_SOURCE_DEPS "${CLENG_SOURCE_DIR}")
+add_custom_command(
+  OUTPUT "${HOST_CLENG_OUTPUT}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-mod-cache"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-path"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${HOST_CLENG_OUTPUT_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E env ${XBAX_HOST_GO_BUILD_ENV}
+          "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
+          -o "${HOST_CLENG_OUTPUT}" .
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HOST_CLENG_OUTPUT}" "${HOST_CLENG_CXX_ALIAS}"
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${XBAX_HOST_CLENG_DIR}/lib/clang"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CLENG_CLANG_PREFIX}/lib/clang"
+          "${XBAX_HOST_CLENG_DIR}/lib/clang"
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${XBAX_HOST_CLENG_DIR}/sysroot"
+  ${HOST_CLENG_RUNTIME_BUNDLE_COMMANDS}
+  DEPENDS
+    go-toolchain
+    host-led
+    clang-engine
+    "${CLANG_ENGINE_STAMP}"
+    "${CLENG_LINK_GENERATED}"
+    ${HOST_CLENG_SOURCE_DEPS}
+    "${CLENG_SOURCE_DIR}/go.mod"
+    "${CLENG_SOURCE_DIR}/main.go"
+    "${CLENG_SOURCE_DIR}/internal/cleng/run.go"
+  WORKING_DIRECTORY "${CLENG_SOURCE_DIR}"
+  COMMENT "Building host cleng${HOST_GO_EXECUTABLE_SUFFIX} (Go-fronted Clang driver)"
+  VERBATIM
+)
+
+add_custom_target(host-cleng DEPENDS "${HOST_CLENG_OUTPUT}" "${HOST_LED_OUTPUT}")
+set_target_properties(host-cleng PROPERTIES FOLDER "Apps")
+
 add_custom_target(package-xbax ALL DEPENDS campiler dastrabution anzipper cleener gatter sarver cliant cleng led)
 set_target_properties(package-xbax PROPERTIES FOLDER "Apps")
 
-add_custom_target(host-tools ALL DEPENDS host-cliant)
+add_custom_target(host-tools ALL DEPENDS host-cliant host-led host-cleng)
 set_target_properties(host-tools PROPERTIES FOLDER "Apps")

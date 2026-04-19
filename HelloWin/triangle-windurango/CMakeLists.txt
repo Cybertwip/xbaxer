@@ -39,3 +39,4 @@ target_link_libraries(TriangleWinDurango PRIVATE
     user32
     gdi32
 )
+target_link_options(TriangleWinDurango PRIVATE -municode)

@@ -28,6 +28,12 @@ type cmakeBuildOptions struct {
 	cmakeArgs     []string
 }
 
+type hostToolchainPaths struct {
+	cleng   string
+	clengXX string
+	led     string
+}
+
 func parseCMakeBuildOptions(serverURL string, args []string) (cmakeBuildOptions, error) {
 	opts := cmakeBuildOptions{
 		serverURL:  serverURL,
@@ -243,6 +249,7 @@ func runLocalCMakeConfigure(sourceRoot, buildDir, toolchainFile string, opts cma
 		return fmt.Errorf("create build directory: %w", err)
 	}
 
+	hostTools := detectHostToolchain()
 	args := []string{
 		"-S", sourceRoot,
 		"-B", buildDir,
@@ -250,6 +257,15 @@ func runLocalCMakeConfigure(sourceRoot, buildDir, toolchainFile string, opts cma
 		"-DCMAKE_BUILD_TYPE=" + opts.buildType,
 		"-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
 		"-DCMAKE_TOOLCHAIN_FILE=" + toolchainFile,
+	}
+	if hostTools.cleng != "" {
+		args = append(args, "-DXBAX_HOST_CLENG="+hostTools.cleng)
+	}
+	if hostTools.clengXX != "" {
+		args = append(args, "-DXBAX_HOST_CLENGXX="+hostTools.clengXX)
+	}
+	if hostTools.led != "" {
+		args = append(args, "-DXBAX_HOST_LED="+hostTools.led)
 	}
 	args = append(args, opts.cmakeArgs...)
 
@@ -579,9 +595,12 @@ func isCompilerDriverCommand(raw string) bool {
 	name := strings.ToLower(filepath.Base(raw))
 	return name == "clang" ||
 		name == "clang++" ||
+		name == "cleng" ||
+		name == "cleng++" ||
 		name == "cc" ||
 		name == "c++" ||
-		strings.Contains(name, "clang")
+		strings.Contains(name, "clang") ||
+		strings.HasPrefix(name, "cleng")
 }
 
 func isCompileOnlyDriverInvocation(argv []string) bool {
@@ -614,6 +633,67 @@ func sanitizePathToken(value string) string {
 		return "remote"
 	}
 	return value
+}
+
+func detectHostToolchain() hostToolchainPaths {
+	paths := hostToolchainPaths{
+		cleng:   strings.TrimSpace(os.Getenv("XBAX_HOST_CLENG")),
+		clengXX: strings.TrimSpace(os.Getenv("XBAX_HOST_CLENGXX")),
+		led:     strings.TrimSpace(os.Getenv("XBAX_HOST_LED")),
+	}
+	if paths.cleng != "" && paths.clengXX != "" && paths.led != "" {
+		return paths
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		if paths.clengXX == "" {
+			paths.clengXX = paths.cleng
+		}
+		return paths
+	}
+
+	hostRoot := filepath.Dir(filepath.Dir(filepath.Clean(exe)))
+	for _, candidateDir := range []string{
+		filepath.Join(hostRoot, "cleng", "bin"),
+		filepath.Join(hostRoot, "cleng"),
+	} {
+		if paths.cleng == "" {
+			paths.cleng = firstExistingPath(
+				filepath.Join(candidateDir, "cleng"),
+				filepath.Join(candidateDir, "cleng.exe"),
+			)
+		}
+		if paths.clengXX == "" {
+			paths.clengXX = firstExistingPath(
+				filepath.Join(candidateDir, "cleng++"),
+				filepath.Join(candidateDir, "cleng++.exe"),
+			)
+		}
+		if paths.led == "" {
+			paths.led = firstExistingPath(
+				filepath.Join(candidateDir, "led"),
+				filepath.Join(candidateDir, "led.exe"),
+			)
+		}
+	}
+
+	if paths.clengXX == "" {
+		paths.clengXX = paths.cleng
+	}
+	return paths
+}
+
+func firstExistingPath(candidates ...string) string {
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func submitArchiveBuild(serverURL, archivePath string, request buildRequest, outputPath string, timeout time.Duration) error {

@@ -12,8 +12,6 @@ against WinDurango-shaped DLL names instead of the usual GameCore libraries.
 Local configure + build:
 
 ```sh
-export XBAX_WINDOWS_SYSROOT=/path/to/your/windows-cross-sysroot
-
 cmake -S HelloWin/triangle-windurango \
   -B HelloWin/triangle-windurango/build-local \
   -G Ninja \
@@ -23,10 +21,12 @@ cmake -S HelloWin/triangle-windurango \
 cmake --build HelloWin/triangle-windurango/build-local --target TriangleWinDurango
 ```
 
-`XBAX_WINDOWS_SYSROOT` should point at a MinGW or Windows SDK style sysroot that
-contains the Windows headers and import libraries for `x86_64-w64-mingw32`.
-Without that sysroot, local configure still works, but the actual compile will
-stop at `windows.h` lookup.
+The toolchain auto-detects the installed `x86_64-w64-mingw32-gcc` sysroot on
+macOS. If you want to override that, set:
+
+```sh
+export XBAX_WINDOWS_SYSROOT=/path/to/your/windows-cross-sysroot
+```
 
 That produces:
 
@@ -37,13 +37,23 @@ That produces:
 Remote compile replay through `cliant` + `sarver`:
 
 ```sh
+cmake --build build --target package-xbax host-cliant host-cleng host-led sarver -j4
+
 cliant http://<sarver>:17777 cmake-build HelloWin/triangle-windurango \
   -target TriangleWinDurango \
   -o triangle-windurango.exe
 ```
 
 The default toolchain file is `cmake/xbax-remote-windows-toolchain.cmake`, and
-the generated Ninja graph is stored under `.cliant-cmake/`.
+the generated Ninja graph is stored under `.cliant-cmake/`. When the host
+targets are built first, `cliant cmake-build` auto-points CMake at the local
+`host/cleng/bin/cleng`, `cleng++`, and `led` wrappers so the exported Ninja
+steps use the same driver names that `sarver` replays remotely.
+
+This is the canonical path for Xbox-side proof-of-concept builds: configure the
+graph locally, then replay the actual compile/link jobs remotely through
+`sarver`, which uses the packaged `cleng` + `led` toolchain and its bundled
+MinGW/target runtime files.
 
 Packaging and deploy from the launcher UI:
 

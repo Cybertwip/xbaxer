@@ -24,13 +24,6 @@ import zipfile
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
-try:
-    import tkinter as tk
-    from tkinter import filedialog
-except Exception:
-    tk = None
-    filedialog = None
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================== CONFIG ==================
@@ -87,8 +80,52 @@ APPX_DEFAULT_ASSETS = {
 
 
 def choose_directory_dialog(title, initial_dir=None, must_exist=True):
-    if tk is None or filedialog is None:
-        raise RuntimeError("tkinter is unavailable, so folder picking is not available in this environment")
+    initial_dir = os.path.abspath(initial_dir or REPO_ROOT)
+
+    if sys.platform == "darwin":
+        return _choose_directory_dialog_macos(title, initial_dir)
+
+    return _choose_directory_dialog_tk(title, initial_dir, must_exist)
+
+
+def _escape_applescript_string(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _choose_directory_dialog_macos(title, initial_dir):
+    script_lines = []
+    choose_command = f'choose folder with prompt "{_escape_applescript_string(title)}"'
+    if initial_dir and os.path.isdir(initial_dir):
+        choose_command += f' default location POSIX file "{_escape_applescript_string(initial_dir)}"'
+    script_lines.append(f"set chosenFolder to {choose_command}")
+    script_lines.append("POSIX path of chosenFolder")
+
+    try:
+        result = subprocess.run(
+            ["osascript", *sum([["-e", line] for line in script_lines], [])],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("osascript is unavailable, so folder picking is not available on macOS") from exc
+
+    if result.returncode == 0:
+        selected = result.stdout.strip()
+        return selected or None
+
+    stderr = (result.stderr or "").strip()
+    if "User canceled" in stderr or "(-128)" in stderr:
+        return None
+    raise RuntimeError(stderr or "macOS folder picker failed")
+
+
+def _choose_directory_dialog_tk(title, initial_dir, must_exist=True):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("tkinter is unavailable, so folder picking is not available in this environment") from exc
 
     root = tk.Tk()
     root.withdraw()
@@ -99,7 +136,7 @@ def choose_directory_dialog(title, initial_dir=None, must_exist=True):
     root.update_idletasks()
     selected = filedialog.askdirectory(
         title=title,
-        initialdir=initial_dir or REPO_ROOT,
+        initialdir=initial_dir,
         mustexist=must_exist,
         parent=root,
     )
@@ -1225,11 +1262,40 @@ class IntegratedTerminal:
             elif stage_dir and not packaged:
                 self.log(f"[*] Appx staging folder kept at {stage_dir}")
 
-    def _device_portal_auth(self, ip):
+    def _device_portal_auth_candidates(self, ip):
         username, password = fetch_dev_credentials(ip)
-        if password:
-            return (username or "DevToolsUser", password)
-        return None
+        if not password:
+            return [None]
+
+        username = username or "DevToolsUser"
+        candidates = []
+        for candidate_username in (f"auto-{username}", username):
+            auth = (candidate_username, password)
+            if auth not in candidates:
+                candidates.append(auth)
+        candidates.append(None)
+        return candidates
+
+    def _open_device_portal_session(self, ip, auth):
+        session = requests.Session()
+        if auth:
+            session.auth = auth
+
+        try:
+            bootstrap = session.get(
+                f"https://{ip}:11443/",
+                allow_redirects=True,
+                verify=False,
+                timeout=15,
+            )
+        except requests.RequestException:
+            bootstrap = None
+
+        csrf_token = session.cookies.get("CSRF-Token")
+        if csrf_token:
+            session.headers["X-CSRF-Token"] = csrf_token
+
+        return session, bootstrap
 
     def _decode_device_portal_payload(self, response):
         try:
@@ -1266,107 +1332,118 @@ class IntegratedTerminal:
         text = str(payload).strip() if payload is not None else ""
         return text, None, None, None
 
-    def _device_portal_post_package(self, ip, endpoint, appx_path, auth):
+    def _device_portal_post_package(self, ip, endpoint, appx_path):
         package_name = os.path.basename(appx_path)
         mime = "application/vnd.ms-appx"
         last_response = None
+        last_session = None
 
-        for active_auth in (auth, None) if auth else (None,):
+        for auth in self._device_portal_auth_candidates(ip):
+            session, _ = self._open_device_portal_session(ip, auth)
             with open(appx_path, "rb") as package_file:
-                response = requests.post(
+                response = session.post(
                     f"https://{ip}:11443{endpoint}",
                     params={"package": package_name},
-                    files=[("", (package_name, package_file, mime))],
-                    auth=active_auth,
+                    files=[("package", (package_name, package_file, mime))],
                     verify=False,
                     timeout=180,
                 )
             last_response = response
+            last_session = session
             if response.status_code not in (401, 403):
-                return response, active_auth
+                return response, session
+            session.close()
 
-        return last_response, auth
+        return last_response, last_session
 
-    def _device_portal_get(self, ip, endpoint, auth, timeout=10):
-        last_response = None
-        for active_auth in (auth, None) if auth else (None,):
-            response = requests.get(
-                f"https://{ip}:11443{endpoint}",
-                auth=active_auth,
-                verify=False,
-                timeout=timeout,
-            )
-            last_response = response
-            if response.status_code not in (401, 403):
-                return response, active_auth
-        return last_response, auth
+    def _device_portal_get(self, ip, endpoint, session, timeout=10):
+        if session is None:
+            session, _ = self._open_device_portal_session(ip, None)
+        response = session.get(
+            f"https://{ip}:11443{endpoint}",
+            verify=False,
+            timeout=timeout,
+        )
+        return response, session
 
     def _deploy_appx_to_console(self, ip, appx_path):
-        auth = self._device_portal_auth(ip)
         accepted_index = None
-        active_auth = auth
+        active_session = None
         last_error = None
 
         # Use the package-manager endpoint that backs the Device Portal Apps
         # tab. `/ext/update/remote` is for system updates, not app deploys.
-        for index, endpoint in enumerate(DEVICE_PORTAL_PACKAGE_APIS):
-            response, used_auth = self._device_portal_post_package(ip, endpoint, appx_path, active_auth)
-            active_auth = used_auth
-            if response is None:
-                continue
-            if response.status_code == 404:
-                last_error = RuntimeError(f"{endpoint} returned HTTP 404")
-                continue
-            if response.status_code >= 400:
+        try:
+            for index, endpoint in enumerate(DEVICE_PORTAL_PACKAGE_APIS):
+                response, session = self._device_portal_post_package(ip, endpoint, appx_path)
+                active_session = session
+                if response is None:
+                    continue
+                if response.status_code == 404:
+                    last_error = RuntimeError(f"{endpoint} returned HTTP 404")
+                    if active_session:
+                        active_session.close()
+                        active_session = None
+                    continue
+                if response.status_code >= 400:
+                    payload = self._decode_device_portal_payload(response)
+                    detail = payload if payload is not None else ""
+                    if response.status_code == 403:
+                        detail = (
+                            f"{detail} "
+                            "Device Portal HTTPS deploys require CSRF-safe auth; xbax now retries with auto-username."
+                        ).strip()
+                    raise RuntimeError(
+                        f"device portal rejected deploy request at {endpoint}: HTTP {response.status_code} "
+                        f"{detail}".rstrip()
+                    )
+                accepted_index = index
+                self.log(f"[*] Deploy accepted by {endpoint}. Waiting for install status...")
+                break
+
+            if accepted_index is None:
+                raise last_error or RuntimeError("no compatible device-portal package endpoint accepted the deploy request")
+
+            state_endpoint = DEVICE_PORTAL_PACKAGE_STATE_APIS[accepted_index]
+            deadline = time.time() + 300
+            next_progress_log = 0.0
+
+            while time.time() < deadline:
+                response, active_session = self._device_portal_get(ip, state_endpoint, active_session, timeout=15)
+                if response is None:
+                    time.sleep(1.0)
+                    continue
+                if response.status_code == 204:
+                    if time.time() >= next_progress_log:
+                        self.log("[*] Deploy still running on the console...")
+                        next_progress_log = time.time() + 2.0
+                    time.sleep(1.0)
+                    continue
+                if response.status_code == 404:
+                    time.sleep(1.0)
+                    continue
+                if response.status_code >= 400:
+                    payload = self._decode_device_portal_payload(response)
+                    raise RuntimeError(
+                        f"device portal status request failed at {state_endpoint}: HTTP {response.status_code} "
+                        f"{payload if payload is not None else ''}".rstrip()
+                    )
+
                 payload = self._decode_device_portal_payload(response)
-                raise RuntimeError(
-                    f"device portal rejected deploy request at {endpoint}: HTTP {response.status_code} "
-                    f"{payload if payload is not None else ''}".rstrip()
-                )
-            accepted_index = index
-            self.log(f"[*] Deploy accepted by {endpoint}. Waiting for install status...")
-            break
+                summary, error_code, error_text, success = self._summarize_device_portal_payload(payload)
+                if error_code not in (None, 0) or success is False or error_text:
+                    detail = error_text or summary or f"error code {error_code}"
+                    raise RuntimeError(f"deploy failed: {detail}")
+                if summary:
+                    self.log(f"[+] Deploy completed. {summary}")
+                else:
+                    self.log("[+] Deploy completed.")
+                return
 
-        if accepted_index is None:
-            raise last_error or RuntimeError("no compatible device-portal package endpoint accepted the deploy request")
-
-        state_endpoint = DEVICE_PORTAL_PACKAGE_STATE_APIS[accepted_index]
-        deadline = time.time() + 300
-        next_progress_log = 0.0
-
-        while time.time() < deadline:
-            response, active_auth = self._device_portal_get(ip, state_endpoint, active_auth, timeout=15)
-            if response is None:
-                time.sleep(1.0)
-                continue
-            if response.status_code == 204:
-                if time.time() >= next_progress_log:
-                    self.log("[*] Deploy still running on the console...")
-                    next_progress_log = time.time() + 2.0
-                time.sleep(1.0)
-                continue
-            if response.status_code == 404:
-                time.sleep(1.0)
-                continue
-            if response.status_code >= 400:
-                payload = self._decode_device_portal_payload(response)
-                raise RuntimeError(
-                    f"device portal status request failed at {state_endpoint}: HTTP {response.status_code} "
-                    f"{payload if payload is not None else ''}".rstrip()
-                )
-
-            payload = self._decode_device_portal_payload(response)
-            summary, error_code, error_text, success = self._summarize_device_portal_payload(payload)
-            if error_code not in (None, 0) or success is False or error_text:
-                detail = error_text or summary or f"error code {error_code}"
-                raise RuntimeError(f"deploy failed: {detail}")
-            if summary:
-                self.log(f"[+] Deploy completed. {summary}")
-            else:
-                self.log("[+] Deploy completed.")
-            return
-
-        raise RuntimeError("deploy timed out while waiting for the package-manager status to finish")
+            raise RuntimeError("deploy timed out while waiting for the package-manager status to finish")
+        finally:
+            if active_session is not None:
+                active_session.close()
 
     def package_directory(self, source_dir, output_dir):
         if self.package_busy:
