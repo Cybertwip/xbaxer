@@ -1,0 +1,157 @@
+﻿#include "d3d11.x.h"
+#include "IIDExports.h"
+
+EXTERN_C HRESULT __stdcall EraD3D10CreateBlob()
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall EraD3D11CreateDevice(void *pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
+                                                UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels,
+                                                UINT SDKVersion, void **ppDevice, D3D_FEATURE_LEVEL *pFeatureLevel,
+                                                void **ppImmediateContext)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall EraD3D11CreateDeviceAndSwapChain()
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+struct D3D11X_CREATE_DEVICE_PARAMETERS
+{
+    UINT Version;
+    UINT Flags;
+    void *pOffchipTessellationBuffer;
+    void *pTessellationFactorsBuffer;
+    UINT DeferredDeletionThreadAffinityMask;
+    UINT ImmediateContextDeRingSizeBytes;
+    UINT ImmediateContextCeRingSizeBytes;
+    UINT ImmediateContextDeSegmentSizeBytes;
+    UINT ImmediateContextCeSegmentSizeBytes;
+};
+
+EXTERN_C HRESULT __stdcall D3D11XCreateDeviceX(const D3D11X_CREATE_DEVICE_PARAMETERS *pParameters, void **ppDevice,
+                                               void **ppImmediateContext)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall D3D11XCreateDeviceXAndSwapChain1(const D3D11X_CREATE_DEVICE_PARAMETERS *pParameters,
+                                                            const DXGI_SWAP_CHAIN_DESC1 *pSwapChainDesc,
+                                                            void **ppSwapChain, void **ppDevice,
+                                                            void **ppImmediateContext)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall D3DAllocateGraphicsMemory(SIZE_T dwSize, UINT64 a2, void *a3, int a4, void **a5)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall D3DConfigureVirtualMemory(UINT64 a1)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall D3DFreeGraphicsMemory(void *pAddress)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall D3DMapEsramMemory(UINT Flags, void *pVirtualAddress, UINT NumPages, const UINT *pPageList)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+struct DXGIX_FRAME_STATISTICS
+{
+    UINT64 CPUTimePresentCalled;
+    UINT64 CPUTimeAddedToQueue;
+    UINT QueueLengthAddedToQueue;
+    UINT64 CPUTimeFrameComplete;
+    UINT64 GPUTimeFrameComplete;
+    UINT64 GPUCountTitleUsed;
+    UINT64 GPUCountSystemUsed;
+    UINT64 CPUTimeVSync;
+    UINT64 GPUTimeVSync;
+    UINT64 CPUTimeFlip;
+    UINT64 GPUTimeFlip;
+    UINT64 VSyncCount;
+    float PercentScanned;
+    void *Cookie[2];
+};
+
+EXTERN_C HRESULT __stdcall DXGIXGetFrameStatistics(UINT NumberFramesRequested, DXGIX_FRAME_STATISTICS *pFrameStatistics)
+{
+    pFrameStatistics->QueueLengthAddedToQueue = 0;
+    pFrameStatistics->CPUTimeAddedToQueue = 0;
+    pFrameStatistics->CPUTimeFlip = 0;
+    pFrameStatistics->CPUTimeFrameComplete = 0;
+    pFrameStatistics->CPUTimePresentCalled = 0;
+    pFrameStatistics->CPUTimeVSync = 0;
+    pFrameStatistics->GPUCountSystemUsed = 0;
+    pFrameStatistics->GPUCountTitleUsed = 0;
+    pFrameStatistics->GPUTimeFlip = 0;
+    pFrameStatistics->GPUTimeFrameComplete = 0;
+    pFrameStatistics->GPUTimeVSync = 0;
+    pFrameStatistics->PercentScanned = 100.0f;
+    pFrameStatistics->QueueLengthAddedToQueue = 0;
+    pFrameStatistics->VSyncCount = 0;
+    return S_OK;
+}
+
+struct DXGIX_PRESENTARRAY_PARAMETERS
+{
+    BOOL Disable;
+    BOOL UsePreviousBuffer;
+    D3D11_RECT SourceRect;
+    POINT DestRectUpperLeft;
+    FLOAT ScaleFactorVert;
+    FLOAT ScaleFactorHorz;
+    void *Cookie;
+    UINT Flags;
+};
+
+void PresentArray(UINT NumSwapChains, void **SwapChains, UINT SyncInterval)
+{
+    // TODO
+}
+
+EXTERN_C HRESULT __stdcall DXGIXPresentArray(UINT SyncInterval, UINT PresentImmediateThreshold, UINT Flags,
+                                             UINT NumSwapChains, void **ppSwapChains,
+                                             const DXGIX_PRESENTARRAY_PARAMETERS *pPresentParameters)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+EXTERN_C HRESULT __stdcall DXGIXSetVLineNotification(UINT VLineCounter, UINT VLineNum, HANDLE hEvent)
+{
+    IMPLEMENT_STUB();
+    return E_NOTIMPL;
+}
+
+#pragma comment(linker, "/export:D3D10CreateBlob=EraD3D10CreateBlob,@1")
+#pragma comment(linker, "/export:D3D11CreateDevice=EraD3D11CreateDevice,@2")
+#pragma comment(linker, "/export:D3D11CreateDeviceAndSwapChain=EraD3D11CreateDeviceAndSwapChain,@3")
+#pragma comment(linker, "/export:D3D11XCreateDeviceX,@4")
+#pragma comment(linker, "/export:D3D11XCreateDeviceXAndSwapChain1,@5")
+#pragma comment(linker, "/export:D3DAllocateGraphicsMemory,@6")
+#pragma comment(linker, "/export:D3DConfigureVirtualMemory,@7")
+#pragma comment(linker, "/export:D3DFreeGraphicsMemory,@8")
+#pragma comment(linker, "/export:D3DMapEsramMemory,@9")
+#pragma comment(linker, "/export:DXGIXGetFrameStatistics,@10")
+#pragma comment(linker, "/export:DXGIXPresentArray,@11")
+#pragma comment(linker, "/export:DXGIXSetVLineNotification,@12")

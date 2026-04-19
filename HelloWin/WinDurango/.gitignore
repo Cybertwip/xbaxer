@@ -1,0 +1,6 @@
+**/.cmake/*
+**/build/*
+**/Generated Files/*
+**/.vscode/*
+**/.vs/*
+**/vcpkg_installed/*

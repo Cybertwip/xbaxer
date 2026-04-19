@@ -1,0 +1,8 @@
+LIBRARY d3d11_x
+EXPORTS
+	IID_ID3D11DeviceContextX											@40
+	IID_ID3D11DeviceX													@41
+	IID_ID3D11Texture2D 												@61
+	IID_IDXGIFactory2												    @76
+	IID_IDXGIDevice 													@70
+	IID_IDXGIDevice1													@71

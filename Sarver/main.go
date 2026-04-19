@@ -41,6 +41,20 @@ type buildRequest struct {
 	// mode, sarver auto-discovers every *.c/*.cc/*.cpp/*.cxx file in
 	// the archive.
 	Sources []string `json:"sources,omitempty"`
+	// Steps is an ordered compiler/linker replay plan generated on the
+	// host after a local CMake/Ninja configure. Sarver executes every
+	// step inside the same extracted workspace so intermediate objects,
+	// import libraries, and final binaries stay available for later
+	// link stages.
+	Steps []buildStep `json:"steps,omitempty"`
+	// ArtifactPath selects which file from the plan workspace should be
+	// streamed back to the host after all steps succeed.
+	ArtifactPath string `json:"artifact_path,omitempty"`
+}
+
+type buildStep struct {
+	Args             []string `json:"args"`
+	WorkingDirectory string   `json:"working_directory,omitempty"`
 }
 
 type errorResponse struct {
@@ -392,6 +406,13 @@ func (s *server) executeBuild(parent context.Context, req buildRequest, archiveR
 	}
 
 	outputPath := filepath.Join(workspace, outputName)
+	if strings.TrimSpace(req.ArtifactPath) != "" {
+		outputPath, err = resolveWorkspacePath(sourceDir, req.ArtifactPath)
+		if err != nil {
+			_ = os.RemoveAll(workspace)
+			return nil, http.StatusBadRequest, &errorResponse{Error: err.Error()}
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
@@ -422,12 +443,22 @@ func (s *server) executeBuild(parent context.Context, req buildRequest, archiveR
 			_ = os.RemoveAll(workspace)
 			return nil, http.StatusBadRequest, &errorResponse{Error: cerr.Error()}
 		}
+	case "plan":
+		if s.clengBinary == "" {
+			_ = os.RemoveAll(workspace)
+			return nil, http.StatusBadRequest, &errorResponse{Error: "language=plan requires cleng to be configured (-cleng path)"}
+		}
+		cmd = nil
 	default:
 		_ = os.RemoveAll(workspace)
-		return nil, http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("unknown language %q (want go, c, or cpp)", req.Language)}
+		return nil, http.StatusBadRequest, &errorResponse{Error: fmt.Sprintf("unknown language %q (want go, c, cpp, or plan)", req.Language)}
 	}
 
-	buildLog, err = cmd.CombinedOutput()
+	if lang == "plan" {
+		buildLog, err = s.executeBuildPlan(ctx, sourceDir, req)
+	} else {
+		buildLog, err = cmd.CombinedOutput()
+	}
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -729,6 +760,8 @@ func normalizeLanguage(lang string) string {
 		return "c"
 	case "cpp", "c++", "cxx":
 		return "cpp"
+	case "plan", "cmake":
+		return "plan"
 	default:
 		return strings.ToLower(strings.TrimSpace(lang))
 	}

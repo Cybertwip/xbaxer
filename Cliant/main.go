@@ -27,14 +27,21 @@ const relayPullTimeout = 25 * time.Second
 var errUsageRequested = errors.New("usage requested")
 
 type buildRequest struct {
-	Target       string   `json:"target"`
-	OutputName   string   `json:"output_name"`
-	GOOS         string   `json:"goos"`
-	GOARCH       string   `json:"goarch"`
-	CGOEnabled   string   `json:"cgo_enabled"`
-	Language     string   `json:"language,omitempty"`
-	CompilerArgs []string `json:"compiler_args,omitempty"`
-	Sources      []string `json:"sources,omitempty"`
+	Target       string      `json:"target"`
+	OutputName   string      `json:"output_name"`
+	GOOS         string      `json:"goos"`
+	GOARCH       string      `json:"goarch"`
+	CGOEnabled   string      `json:"cgo_enabled"`
+	Language     string      `json:"language,omitempty"`
+	CompilerArgs []string    `json:"compiler_args,omitempty"`
+	Sources      []string    `json:"sources,omitempty"`
+	Steps        []buildStep `json:"steps,omitempty"`
+	ArtifactPath string      `json:"artifact_path,omitempty"`
+}
+
+type buildStep struct {
+	Args             []string `json:"args"`
+	WorkingDirectory string   `json:"working_directory,omitempty"`
 }
 
 type errorResponse struct {
@@ -138,6 +145,15 @@ func run(args []string) error {
 			return err
 		}
 		return runBuild(opts)
+	case "cmake-build":
+		opts, err := parseCMakeBuildOptions(serverURL, args[2:])
+		if err != nil {
+			if errors.Is(err, errUsageRequested) {
+				return nil
+			}
+			return err
+		}
+		return runCMakeBuild(opts)
 	case "health":
 		return runHealth(serverURL)
 	default:
@@ -962,6 +978,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  cliant serve [-listen 0.0.0.0:17777] [-max-upload-mib 256]")
 	fmt.Fprintln(os.Stderr, "  cliant probe <xbox-ip>")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> build [path] [-o output] [-pkg target] [-goos os] [-goarch arch] [-cgo 0|1] [-timeout 10m] [-- compiler-flags]")
+	fmt.Fprintln(os.Stderr, "  cliant <server-url> cmake-build [source-dir] -target <cmake-target> [-toolchain file] [-build-dir dir] [-o output] [-- cmake-configure-flags]")
 	fmt.Fprintln(os.Stderr, "  cliant <server-url> health")
 }
 
