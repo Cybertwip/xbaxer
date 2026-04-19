@@ -95,6 +95,14 @@ APPX_DEFAULT_ASSETS = {
     "Assets/SplashScreen.png": (620, 300),
 }
 
+GAME_CONFIG_DEFAULT_ASSETS = {
+    "StoreLogo.png": (50, 50),
+    "GraphicsLogo.png": (150, 150),
+    "SmallLogo.png": (44, 44),
+    "LargeLogo.png": (480, 480),
+    "SplashScreen.png": (620, 300),
+}
+
 UI_COLORS = {
     "bg": (8, 13, 22),
     "bg_alt": (12, 21, 34),
@@ -1254,8 +1262,18 @@ class IntegratedTerminal:
         normalized = rel_path.replace("\\", "/")
         if normalized in APPX_DEFAULT_ASSETS:
             return APPX_DEFAULT_ASSETS[normalized]
+        if normalized in GAME_CONFIG_DEFAULT_ASSETS:
+            return GAME_CONFIG_DEFAULT_ASSETS[normalized]
 
         lower_name = os.path.basename(normalized).lower()
+        if "storelogo" in lower_name:
+            return (50, 50)
+        if "graphicslogo" in lower_name:
+            return (150, 150)
+        if "smalllogo" in lower_name:
+            return (44, 44)
+        if "largelogo" in lower_name or "480x480" in lower_name:
+            return (480, 480)
         if "44x44" in lower_name:
             return (44, 44)
         if "150x150" in lower_name:
@@ -1277,7 +1295,296 @@ class IntegratedTerminal:
         pygame.draw.line(surface, (0, 120, 215), (0, 0), (size[0] - 1, size[1] - 1), max(2, min(size) // 22))
         pygame.draw.line(surface, (0, 120, 215), (size[0] - 1, 0), (0, size[1] - 1), max(2, min(size) // 22))
         pygame.image.save(surface, path)
-    
+
+    def _xml_escape(self, value):
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    def _local_xml_name(self, tag):
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    def _default_game_config_app_id(self, exe_name):
+        base_name = os.path.splitext(os.path.basename(exe_name or ""))[0]
+        token = re.sub(r"[^A-Za-z0-9]+", "", base_name)
+        if not token:
+            return "Game0"
+        if not token[0].isalpha():
+            token = "Game" + token
+        return token[:64]
+
+    def _infer_game_config_device_family(self, stage_dir):
+        if os.path.isfile(os.path.join(stage_dir, "gameos.xvd")):
+            return "XboxOne"
+        return "PC"
+
+    def _appx_device_family_settings(self, target_device_family):
+        lowered = (target_device_family or "").strip().lower()
+        if lowered in ("xboxone", "scarlett"):
+            return ("Windows.Xbox", "10.0.14393.0", "10.0.26100.0")
+        if lowered == "pc":
+            return ("Windows.Desktop", "10.0.19041.0", "10.0.26100.0")
+        return ("Windows.Desktop", "10.0.19041.0", "10.0.26100.0")
+
+    def _load_game_config_metadata(self, config_path, exe_rel_path, stage_dir, publisher_override=None):
+        tree = ET.parse(config_path)
+        root = tree.getroot()
+
+        identity = None
+        shell_visuals = None
+        executable_nodes = []
+        resources = []
+
+        for child in list(root):
+            local_name = self._local_xml_name(child.tag)
+            if local_name == "Identity":
+                identity = child
+            elif local_name == "ShellVisuals":
+                shell_visuals = child
+            elif local_name == "ExecutableList":
+                executable_nodes = [
+                    node for node in list(child)
+                    if self._local_xml_name(node.tag) == "Executable"
+                ]
+            elif local_name == "Resources":
+                for resource in list(child):
+                    if self._local_xml_name(resource.tag) != "Resource":
+                        continue
+                    language = (resource.attrib.get("Language") or "").strip()
+                    if language:
+                        resources.append(language)
+
+        if identity is None:
+            raise RuntimeError(f"MicrosoftGame.Config is missing Identity: {config_path}")
+        if shell_visuals is None:
+            raise RuntimeError(f"MicrosoftGame.Config is missing ShellVisuals: {config_path}")
+        if not executable_nodes:
+            raise RuntimeError(f"MicrosoftGame.Config is missing Executable entries: {config_path}")
+
+        normalized_exe = exe_rel_path.replace("\\", "/").strip("/")
+        normalized_exe_name = os.path.basename(normalized_exe).lower()
+        executable = None
+        for node in executable_nodes:
+            node_name = (node.attrib.get("Name") or "").replace("\\", "/").strip("/")
+            if not node_name:
+                continue
+            if node_name.lower() == normalized_exe.lower() or os.path.basename(node_name).lower() == normalized_exe_name:
+                executable = node
+                break
+        if executable is None:
+            executable = executable_nodes[0]
+
+        if publisher_override:
+            identity.set("Publisher", publisher_override)
+
+        package_name = (identity.attrib.get("Name") or "").strip()
+        if not package_name:
+            raise RuntimeError(f"MicrosoftGame.Config Identity Name is empty: {config_path}")
+
+        version = (identity.attrib.get("Version") or "").strip() or self._default_appx_version()
+        publisher = (identity.attrib.get("Publisher") or "").strip() or self._default_appx_publisher()
+        display_name = (shell_visuals.attrib.get("DefaultDisplayName") or package_name).strip() or package_name
+        publisher_display_name = (
+            (shell_visuals.attrib.get("PublisherDisplayName") or display_name).strip() or display_name
+        )
+        description = (shell_visuals.attrib.get("Description") or display_name).strip() or display_name
+        store_logo = (
+            (shell_visuals.attrib.get("StoreLogo") or shell_visuals.attrib.get("Square150x150Logo") or "StoreLogo.png")
+            .strip()
+        )
+        app_id = (executable.attrib.get("Id") or "").strip() or self._default_game_config_app_id(
+            executable.attrib.get("Name") or exe_rel_path
+        )
+        target_device_family = (
+            (executable.attrib.get("TargetDeviceFamily") or "").strip()
+            or self._infer_game_config_device_family(stage_dir)
+        )
+        processor_architecture = (
+            "arm64" if (executable.attrib.get("Architecture") or "").strip().lower() == "arm64" else "x64"
+        )
+
+        return {
+            "tree": tree,
+            "root": root,
+            "identity": identity,
+            "shell_visuals": shell_visuals,
+            "executable": executable,
+            "package_name": package_name,
+            "version": version,
+            "publisher": publisher,
+            "display_name": display_name,
+            "publisher_display_name": publisher_display_name,
+            "description": description,
+            "store_logo": store_logo,
+            "app_id": app_id,
+            "target_device_family": target_device_family,
+            "processor_architecture": processor_architecture,
+            "resources": resources,
+        }
+
+    def _write_game_config_metadata(self, game_config, config_path):
+        game_config["tree"].write(config_path, encoding="utf-8", xml_declaration=True)
+
+    def _generated_manifest_from_game_config(self, game_config, exe_rel_path):
+        executable = exe_rel_path.replace("/", "\\")
+        shell_visuals = game_config["shell_visuals"]
+        package_name = self._xml_escape(game_config["package_name"])
+        publisher = self._xml_escape(game_config["publisher"])
+        version = self._xml_escape(game_config["version"])
+        display_name = self._xml_escape(game_config["display_name"])
+        publisher_display_name = self._xml_escape(game_config["publisher_display_name"])
+        description = self._xml_escape(game_config["description"])
+        logo = self._xml_escape(game_config["store_logo"].replace("/", "\\"))
+        application_id = self._xml_escape(game_config["app_id"])
+        square_150_logo = self._xml_escape(
+            (
+                shell_visuals.attrib.get("Square150x150Logo")
+                or shell_visuals.attrib.get("StoreLogo")
+                or "GraphicsLogo.png"
+            ).replace("/", "\\")
+        )
+        square_44_logo = self._xml_escape(
+            (
+                shell_visuals.attrib.get("Square44x44Logo")
+                or shell_visuals.attrib.get("StoreLogo")
+                or "SmallLogo.png"
+            ).replace("/", "\\")
+        )
+        splash_image = self._xml_escape(
+            (shell_visuals.attrib.get("SplashScreenImage") or "SplashScreen.png").replace("/", "\\")
+        )
+        background_color = self._xml_escape(
+            (shell_visuals.attrib.get("BackgroundColor") or "transparent").strip() or "transparent"
+        )
+        foreground_text = (shell_visuals.attrib.get("ForegroundText") or "").strip()
+        foreground_attr = f' ForegroundText="{self._xml_escape(foreground_text)}"' if foreground_text else ""
+        family_name, min_version, max_version = self._appx_device_family_settings(
+            game_config["target_device_family"]
+        )
+        resources = game_config["resources"] or ["en-US"]
+        resources_xml = "\n".join(
+            f'    <Resource Language="{self._xml_escape(language)}" />' for language in resources
+        )
+
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+    <Package IgnorableNamespaces="uap rescap"
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+    <Identity Name="{package_name}" Publisher="{publisher}" Version="{version}" ProcessorArchitecture="{game_config["processor_architecture"]}" />
+    <Properties>
+        <DisplayName>{display_name}</DisplayName>
+        <PublisherDisplayName>{publisher_display_name}</PublisherDisplayName>
+        <Description>{description}</Description>
+        <Logo>{logo}</Logo>
+    </Properties>
+    <Dependencies>
+        <TargetDeviceFamily Name="{family_name}" MinVersion="{min_version}" MaxVersionTested="{max_version}" />
+    </Dependencies>
+    <Resources>
+{resources_xml}
+    </Resources>
+    <Capabilities>
+        <rescap:Capability Name="runFullTrust" />
+        <rescap:Capability Name="unvirtualizedResources" />
+    </Capabilities>
+    <Applications>
+        <Application Id="{application_id}" Executable="{executable}" EntryPoint="Windows.FullTrustApplication">
+            <uap:VisualElements DisplayName="{display_name}" Description="{description}" BackgroundColor="{background_color}" Square150x150Logo="{square_150_logo}" Square44x44Logo="{square_44_logo}"{foreground_attr}>
+                <uap:SplashScreen Image="{splash_image}" />
+            </uap:VisualElements>
+        </Application>
+    </Applications>
+    </Package>
+    """
+
+    def _game_config_asset_paths(self, game_config):
+        asset_paths = set()
+        shell_visuals = game_config["shell_visuals"]
+        executable = game_config["executable"]
+        for attr_name in (
+            "StoreLogo",
+            "Square150x150Logo",
+            "Square44x44Logo",
+            "Square480x480Logo",
+            "SplashScreenImage",
+        ):
+            attr_value = (shell_visuals.attrib.get(attr_name) or "").strip()
+            if attr_value:
+                asset_paths.add(attr_value.replace("\\", "/"))
+        for attr_name in (
+            "OverrideLogo",
+            "OverrideSquare44x44Logo",
+            "OverrideSquare480x480Logo",
+            "OverrideSplashScreenImage",
+        ):
+            attr_value = (executable.attrib.get(attr_name) or "").strip()
+            if attr_value:
+                asset_paths.add(attr_value.replace("\\", "/"))
+        return asset_paths
+
+    def _ensure_game_config_assets(self, stage_dir, game_config):
+        for rel_path in sorted(self._game_config_asset_paths(game_config)):
+            normalized = rel_path.replace("\\", "/").lstrip("/")
+            if not normalized:
+                continue
+            asset_path = os.path.join(stage_dir, *normalized.split("/"))
+            if os.path.exists(asset_path):
+                continue
+            self._create_placeholder_asset(asset_path, self._guess_asset_size(normalized))
+
+    def _game_config_matches_executable(self, game_config, exe_rel_path):
+        config_executable = (
+            (game_config["executable"].attrib.get("Name") or "")
+            .replace("\\", "/")
+            .strip("/")
+            .lower()
+        )
+        if not config_executable:
+            return False
+        expected_executable = exe_rel_path.replace("\\", "/").strip("/").lower()
+        if config_executable == expected_executable:
+            return True
+        return os.path.basename(config_executable) == os.path.basename(expected_executable)
+
+    def _candidate_game_config_sources(self, source_dir):
+        candidates = []
+        seen = set()
+        repo_root = os.path.abspath(REPO_ROOT)
+        current = os.path.abspath(source_dir)
+        while True:
+            candidate = os.path.join(current, "MicrosoftGame.Config")
+            if os.path.isfile(candidate):
+                candidate = os.path.abspath(candidate)
+                if candidate not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate)
+            if current == repo_root or current == os.path.dirname(current):
+                break
+            current = os.path.dirname(current)
+        return candidates
+
+    def _select_game_config_source(self, source_dir, exe_rel_path):
+        fallback = None
+        for candidate in self._candidate_game_config_sources(source_dir):
+            try:
+                metadata = self._load_game_config_metadata(
+                    candidate,
+                    exe_rel_path,
+                    os.path.dirname(candidate),
+                )
+            except Exception:
+                continue
+            if fallback is None:
+                fallback = candidate
+            if self._game_config_matches_executable(metadata, exe_rel_path):
+                return candidate
+        return fallback
+
     def _normalize_manifest_text(self, manifest_text, exe_rel_path):
         exe_name = os.path.splitext(os.path.basename(exe_rel_path))[0]
         publisher = self._default_appx_publisher()
@@ -1411,21 +1718,40 @@ class IntegratedTerminal:
             os.path.join(stage_dir, "Package.appxmanifest"),
         ]
         manifest_target = os.path.join(stage_dir, "AppxManifest.xml")
+        game_config_path = os.path.join(stage_dir, "MicrosoftGame.Config")
+        selected_game_config_source = self._select_game_config_source(source_dir, exe_rel_path)
+        if selected_game_config_source:
+            selected_game_config_source = os.path.abspath(selected_game_config_source)
+            if not os.path.isfile(game_config_path) or os.path.abspath(game_config_path) != selected_game_config_source:
+                shutil.copyfile(selected_game_config_source, game_config_path)
 
-        manifest_source = next((path for path in manifest_candidates if os.path.isfile(path)), None)
-        if manifest_source:
-            with open(manifest_source, "r", encoding="utf-8-sig") as manifest_file:
-                manifest_text = self._normalize_manifest_text(manifest_file.read(), exe_rel_path)
+        if os.path.isfile(game_config_path):
+            game_config = self._load_game_config_metadata(
+                game_config_path,
+                exe_rel_path,
+                stage_dir,
+                publisher_override=self._default_appx_publisher(),
+            )
+            self._write_game_config_metadata(game_config, game_config_path)
+            manifest_text = self._generated_manifest_from_game_config(game_config, exe_rel_path)
+            ensure_assets = lambda: self._ensure_game_config_assets(stage_dir, game_config)
         else:
-            folder_name = os.path.basename(source_dir.rstrip(os.sep)) or "HelloWin"
-            display_name = folder_name.replace("_", " ").replace("-", " ").strip() or "HelloWin"
-            package_name = "Cybertwip." + self._sanitize_package_token(folder_name)
-            manifest_text = self._generated_manifest_text(exe_rel_path, package_name, display_name)
+            manifest_source = next((path for path in manifest_candidates if os.path.isfile(path)), None)
+            if manifest_source:
+                with open(manifest_source, "r", encoding="utf-8-sig") as manifest_file:
+                    manifest_text = self._normalize_manifest_text(manifest_file.read(), exe_rel_path)
+                    ensure_assets = lambda: self._ensure_manifest_assets(stage_dir, manifest_target)
+            else:
+                folder_name = os.path.basename(source_dir.rstrip(os.sep)) or "HelloWin"
+                display_name = folder_name.replace("_", " ").replace("-", " ").strip() or "HelloWin"
+                package_name = "Cybertwip." + self._sanitize_package_token(folder_name)
+                manifest_text = self._generated_manifest_text(exe_rel_path, package_name, display_name)
+                ensure_assets = lambda: self._ensure_manifest_assets(stage_dir, manifest_target)
 
         with open(manifest_target, "w", encoding="utf-8") as manifest_file:
             manifest_file.write(manifest_text)
 
-        self._ensure_manifest_assets(stage_dir, manifest_target)
+        ensure_assets()
         return stage_dir
 
     def _ensure_appx_tool(self):
@@ -1724,50 +2050,22 @@ class IntegratedTerminal:
     def _triangle_cpp_package_source_dir(self):
         if not os.path.isfile(TRIANGLE_CPP_OUTPUT):
             raise RuntimeError(f"TriangleCpp build output not found: {TRIANGLE_CPP_OUTPUT}")
-        if os.path.isdir(TRIANGLE_CPP_APP_DIR):
-            shutil.rmtree(TRIANGLE_CPP_APP_DIR, ignore_errors=True)
-        shutil.copytree(TRIANGLE_CPP_OUTPUT_DIR, TRIANGLE_CPP_APP_DIR, dirs_exist_ok=True)
-        return TRIANGLE_CPP_APP_DIR
+        return TRIANGLE_CPP_OUTPUT_DIR
 
-    def _triangle_cpp_deploy_artifact(self):
-        candidate_roots = [
-            TRIANGLE_CPP_SOURCE_DIR,
-            os.path.dirname(TRIANGLE_CPP_SOURCE_DIR),
-            os.path.dirname(DEFAULT_GAMEOS_XVD),
-        ]
-        seen = set()
-        for root in candidate_roots:
-            root = os.path.abspath(root)
-            if root in seen:
-                continue
-            seen.add(root)
-            package_path = self._find_packaged_build(root)
-            if package_path:
-                return package_path
-        return None
+    def _is_packaged_build_file(self, source_path):
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            return False
+        lowered = os.path.basename(source_path).lower()
+        return lowered == "gameos.xvd" or lowered.endswith(".xvd") or lowered.endswith(".xvc")
 
     def _find_packaged_build(self, source_path):
         source_path = os.path.abspath(source_path)
-        if os.path.isfile(source_path):
-            lowered = os.path.basename(source_path).lower()
-            if lowered == "gameos.xvd" or lowered.endswith(".xvd") or lowered.endswith(".xvc"):
-                return source_path
+        if self._is_packaged_build_file(source_path):
+            return source_path
+        if os.path.isdir(source_path) or not os.path.isfile(source_path):
             return None
-        if not os.path.isdir(source_path):
-            return None
-
-        direct_candidate = os.path.join(source_path, "gameos.xvd")
-        if os.path.isfile(direct_candidate):
-            return direct_candidate
-
-        matches = []
-        for root, _, filenames in os.walk(source_path):
-            filenames.sort()
-            for filename in filenames:
-                lowered = filename.lower()
-                if lowered == "gameos.xvd" or lowered.endswith(".xvd") or lowered.endswith(".xvc"):
-                    matches.append(os.path.join(root, filename))
-        return matches[0] if matches else None
+        return None
 
     def _ensure_remote_cleng_bundle(self, force=False):
         local_cleng_dir = os.path.join(LOCAL_PACKAGE_DIR, "cleng")
@@ -1956,20 +2254,15 @@ class IntegratedTerminal:
         try:
             self.log("[*] Starting the TriangleCpp build + deploy pipeline...")
             self._build_triangle_cpp_impl()
-            packaged_build = self._triangle_cpp_deploy_artifact()
-            if packaged_build:
-                self.log(
-                    f"[*] TriangleCpp built successfully. Deploying packaged build "
-                    f"{os.path.basename(packaged_build)} via wdApp install..."
-                )
-                self._deploy_packaged_build_to_console(ip, packaged_build)
-            else:
-                package_source_dir = self._triangle_cpp_package_source_dir()
-                temp_output_dir = tempfile.mkdtemp(prefix="xbax-trianglecpp-appx-")
-                appx_path = os.path.join(temp_output_dir, self._default_appx_name(package_source_dir))
-                packaged_path = self._package_directory_to_appx(package_source_dir, appx_path, require_signing=True)
-                self.log(f"[*] Deploying {os.path.basename(packaged_path)} to {ip}...")
-                self._deploy_appx_to_console(ip, packaged_path)
+            package_source_dir = self._triangle_cpp_package_source_dir()
+            temp_output_dir = tempfile.mkdtemp(prefix="xbax-trianglecpp-appx-")
+            appx_path = os.path.join(temp_output_dir, self._default_appx_name(package_source_dir))
+            packaged_path = self._package_directory_to_appx(package_source_dir, appx_path, require_signing=True)
+            self.log(
+                f"[*] TriangleCpp built successfully. Deploying "
+                f"{os.path.basename(packaged_path)} via Device Portal upload..."
+            )
+            self._deploy_appx_to_console(ip, packaged_path)
             self.log("[+] TriangleCpp pipeline complete.")
         except Exception as exc:
             self.log(f"[-] TriangleCpp pipeline failed: {exc}")
@@ -2361,12 +2654,15 @@ class IntegratedTerminal:
         sftp = self.ssh_client.open_sftp()
         try:
             self._remote_mkdirs(sftp, remote_bootstrap_dir)
-            local_size = os.path.getsize(local_tool)
+            local_stat = os.stat(local_tool)
             try:
                 remote_stat = sftp.stat(remote_tool)
             except IOError:
                 remote_stat = None
-            if remote_stat is None or remote_stat.st_size != local_size:
+            should_upload = remote_stat is None or remote_stat.st_size != local_stat.st_size
+            if not should_upload and int(getattr(remote_stat, "st_mtime", 0) or 0) < int(local_stat.st_mtime):
+                should_upload = True
+            if should_upload:
                 self.log(f"[*] Bootstrapping {tool_name}.exe on the remote machine...")
                 sftp.put(local_tool, remote_tool)
         finally:
@@ -3322,7 +3618,7 @@ Usage:
   main.py upload <ip> <local> [remote-dir]
                                     # SFTP-upload a single file (default dir: D:/DevelopmentFiles/Sandbox)
   main.py install <ip>              # build the Xbax package and sync it to <ip>
-  main.py trianglecpp <ip>          # install tools, start the relay, build TriangleCpp, then deploy gameos.xvd when available
+  main.py trianglecpp <ip>          # install tools, start the relay, build TriangleCpp, package bin.appx, then upload/deploy it
   main.py reboot <ip>               # POST a reboot to <ip>:11443
   main.py -h | --help               # show this message
 """
