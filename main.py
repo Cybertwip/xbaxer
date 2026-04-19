@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import shutil
 import zipfile
+from functools import lru_cache
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
@@ -34,7 +35,7 @@ CONFIG_FILE = "xbox_config.json"
 TELNET_CONNECT_TIMEOUT = 15
 TELNET_KEEPALIVE_INTERVAL = 10
 SSH_KEEPALIVE_INTERVAL = 20
-HEADER_HEIGHT = 80
+HEADER_HEIGHT = 154
 DEFAULT_TERMINAL_HEIGHT = 290
 MIN_TERMINAL_HEIGHT = 180
 MIN_VIDEO_HEIGHT = 180
@@ -55,6 +56,22 @@ REMOTE_SARVER_DIR = REMOTE_INSTALL_DIR + "/sarver"
 APPX_UTIL_SOURCE_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "appx-util")
 APPX_UTIL_BUILD_DIR = os.path.join(REPO_ROOT, "third_party", "appx-util", "build")
 APPX_UTIL_BINARY = os.path.join(APPX_UTIL_BUILD_DIR, "appx.exe" if os.name == "nt" else "appx")
+DEFAULT_APPX_SIGNING_PFX = os.path.join(REPO_ROOT, "HelloWin", "Cybertwip.pfx")
+APPX_SIGNING_PFX_ENV = "XBAX_APPX_PFX"
+APPX_SIGNING_PASSWORD_ENV = "XBAX_APPX_PFX_PASSWORD"
+APPX_PUBLISHER_ENV = "XBAX_APPX_PUBLISHER"
+HOST_IP_ENV = "XBAX_HOST_IP"
+TRIANGLE_CPP_SOURCE_DIR = os.path.join(REPO_ROOT, "HelloWin", "TriangleC++")
+TRIANGLE_CPP_TARGET = "TriangleCpp"
+TRIANGLE_CPP_BUILD_DIR = os.path.join(TRIANGLE_CPP_SOURCE_DIR, ".cliant-cmake", TRIANGLE_CPP_TARGET)
+TRIANGLE_CPP_OUTPUT_DIR = os.path.join(TRIANGLE_CPP_BUILD_DIR, "bin")
+TRIANGLE_CPP_OUTPUT = os.path.join(TRIANGLE_CPP_OUTPUT_DIR, TRIANGLE_CPP_TARGET + ".exe")
+TRIANGLE_CPP_APP_DIR = os.path.join(TRIANGLE_CPP_BUILD_DIR, "appx", TRIANGLE_CPP_TARGET)
+DEFAULT_GAMEOS_XVD = os.path.join(REPO_ROOT, "HelloWin", "gameos.xvd")
+REMOTE_PACKAGE_STAGING_DIR = "D:/DevelopmentFiles/Sandbox/Packages"
+REMOTE_WDAPP_PATH = "J:/tools/wdapp.exe"
+REMOTE_KILL_TOOL = "J:/tools/kill.exe"
+DEFAULT_WDAPP_DRIVE = "Development"
 DEVICE_PORTAL_PACKAGE_APIS = [
     "/api/app/packagemanager/package",
     "/api/appx/packagemanager/package",
@@ -77,6 +94,83 @@ APPX_DEFAULT_ASSETS = {
     "Assets/Wide310x150Logo.png": (310, 150),
     "Assets/SplashScreen.png": (620, 300),
 }
+
+UI_COLORS = {
+    "bg": (8, 13, 22),
+    "bg_alt": (12, 21, 34),
+    "panel": (18, 29, 43),
+    "panel_alt": (23, 35, 52),
+    "panel_border": (58, 82, 112),
+    "shadow": (4, 8, 14, 110),
+    "text": (241, 245, 250),
+    "muted": (151, 167, 186),
+    "accent": (76, 190, 255),
+    "success": (61, 182, 125),
+    "warning": (236, 171, 73),
+    "danger": (220, 92, 97),
+    "terminal_bg": (10, 15, 24),
+    "terminal_border": (52, 72, 96),
+    "terminal_text": (132, 237, 190),
+    "terminal_muted": (104, 123, 143),
+}
+
+
+@lru_cache(maxsize=64)
+def ui_font(size, bold=False, italic=False, monospace=False):
+    preferred_names = (
+        ["SF Mono", "Menlo", "Consolas", "Monaco", "Courier New"]
+        if monospace
+        else ["Avenir Next", "Avenir", "Segoe UI", "Helvetica Neue", "Arial"]
+    )
+    font_path = None
+    for name in preferred_names:
+        font_path = pygame.font.match_font(name, bold=bold, italic=italic)
+        if font_path:
+            break
+    return pygame.font.Font(font_path, size)
+
+
+def draw_panel(surface, rect, fill, border, radius=18, shadow=True):
+    panel_rect = pygame.Rect(rect)
+    if shadow:
+        shadow_rect = panel_rect.move(0, 8)
+        shadow_surface = pygame.Surface(shadow_rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(shadow_surface, UI_COLORS["shadow"], shadow_surface.get_rect(), border_radius=radius)
+        surface.blit(shadow_surface, shadow_rect.topleft)
+    pygame.draw.rect(surface, fill, panel_rect, border_radius=radius)
+    pygame.draw.rect(surface, border, panel_rect, width=1, border_radius=radius)
+
+
+def draw_status_chip(surface, x, y, label, color, text_color=None):
+    font = ui_font(15, bold=True)
+    text_color = text_color or UI_COLORS["text"]
+    text = font.render(label, True, text_color)
+    rect = pygame.Rect(x, y, text.get_width() + 22, 30)
+    pygame.draw.rect(surface, (*color, 40), rect, border_radius=15)
+    pygame.draw.rect(surface, color, rect, width=1, border_radius=15)
+    surface.blit(text, (rect.x + 11, rect.y + (rect.height - text.get_height()) // 2))
+    return rect
+
+
+def build_backdrop(size):
+    width, height = size
+    backdrop = pygame.Surface(size, pygame.SRCALPHA)
+    backdrop.fill(UI_COLORS["bg"])
+
+    for y in range(height):
+        ratio = y / max(1, height - 1)
+        color = tuple(
+            int(UI_COLORS["bg"][idx] * (1.0 - ratio) + UI_COLORS["bg_alt"][idx] * ratio)
+            for idx in range(3)
+        )
+        pygame.draw.line(backdrop, color, (0, y), (width, y))
+
+    glow = pygame.Surface(size, pygame.SRCALPHA)
+    pygame.draw.circle(glow, (28, 89, 149, 70), (int(width * 0.85), 80), 220)
+    pygame.draw.circle(glow, (27, 138, 112, 45), (int(width * 0.12), int(height * 0.22)), 180)
+    pygame.draw.circle(glow, (236, 171, 73, 26), (int(width * 0.22), int(height * 0.92)), 210)
+    backdrop.blit(glow, (0, 0))
+    return backdrop
 
 
 def choose_directory_dialog(title, initial_dir=None, must_exist=True):
@@ -200,6 +294,9 @@ M_DOWN = 0x0020; M_UP = 0x0040; WHEEL_V = 0x0800
 
 # ================== NETWORK SCANNER ==================
 def get_local_ip():
+    forced_ip = os.environ.get(HOST_IP_ENV, "").strip()
+    if forced_ip:
+        return forced_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('10.255.255.255', 1))
@@ -243,20 +340,27 @@ class Button:
         self.hover = hover
         self.disabled = disabled
         self.enabled = True
-        self.font = pygame.font.SysFont("consolas", 20, bold=True)
-        # Measure text ONCE at construction — no runtime overflow
+        self.font = ui_font(17, bold=True)
         txt_w = self.font.size(text)[0]
-        actual_w = max(w, txt_w + 30)
+        actual_w = max(w, txt_w + 34)
         self.rect = pygame.Rect(x, y, actual_w, h)
 
     def draw(self, surf):
         if not self.enabled:
             col = self.disabled
-            txt_color = (185, 185, 185)
+            txt_color = (188, 196, 206)
+            border = UI_COLORS["terminal_border"]
         else:
             col = self.hover if self.rect.collidepoint(pygame.mouse.get_pos()) else self.color
-            txt_color = (255, 255, 255)
-        pygame.draw.rect(surf, col, self.rect, border_radius=8)
+            txt_color = UI_COLORS["text"]
+            border = tuple(min(255, channel + 24) for channel in col)
+
+        shadow_rect = self.rect.move(0, 5)
+        shadow_surface = pygame.Surface(shadow_rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(shadow_surface, UI_COLORS["shadow"], shadow_surface.get_rect(), border_radius=12)
+        surf.blit(shadow_surface, shadow_rect.topleft)
+        pygame.draw.rect(surf, col, self.rect, border_radius=12)
+        pygame.draw.rect(surf, border, self.rect, width=1, border_radius=12)
         txt = self.font.render(self.text, True, txt_color)
         surf.blit(txt, txt.get_rect(center=self.rect.center))
 
@@ -267,15 +371,15 @@ class Button:
 class IntegratedTerminal:
     def __init__(self, x, y, w, h):
         self.rect = pygame.Rect(x, y, w, h)
-        self.font = pygame.font.SysFont("consolas", 17)
+        self.font = ui_font(16, monospace=True)
         self.line_h = 19
 
         self.cols = 140
         self.rows = 40
         self.grid = [[' ' for _ in range(self.cols)] for _ in range(self.rows)]
         self.history = [
-            "[INFO] Xbox Devkit VT100 Terminal Emulation Active",
-            "[INFO] Drag and drop any file onto this window to upload to Sandbox."
+            "[INFO] Xbox Devkit console ready",
+            "[INFO] Drag files onto the window to upload them into the Sandbox."
         ]
         self.screen_history = []
 
@@ -543,9 +647,20 @@ class IntegratedTerminal:
     def can_install(self):
         return self.connected and self.has_active_ssh() and not self.installing and not self.package_busy
 
+    def can_triangle_pipeline(self):
+        return self.connected and self.has_active_ssh() and not self.installing and not self.package_busy
+
     def is_bs_running(self):
         with self.bs_lock:
             return self.bs_running
+
+    def _allocate_local_tcp_port(self):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+        finally:
+            probe.close()
 
     def can_toggle_bs(self):
         with self.bs_lock:
@@ -566,7 +681,10 @@ class IntegratedTerminal:
         return candidates[0]
 
     def _remote_sarver_path(self):
-        return REMOTE_SARVER_DIR.rstrip("/") + "/sarver.exe"
+        return self._remote_bootstrap_tool_path(REMOTE_INSTALL_DIR, "sarver")
+
+    def _remote_cleng_binary_path(self):
+        return REMOTE_INSTALL_DIR.rstrip("/") + "/cleng/bin/cleng.exe"
 
     def _ensure_local_cliant(self):
         cliant_path = self._local_cliant_path()
@@ -579,14 +697,7 @@ class IntegratedTerminal:
         return cliant_path
 
     def _ensure_remote_sarver_installed(self):
-        remote_sarver = self._remote_sarver_path().replace("/", "\\")
-        command = f'cmd /c if exist {self._cmd_quote(remote_sarver)} (exit /b 0) else (exit /b 1)'
-        exit_status, _, _ = self._run_remote_command(command)
-        if exit_status != 0:
-            raise RuntimeError(
-                f"remote sarver.exe not found at {remote_sarver}; run Install first"
-            )
-        return remote_sarver
+        return self._ensure_remote_bootstrap_tool(REMOTE_INSTALL_DIR, "sarver").replace("/", "\\")
 
     def _watch_bs_process(self, process):
         try:
@@ -613,10 +724,7 @@ class IntegratedTerminal:
             self._mark_dirty()
 
             if should_stop_remote and self.has_active_ssh():
-                try:
-                    self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
-                except Exception:
-                    pass
+                self._stop_remote_process("sarver.exe")
 
             if stop_requested:
                 self.log("[*] BS relay stopped.")
@@ -625,7 +733,7 @@ class IntegratedTerminal:
             else:
                 self.log(f"[-] BS relay exited with code {return_code}.")
 
-    def start_bs(self):
+    def start_bs(self, relay_port=None):
         with self.bs_lock:
             if self.bs_busy:
                 self.log("[-] BS start/stop already in progress.")
@@ -644,11 +752,14 @@ class IntegratedTerminal:
 
             cliant_path = self._ensure_local_cliant()
             remote_sarver = self._ensure_remote_sarver_installed()
-            relay_url = f"http://{get_local_ip()}:{BS_RELAY_PORT}"
+            remote_cleng = self._remote_cleng_binary_path().replace("/", "\\")
+            relay_port = int(relay_port or BS_RELAY_PORT)
+            relay_listen = f"0.0.0.0:{relay_port}"
+            relay_url = f"http://{get_local_ip()}:{relay_port}"
 
-            self.log(f"[*] Starting local cliant relay on http://{BS_RELAY_LISTEN}...")
+            self.log(f"[*] Starting local cliant relay on http://{relay_listen}...")
             relay_process = subprocess.Popen(
-                [cliant_path, "serve", "-listen", BS_RELAY_LISTEN],
+                [cliant_path, "serve", "-listen", relay_listen],
                 cwd=REPO_ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -663,14 +774,14 @@ class IntegratedTerminal:
                 raise RuntimeError(startup_log or "cliant relay exited immediately")
 
             self.log(f"[*] Launching remote sarver.exe -reverse {relay_url} ...")
-            try:
-                self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
-            except Exception:
-                pass
+            self._stop_remote_process("sarver.exe")
 
-            exit_status, output, error = self._run_remote_command(
-                f'cmd /c start "" /b {self._cmd_quote(remote_sarver)} -reverse {self._cmd_quote(relay_url)}'
+            launch_command = (
+                f'cmd /c start "" /b {self._cmd_quote(remote_sarver)} '
+                f'-cleng {self._cmd_quote(remote_cleng)} '
+                f'-reverse {self._cmd_quote(relay_url)}'
             )
+            exit_status, output, error = self._run_remote_command(launch_command)
             if exit_status != 0:
                 raise RuntimeError((error or output or "remote sarver launch failed").strip())
 
@@ -686,10 +797,7 @@ class IntegratedTerminal:
             self.log(f"[+] BS started. Relay URL: {relay_url}")
         except Exception as exc:
             if self.has_active_ssh():
-                try:
-                    self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
-                except Exception:
-                    pass
+                self._stop_remote_process("sarver.exe")
             if relay_process and relay_process.poll() is None:
                 try:
                     relay_process.terminate()
@@ -722,7 +830,7 @@ class IntegratedTerminal:
         try:
             if self.has_active_ssh():
                 self.log("[*] Stopping remote sarver.exe...")
-                self._run_remote_command('taskkill /F /IM sarver.exe /T >NUL 2>&1')
+                self._stop_remote_process("sarver.exe")
             else:
                 self.log("[*] SSH is unavailable; stopping the local BS relay only.")
 
@@ -944,7 +1052,7 @@ class IntegratedTerminal:
         if self._dirty or self._cached_surf is None:
             body_h = max(1, self.rect.height - 40)
             surf = pygame.Surface((self.rect.width, body_h))
-            surf.fill((15, 15, 25))
+            surf.fill(UI_COLORS["terminal_bg"])
 
             with self.lock:
                 visible_lines = self._visible_lines_locked()
@@ -952,30 +1060,30 @@ class IntegratedTerminal:
             y = 10
             for line in visible_lines:
                 if line:
-                    surf.blit(self.font.render(line, True, (0, 255, 120)), (12, y))
+                    surf.blit(self.font.render(line, True, UI_COLORS["terminal_text"]), (12, y))
                 y += self.line_h
 
             self._cached_surf = surf
             self._dirty = False
 
         screen.blit(self._cached_surf, (self.rect.x, self.rect.y))
-        outline_color = (0, 255, 120) if self.focused else (50, 70, 80)
+        outline_color = UI_COLORS["accent"] if self.focused else UI_COLORS["terminal_border"]
         pygame.draw.rect(screen, outline_color, self.rect, 3)
 
         # Footer bar
         footer_y = self.rect.bottom - 30
-        pygame.draw.rect(screen, (15, 15, 25),
+        pygame.draw.rect(screen, UI_COLORS["terminal_bg"],
                          (self.rect.x, footer_y - 4, self.rect.width, 34))
 
         mode_text  = "[RAW INPUT ON]" if self.raw_input_mode else "[BUFFERED INPUT]"
-        mode_color = (255, 100, 100) if self.raw_input_mode else (100, 150, 255)
+        mode_color = UI_COLORS["danger"] if self.raw_input_mode else UI_COLORS["accent"]
         m_surf = self.font.render(mode_text, True, mode_color)
         screen.blit(m_surf, (self.rect.right - m_surf.get_width() - 20, footer_y))
 
         if not self.raw_input_mode:
             cursor = "_" if (self.focused and time.time() % 1 > 0.5) else ""
             prompt = "> " + self.input_buffer + cursor
-            ps = self.font.render(prompt, True, (0, 255, 200))
+            ps = self.font.render(prompt, True, UI_COLORS["terminal_text"])
             screen.blit(ps, (self.rect.x + 12, footer_y))
 
     def upload_file(self, filepath):
@@ -1011,8 +1119,12 @@ class IntegratedTerminal:
                 return match.group(1).replace("\\", "/")
         return None
 
-    def _run_local_command(self, cmd, cwd):
+    def _run_local_command(self, cmd, cwd, env=None):
         self.log(f"[*] Running: {' '.join(cmd)}")
+        run_env = None
+        if env:
+            run_env = os.environ.copy()
+            run_env.update(env)
         try:
             process = subprocess.Popen(
                 cmd,
@@ -1021,6 +1133,7 @@ class IntegratedTerminal:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=run_env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"missing build tool: {exc.filename}") from exc
@@ -1034,6 +1147,119 @@ class IntegratedTerminal:
         return_code = process.wait()
         if return_code != 0:
             raise RuntimeError(f"command failed with exit code {return_code}: {' '.join(cmd)}")
+
+    def _default_appx_publisher(self):
+        return os.environ.get(APPX_PUBLISHER_ENV, "C=SE, O=Cybertwip, CN=Cybertwip, E=greentwip@gmail.com")
+
+    def _default_appx_signing_pfx(self):
+        candidates = [
+            os.environ.get(APPX_SIGNING_PFX_ENV, "").strip(),
+            DEFAULT_APPX_SIGNING_PFX,
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def _default_appx_signing_password(self, pfx_path):
+        env_password = os.environ.get(APPX_SIGNING_PASSWORD_ENV, "")
+        if env_password:
+            return env_password
+
+        if not pfx_path:
+            return None
+
+        pass_candidates = [
+            pfx_path + ".password",
+            pfx_path + ".pass",
+            os.path.splitext(pfx_path)[0] + ".password",
+            os.path.splitext(pfx_path)[0] + ".pass",
+        ]
+        for candidate in pass_candidates:
+            if not os.path.isfile(candidate):
+                continue
+            with open(candidate, "r", encoding="utf-8") as password_file:
+                password = password_file.read().strip()
+            if password:
+                return password
+        return None
+
+    def appx_signing_summary(self):
+        pfx_path = self._default_appx_signing_pfx()
+        if not pfx_path:
+            return "Signing unavailable", UI_COLORS["danger"]
+
+        password = self._default_appx_signing_password(pfx_path)
+        if password:
+            return f"Signing {os.path.basename(pfx_path)}", UI_COLORS["success"]
+        return f"Signing {os.path.basename(pfx_path)}", UI_COLORS["warning"]
+
+    def _find_openssl_binary(self):
+        candidates = [
+            os.environ.get("OPENSSL", "").strip(),
+            shutil.which("openssl"),
+            "/opt/homebrew/opt/openssl@3/bin/openssl",
+            "/usr/local/opt/openssl@3/bin/openssl",
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        return shutil.which("openssl")
+
+    def _prepare_appx_signing_pfx(self, require_signing=True):
+        pfx_path = self._default_appx_signing_pfx()
+        if not pfx_path:
+            if require_signing:
+                raise RuntimeError(
+                    "no signing certificate found; set "
+                    f"{APPX_SIGNING_PFX_ENV} or add {DEFAULT_APPX_SIGNING_PFX}"
+                )
+            return None, None
+
+        password = self._default_appx_signing_password(pfx_path)
+        if not password:
+            return pfx_path, None
+
+        openssl = self._find_openssl_binary()
+        if not openssl:
+            raise RuntimeError(
+                f"{APPX_SIGNING_PASSWORD_ENV} is set, but openssl was not found to normalize the password-protected PFX"
+            )
+
+        temp_dir = tempfile.mkdtemp(prefix="xbax-appx-sign-")
+        pem_path = os.path.join(temp_dir, "signing.pem")
+        normalized_pfx = os.path.join(temp_dir, "signing-empty-password.pfx")
+
+        self.log(f"[*] Normalizing signing bundle {os.path.basename(pfx_path)} for appx-util...")
+        self._run_local_command(
+            [
+                openssl,
+                "pkcs12",
+                "-in",
+                pfx_path,
+                "-passin",
+                f"pass:{password}",
+                "-nodes",
+                "-out",
+                pem_path,
+            ],
+            REPO_ROOT,
+        )
+        self._run_local_command(
+            [
+                openssl,
+                "pkcs12",
+                "-export",
+                "-in",
+                pem_path,
+                "-out",
+                normalized_pfx,
+                "-passout",
+                "pass:",
+            ],
+            REPO_ROOT,
+        )
+        return normalized_pfx, temp_dir
 
     def _sanitize_package_token(self, value, fallback="HelloWin"):
         token = re.sub(r"[^A-Za-z0-9]+", "", value or "")
@@ -1108,7 +1334,7 @@ class IntegratedTerminal:
     
     def _normalize_manifest_text(self, manifest_text, exe_rel_path):
         exe_name = os.path.splitext(os.path.basename(exe_rel_path))[0]
-        publisher = "C=SE, O=Cybertwip, CN=Cybertwip, E=greentwip@gmail.com"
+        publisher = self._default_appx_publisher()
 
         manifest_text = manifest_text.lstrip("\ufeff").replace("$targetnametoken$", exe_name)
 
@@ -1153,7 +1379,7 @@ class IntegratedTerminal:
             .replace('"', "&quot;")
         )
         version = self._default_appx_version()
-        publisher = "C=SE, O=Cybertwip, CN=Cybertwip, E=greentwip@gmail.com"
+        publisher = self._default_appx_publisher()
 
         return f"""<?xml version="1.0" encoding="utf-8"?>
     <Package IgnorableNamespaces="uap uap10 rescap"
@@ -1274,20 +1500,26 @@ class IntegratedTerminal:
             raise RuntimeError(f"appx-util build did not produce {APPX_UTIL_BINARY}")
         return APPX_UTIL_BINARY
 
-    def _package_directory_to_appx(self, source_dir, output_path):
+    def _package_directory_to_appx(self, source_dir, output_path, require_signing=True):
         source_dir = os.path.abspath(source_dir)
         output_path = os.path.abspath(output_path)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         appx_tool = self._ensure_appx_tool()
         stage_dir = None
+        signing_temp_dir = None
         packaged = False
         try:
             stage_dir = self._prepare_appx_staging(source_dir)
+            signing_pfx, signing_temp_dir = self._prepare_appx_signing_pfx(require_signing=require_signing)
             if os.path.exists(output_path):
                 os.remove(output_path)
             self.log(f"[*] Packing {source_dir} into {output_path}...")
-            self._run_local_command([appx_tool, "-o", output_path, stage_dir], REPO_ROOT)
+            command = [appx_tool, "-o", output_path]
+            if signing_pfx:
+                command.extend(["-c", signing_pfx])
+            command.append(stage_dir)
+            self._run_local_command(command, REPO_ROOT)
             if not os.path.isfile(output_path):
                 raise RuntimeError(f"appx output was not created: {output_path}")
             packaged = True
@@ -1297,6 +1529,8 @@ class IntegratedTerminal:
                 shutil.rmtree(stage_dir, ignore_errors=True)
             elif stage_dir and not packaged:
                 self.log(f"[*] Appx staging folder kept at {stage_dir}")
+            if signing_temp_dir:
+                shutil.rmtree(signing_temp_dir, ignore_errors=True)
 
     def _device_portal_auth_candidates(self, ip):
         username, password = fetch_dev_credentials(ip)
@@ -1492,7 +1726,7 @@ class IntegratedTerminal:
             source_dir = os.path.abspath(source_dir)
             output_dir = os.path.abspath(output_dir)
             output_path = os.path.join(output_dir, self._default_appx_name(source_dir))
-            packaged_path = self._package_directory_to_appx(source_dir, output_path)
+            packaged_path = self._package_directory_to_appx(source_dir, output_path, require_signing=True)
             self.log(f"[+] Package complete: {packaged_path}")
         except Exception as exc:
             self.log(f"[-] Package failed: {exc}")
@@ -1510,13 +1744,289 @@ class IntegratedTerminal:
         temp_output_dir = None
         try:
             source_dir = os.path.abspath(source_dir)
-            temp_output_dir = tempfile.mkdtemp(prefix="xbax-appx-output-")
-            appx_path = os.path.join(temp_output_dir, self._default_appx_name(source_dir))
-            packaged_path = self._package_directory_to_appx(source_dir, appx_path)
-            self.log(f"[*] Deploying {os.path.basename(packaged_path)} to {ip}...")
-            self._deploy_appx_to_console(ip, packaged_path)
+            packaged_build = self._find_packaged_build(source_dir)
+            if packaged_build:
+                self.log(f"[*] Deploying packaged build {os.path.basename(packaged_build)} to {ip}...")
+                self._deploy_packaged_build_to_console(ip, packaged_build)
+            else:
+                temp_output_dir = tempfile.mkdtemp(prefix="xbax-appx-output-")
+                appx_path = os.path.join(temp_output_dir, self._default_appx_name(source_dir))
+                packaged_path = self._package_directory_to_appx(source_dir, appx_path, require_signing=True)
+                self.log(f"[*] Deploying {os.path.basename(packaged_path)} to {ip}...")
+                self._deploy_appx_to_console(ip, packaged_path)
         except Exception as exc:
             self.log(f"[-] Deploy failed: {exc}")
+        finally:
+            if temp_output_dir:
+                shutil.rmtree(temp_output_dir, ignore_errors=True)
+            self.package_busy = False
+            self._mark_dirty()
+
+    def _local_build_jobs(self):
+        return str(max(4, min(8, os.cpu_count() or 4)))
+
+    def _ensure_root_build_targets(self, targets, build_label=None):
+        self.log("[*] Configuring the local xbax build graph...")
+        self._run_local_command(["cmake", "-S", REPO_ROOT, "-B", BUILD_DIR], REPO_ROOT)
+        if build_label:
+            self.log(build_label)
+        self._run_local_command(
+            ["cmake", "--build", BUILD_DIR, "--target", *targets, f"-j{self._local_build_jobs()}"],
+            REPO_ROOT,
+        )
+
+    def _triangle_cpp_package_source_dir(self):
+        if not os.path.isfile(TRIANGLE_CPP_OUTPUT):
+            raise RuntimeError(f"TriangleCpp build output not found: {TRIANGLE_CPP_OUTPUT}")
+        if os.path.isdir(TRIANGLE_CPP_APP_DIR):
+            shutil.rmtree(TRIANGLE_CPP_APP_DIR, ignore_errors=True)
+        shutil.copytree(TRIANGLE_CPP_OUTPUT_DIR, TRIANGLE_CPP_APP_DIR, dirs_exist_ok=True)
+        return TRIANGLE_CPP_APP_DIR
+
+    def _triangle_cpp_deploy_artifact(self):
+        candidate_roots = [
+            TRIANGLE_CPP_SOURCE_DIR,
+            os.path.dirname(TRIANGLE_CPP_SOURCE_DIR),
+            os.path.dirname(DEFAULT_GAMEOS_XVD),
+        ]
+        seen = set()
+        for root in candidate_roots:
+            root = os.path.abspath(root)
+            if root in seen:
+                continue
+            seen.add(root)
+            package_path = self._find_packaged_build(root)
+            if package_path:
+                return package_path
+        return None
+
+    def _find_packaged_build(self, source_path):
+        source_path = os.path.abspath(source_path)
+        if os.path.isfile(source_path):
+            lowered = os.path.basename(source_path).lower()
+            if lowered == "gameos.xvd" or lowered.endswith(".xvd") or lowered.endswith(".xvc"):
+                return source_path
+            return None
+        if not os.path.isdir(source_path):
+            return None
+
+        direct_candidate = os.path.join(source_path, "gameos.xvd")
+        if os.path.isfile(direct_candidate):
+            return direct_candidate
+
+        matches = []
+        for root, _, filenames in os.walk(source_path):
+            filenames.sort()
+            for filename in filenames:
+                lowered = filename.lower()
+                if lowered == "gameos.xvd" or lowered.endswith(".xvd") or lowered.endswith(".xvc"):
+                    matches.append(os.path.join(root, filename))
+        return matches[0] if matches else None
+
+    def _ensure_remote_cleng_bundle(self, force=False):
+        local_cleng_dir = os.path.join(LOCAL_PACKAGE_DIR, "cleng")
+        local_cleng_binary = os.path.join(local_cleng_dir, "bin", "cleng.exe")
+        if not os.path.isfile(local_cleng_binary):
+            self._ensure_root_build_targets(
+                ["cleng"],
+                build_label="[*] Building the packaged cleng toolchain for the remote worker...",
+            )
+
+        remote_cleng_binary = REMOTE_INSTALL_DIR.rstrip("/") + "/cleng/bin/cleng.exe"
+        if not force:
+            sftp = self.ssh_client.open_sftp()
+            try:
+                try:
+                    sftp.stat(remote_cleng_binary)
+                    return
+                except IOError:
+                    pass
+            finally:
+                sftp.close()
+
+        files, _, skipped_unsafe = self._collect_local_package_files(local_cleng_dir)
+        if skipped_unsafe:
+            self.log(
+                f"[*] Skipping {len(skipped_unsafe)} Windows-incompatible cleng file(s) "
+                f"(first: {skipped_unsafe[0]})"
+            )
+
+        bundle_path = self._create_zip_archive(files)
+        bundle_size = os.path.getsize(bundle_path)
+        remote_bundle_dir = self._remote_bootstrap_dir(REMOTE_INSTALL_DIR)
+        remote_bundle_path = remote_bundle_dir.rstrip("/") + "/cleng-repair.zip"
+        remote_cleng_dir = REMOTE_INSTALL_DIR.rstrip("/") + "/cleng"
+
+        try:
+            self.log(
+                f"[*] Remote cleng bundle is missing; uploading a compressed repair bundle "
+                f"({self._format_size(bundle_size)})..."
+            )
+            sftp = self.ssh_client.open_sftp()
+            try:
+                self._remote_mkdirs(sftp, remote_bundle_dir)
+                sftp.put(bundle_path, remote_bundle_path)
+            finally:
+                sftp.close()
+
+            remote_anzipper = self._ensure_remote_anzipper(REMOTE_INSTALL_DIR).replace("/", "\\")
+            remote_bundle_windows = remote_bundle_path.replace("/", "\\")
+            remote_cleng_windows = remote_cleng_dir.replace("/", "\\")
+            command = (
+                f"{self._cmd_quote(remote_anzipper)} "
+                f"-zip {self._cmd_quote(remote_bundle_windows)} "
+                f"-out {self._cmd_quote(remote_cleng_windows)} "
+                f"&& del /Q {self._cmd_quote(remote_bundle_windows)}"
+            )
+            exit_status, output, error = self._run_remote_command(command)
+            if exit_status != 0:
+                raise RuntimeError((error or output or "cleng repair extraction failed").strip())
+            if output.strip():
+                self.log(f"[*] {output.strip()}")
+        finally:
+            try:
+                os.remove(bundle_path)
+            except OSError:
+                pass
+
+    def _build_triangle_cpp_impl(self):
+        if not os.path.isdir(TRIANGLE_CPP_SOURCE_DIR):
+            raise RuntimeError(f"TriangleC++ source directory not found: {TRIANGLE_CPP_SOURCE_DIR}")
+
+        self._ensure_root_build_targets(
+            ["host-tools"],
+            build_label="[*] Building host-side distributed compilation tools...",
+        )
+
+        try:
+            self._ensure_remote_sarver_installed()
+        except RuntimeError:
+            self.log("[*] Remote build worker is missing; running Install first...")
+            self.install_package()
+            self._ensure_remote_sarver_installed()
+
+        self._ensure_remote_cleng_bundle()
+
+        if self.is_bs_running():
+            self.log("[*] Restarting BS for TriangleCpp...")
+            self.stop_bs()
+        self.start_bs()
+        if not self.is_bs_running():
+            raise RuntimeError("BS relay did not start successfully")
+
+        relay_url = self.bs_relay_url or f"http://{get_local_ip()}:{BS_RELAY_PORT}"
+        cliant_path = self._ensure_local_cliant()
+        os.makedirs(TRIANGLE_CPP_OUTPUT_DIR, exist_ok=True)
+
+        self.log(f"[*] Building TriangleCpp.exe through {relay_url}...")
+        cmake_build_command = [
+            cliant_path,
+            relay_url,
+            "cmake-build",
+            TRIANGLE_CPP_SOURCE_DIR,
+            "-goos",
+            "windows",
+            "-goarch",
+            "amd64",
+            "-target",
+            TRIANGLE_CPP_TARGET,
+            "-build-dir",
+            TRIANGLE_CPP_BUILD_DIR,
+            "-o",
+            TRIANGLE_CPP_OUTPUT,
+        ]
+        direct_build_command = [
+            cliant_path,
+            relay_url,
+            "build",
+            TRIANGLE_CPP_SOURCE_DIR,
+            "-goos",
+            "windows",
+            "-goarch",
+            "amd64",
+            "-lang",
+            "cpp",
+            "-src",
+            "TriangleApp.cpp",
+            "-o",
+            TRIANGLE_CPP_OUTPUT,
+            "--",
+            "-std=c++20",
+            "-DUNICODE",
+            "-D_UNICODE",
+            "-DWIN32_LEAN_AND_MEAN",
+            "-DNOMINMAX",
+            "-municode",
+        ]
+
+        try:
+            self._run_local_command(cmake_build_command, REPO_ROOT)
+        except RuntimeError as exc:
+            self.log(f"[*] cliant cmake-build failed; falling back to direct cleng replay: {exc}")
+            if os.path.exists(TRIANGLE_CPP_OUTPUT):
+                os.remove(TRIANGLE_CPP_OUTPUT)
+            try:
+                self._run_local_command(direct_build_command, REPO_ROOT)
+            except RuntimeError as direct_exc:
+                self.log(f"[*] Direct cleng replay failed; refreshing the remote cleng bundle and retrying once: {direct_exc}")
+                self._ensure_remote_cleng_bundle(force=True)
+                self._run_local_command(direct_build_command, REPO_ROOT)
+
+        if not os.path.isfile(TRIANGLE_CPP_OUTPUT):
+            raise RuntimeError(f"TriangleCpp.exe was not produced at {TRIANGLE_CPP_OUTPUT}")
+
+        self.log(f"[+] TriangleCpp ready: {TRIANGLE_CPP_OUTPUT}")
+        return TRIANGLE_CPP_OUTPUT
+
+    def build_triangle_cpp(self):
+        if self.package_busy:
+            self.log("[-] Another package or build job is already running.")
+            return
+        if not self.has_active_ssh():
+            self.log("[-] Connect Dev Shell first to build TriangleCpp.")
+            return
+
+        self.package_busy = True
+        self._mark_dirty()
+        try:
+            self._build_triangle_cpp_impl()
+        except Exception as exc:
+            self.log(f"[-] TriangleCpp build failed: {exc}")
+        finally:
+            self.package_busy = False
+            self._mark_dirty()
+
+    def run_triangle_cpp_pipeline(self, ip):
+        if self.package_busy:
+            self.log("[-] Another package or build job is already running.")
+            return
+        if not self.has_active_ssh():
+            self.log("[-] Connect Dev Shell first to run the TriangleCpp pipeline.")
+            return
+
+        self.package_busy = True
+        self._mark_dirty()
+        temp_output_dir = None
+        try:
+            self.log("[*] Starting the TriangleCpp build + deploy pipeline...")
+            self._build_triangle_cpp_impl()
+            packaged_build = self._triangle_cpp_deploy_artifact()
+            if packaged_build:
+                self.log(
+                    f"[*] TriangleCpp built successfully. Deploying packaged build "
+                    f"{os.path.basename(packaged_build)} via wdApp install..."
+                )
+                self._deploy_packaged_build_to_console(ip, packaged_build)
+            else:
+                package_source_dir = self._triangle_cpp_package_source_dir()
+                temp_output_dir = tempfile.mkdtemp(prefix="xbax-trianglecpp-appx-")
+                appx_path = os.path.join(temp_output_dir, self._default_appx_name(package_source_dir))
+                packaged_path = self._package_directory_to_appx(package_source_dir, appx_path, require_signing=True)
+                self.log(f"[*] Deploying {os.path.basename(packaged_path)} to {ip}...")
+                self._deploy_appx_to_console(ip, packaged_path)
+            self.log("[+] TriangleCpp pipeline complete.")
+        except Exception as exc:
+            self.log(f"[-] TriangleCpp pipeline failed: {exc}")
         finally:
             if temp_output_dir:
                 shutil.rmtree(temp_output_dir, ignore_errors=True)
@@ -1568,6 +2078,61 @@ class IntegratedTerminal:
 
     def _remote_bundle_path(self, remote_dir):
         return self._remote_bootstrap_dir(remote_dir).rstrip("/") + "/" + REMOTE_INSTALL_BUNDLE
+
+    def _upload_remote_file(self, local_path, remote_dir):
+        local_path = os.path.abspath(local_path)
+        if not os.path.isfile(local_path):
+            raise RuntimeError(f"local file not found: {local_path}")
+
+        remote_dir = remote_dir.replace("\\", "/").rstrip("/")
+        remote_path = remote_dir + "/" + os.path.basename(local_path)
+        local_stat = os.stat(local_path)
+        sftp = self.ssh_client.open_sftp()
+        try:
+            self._remote_mkdirs(sftp, remote_dir)
+            remote_stat = self._remote_path_exists(sftp, remote_path)
+            if (
+                remote_stat is not None
+                and int(remote_stat.st_size) == int(local_stat.st_size)
+                and int(remote_stat.st_mtime) >= int(local_stat.st_mtime)
+            ):
+                self.log(f"[*] Remote file already current: {remote_path}")
+                return remote_path
+
+            self.log(
+                f"[*] Uploading {os.path.basename(local_path)} to {remote_dir} "
+                f"({self._format_size(local_stat.st_size)})..."
+            )
+            sftp.put(local_path, remote_path)
+            try:
+                sftp.utime(remote_path, (int(local_stat.st_atime), int(local_stat.st_mtime)))
+            except Exception:
+                pass
+            return remote_path
+        finally:
+            sftp.close()
+
+    def _deploy_packaged_build_to_console(self, ip, package_path, drive=DEFAULT_WDAPP_DRIVE):
+        package_path = os.path.abspath(package_path)
+        if not os.path.isfile(package_path):
+            raise RuntimeError(f"packaged build not found: {package_path}")
+
+        remote_package_path = self._upload_remote_file(package_path, REMOTE_PACKAGE_STAGING_DIR)
+        wdapp_path = REMOTE_WDAPP_PATH.replace("/", "\\")
+        remote_package_windows = remote_package_path.replace("/", "\\")
+        command = f"cmd /c {wdapp_path} install {remote_package_windows} /drive={drive}"
+        self.log(
+            f"[*] Installing packaged build {os.path.basename(package_path)} "
+            f"on {ip} with wdApp (/drive={drive})..."
+        )
+        exit_status, output, error = self._run_remote_command(command)
+        combined = "\n".join(part.strip() for part in (output, error) if part and part.strip())
+        if exit_status != 0:
+            raise RuntimeError(combined or f"wdApp install failed with exit code {exit_status}")
+        for line in combined.splitlines():
+            line = line.strip()
+            if line:
+                self.log(f"[*] {line}")
 
     def _is_windows_safe_relpath(self, rel_path):
         invalid_chars = set('<>:"|?*')
@@ -1672,6 +2237,21 @@ class IntegratedTerminal:
                 pass
             raise
 
+    def _create_zip_archive(self, bundle_files):
+        fd, bundle_path = tempfile.mkstemp(prefix="xbax-bundle-", suffix=".zip")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for local_path, rel_path in bundle_files:
+                    archive.write(local_path, arcname=rel_path)
+            return bundle_path
+        except Exception:
+            try:
+                os.remove(bundle_path)
+            except OSError:
+                pass
+            raise
+
     def _format_size(self, size_bytes):
         if size_bytes < 1024:
             return f"{size_bytes} B"
@@ -1685,6 +2265,30 @@ class IntegratedTerminal:
         error = stderr.read().decode("utf-8", errors="ignore")
         exit_status = stdout.channel.recv_exit_status()
         return exit_status, output, error
+
+    def _stop_remote_process(self, pattern):
+        pattern = (pattern or "").strip()
+        if not pattern or not self.has_active_ssh():
+            return
+
+        patterns = [pattern]
+        if pattern.lower() == "sarver.exe":
+            patterns = ["sarver.*", "sarver.exe", "sarver.tmp.exe", "sarver-copy.exe"]
+
+        kill_path = REMOTE_KILL_TOOL.replace("/", "\\")
+        taskkill_path = r"C:\Windows\system32\taskkill.exe"
+        for candidate in patterns:
+            command = (
+                f'cmd /c if exist {self._cmd_quote(kill_path)} '
+                f'({self._cmd_quote(kill_path)} -f {self._cmd_quote(candidate)} >NUL 2>&1) '
+                f'else (if exist {self._cmd_quote(taskkill_path)} '
+                f'({self._cmd_quote(taskkill_path)} /F /IM {self._cmd_quote(candidate)} /T >NUL 2>&1) '
+                f'else (exit /b 0))'
+            )
+            try:
+                self._run_remote_command(command)
+            except Exception:
+                pass
 
     def _powershell_quote(self, value):
         return value.replace("'", "''")
@@ -1758,6 +2362,7 @@ class IntegratedTerminal:
     def _wipe_remote_install_dir(self, remote_dir):
         remote_dir_windows = remote_dir.replace("/", "\\")
         remote_cleener = self._ensure_remote_cleener(remote_dir).replace("/", "\\")
+        self._stop_remote_process("sarver.exe")
         self.log("[*] Removing existing remote Xbax folder with cleener.exe...")
         command = (
             f'cmd /c if exist {self._cmd_quote(remote_dir_windows)} '
@@ -1899,10 +2504,16 @@ class IntegratedTerminal:
         self.installing = True
         self._mark_dirty()
         try:
-            self.log("[*] Configuring Xbax package build...")
-            self._run_local_command(["cmake", "-S", REPO_ROOT, "-B", BUILD_DIR], REPO_ROOT)
-            self.log("[*] Building Xbax package artifacts and host cliant...")
-            self._run_local_command(["cmake", "--build", BUILD_DIR, "--target", "package-xbax", "host-cliant", "-j4"], REPO_ROOT)
+            if self.is_bs_running():
+                self.log("[*] Stopping the BS relay before reinstalling the remote toolchain...")
+                self.stop_bs()
+            else:
+                self._stop_remote_process("sarver.exe")
+
+            self._ensure_root_build_targets(
+                ["package-xbax", "host-tools"],
+                build_label="[*] Building Xbax package artifacts plus host cleng/cliant/led...",
+            )
 
             if not os.path.isdir(LOCAL_PACKAGE_DIR):
                 raise RuntimeError(f"package directory not found: {LOCAL_PACKAGE_DIR}")
@@ -2198,43 +2809,73 @@ def connect_ssh(ip, pin, terminal, save_on_success=False):
 
 # ================== MENU ==================
 def run_menu(screen, clock):
-    font_big   = pygame.font.SysFont(None, 64)
-    font_small = pygame.font.SysFont(None, 24)
+    global MENU_SIZE
+    font_big = ui_font(56, bold=True)
+    font_small = ui_font(20)
+    font_label = ui_font(16, bold=True)
     consoles = []
     scanning = True
+    backdrop = build_backdrop(MENU_SIZE)
 
     def done():
         nonlocal scanning
         scanning = False
 
     threading.Thread(target=scan_network_async, args=(consoles, done), daemon=True).start()
-    refresh_btn = Button(MENU_SIZE[0]//2 - 150, MENU_SIZE[1] - 110, 300, 55, "Refresh Network")
+    refresh_btn = Button(MENU_SIZE[0]//2 - 130, MENU_SIZE[1] - 96, 260, 48, "Refresh Discovery", (63, 126, 214), (86, 155, 245))
 
     running = True
     while running:
-        screen.fill((28, 28, 35))
-        title = font_big.render("Xbox Devkit Launcher", True, (255, 255, 255))
-        screen.blit(title, (MENU_SIZE[0]//2 - title.get_width()//2, 60))
+        cur_size = screen.get_size()
+        if cur_size != MENU_SIZE:
+            MENU_SIZE = cur_size
+            backdrop = build_backdrop(MENU_SIZE)
+            refresh_btn.rect.x = MENU_SIZE[0]//2 - refresh_btn.rect.w//2
+            refresh_btn.rect.y = MENU_SIZE[1] - 96
+
+        screen.blit(backdrop, (0, 0))
+
+        hero_rect = pygame.Rect(22, 22, MENU_SIZE[0] - 44, min(240, MENU_SIZE[1] - 160))
+        draw_panel(screen, hero_rect, UI_COLORS["panel"], UI_COLORS["panel_border"], radius=24)
+
+        title = font_big.render("Xbox Devkit Launcher", True, UI_COLORS["text"])
+        screen.blit(title, (hero_rect.x + 28, hero_rect.y + 28))
+        subtitle = font_small.render(
+            "Discover devkits, attach the Dev Shell, and drive the build/package/deploy loop from one place.",
+            True,
+            UI_COLORS["muted"],
+        )
+        screen.blit(subtitle, (hero_rect.x + 30, hero_rect.y + 94))
+
+        status_text = "Scanning the local network for Dev Mode consoles..." if scanning else f"{len(consoles)} console(s) discovered"
+        status_color = UI_COLORS["warning"] if scanning else (UI_COLORS["success"] if consoles else UI_COLORS["danger"])
+        draw_status_chip(screen, hero_rect.x + 30, hero_rect.y + 132, status_text, status_color)
+
+        list_rect = pygame.Rect(22, hero_rect.bottom + 16, MENU_SIZE[0] - 44, MENU_SIZE[1] - hero_rect.bottom - 130)
+        draw_panel(screen, list_rect, UI_COLORS["panel_alt"], UI_COLORS["panel_border"], radius=22)
+        screen.blit(font_label.render("Available Consoles", True, UI_COLORS["text"]), (list_rect.x + 20, list_rect.y + 18))
 
         if scanning:
-            txt = font_small.render("Scanning network for Dev Mode consoles...", True, (255, 220, 60))
-            screen.blit(txt, (MENU_SIZE[0]//2 - txt.get_width()//2, 180))
+            txt = font_small.render("Waiting for Dev Mode consoles to answer on port 11443...", True, UI_COLORS["muted"])
+            screen.blit(txt, (list_rect.x + 20, list_rect.y + 56))
         else:
             if not consoles:
-                txt = font_small.render("No consoles found. Make sure Dev Mode is enabled.", True, (255, 80, 80))
-                screen.blit(txt, (MENU_SIZE[0]//2 - txt.get_width()//2, 180))
+                txt = font_small.render("No consoles found yet. Confirm Dev Mode is enabled and the kit is on the same LAN.", True, UI_COLORS["danger"])
+                screen.blit(txt, (list_rect.x + 20, list_rect.y + 56))
             else:
-                txt = font_small.render("Select your Xbox:", True, (100, 255, 100))
-                screen.blit(txt, (MENU_SIZE[0]//2 - txt.get_width()//2, 160))
+                txt = font_small.render("Select a console to open the live control room.", True, UI_COLORS["muted"])
+                screen.blit(txt, (list_rect.x + 20, list_rect.y + 56))
                 for i, (ip, name) in enumerate(consoles):
-                    btn = Button(MENU_SIZE[0]//2 - 220, 220 + i*65, 440, 58,
-                                 f"{name}   ({ip})", (40, 160, 70), (70, 210, 100))
+                    btn = Button(list_rect.x + 20, list_rect.y + 94 + i*64, list_rect.width - 40, 52,
+                                 f"{name}   ({ip})", (39, 139, 101), (58, 170, 122))
                     btn.draw(screen)
 
         refresh_btn.draw(screen)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT: return None
+            if event.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if not scanning:
                     if refresh_btn.clicked(pygame.mouse.get_pos()):
@@ -2242,8 +2883,8 @@ def run_menu(screen, clock):
                         threading.Thread(target=scan_network_async, args=(consoles, done), daemon=True).start()
                     else:
                         for i, (ip, name) in enumerate(consoles):
-                            btn = Button(MENU_SIZE[0]//2 - 220, 220 + i*65, 440, 58,
-                                         f"{name}   ({ip})", (40, 160, 70), (70, 210, 100))
+                            btn = Button(list_rect.x + 20, list_rect.y + 94 + i*64, list_rect.width - 40, 52,
+                                         f"{name}   ({ip})", (39, 139, 101), (58, 170, 122))
                             if btn.clicked(pygame.mouse.get_pos()): return ip
 
         pygame.display.flip()
@@ -2265,12 +2906,13 @@ def run_stream(screen, clock, ip):
         video.stop(); mode = "IMG"; video = IMGVideoStream(ip).start()
 
     # Buttons auto-size their width from text at construction
-    shell_btn     = Button(0, 18, 0, 52, "Connect Dev Shell",    (0, 120, 215), (0, 160, 255))
-    install_btn   = Button(0, 18, 0, 52, "Install",              (35, 145, 85), (55, 185, 110))
-    package_btn   = Button(0, 18, 0, 52, "Package",              (70, 105, 170), (95, 135, 210))
-    deploy_btn    = Button(0, 18, 0, 52, "Deploy",               (150, 55, 60),  (195, 80, 90))
-    bs_btn        = Button(0, 18, 0, 52, "Start BS",             (170, 95, 25), (205, 125, 40))
-    full_term_btn = Button(0, 18, 0, 52, "Toggle Full Terminal", (60, 60, 80),  (90, 90, 110))
+    shell_btn     = Button(0, 18, 0, 46, "Connect Dev Shell",    (39, 119, 184), (58, 149, 220))
+    install_btn   = Button(0, 18, 0, 46, "Install",              (44, 144, 101), (62, 177, 122))
+    pipeline_btn  = Button(0, 18, 0, 46, "TriangleC++ Pipeline", (76, 99, 189),  (103, 129, 230))
+    package_btn   = Button(0, 18, 0, 46, "Package",              (59, 89, 133),  (82, 115, 169))
+    deploy_btn    = Button(0, 18, 0, 46, "Deploy",               (166, 73, 81),  (198, 92, 102))
+    bs_btn        = Button(0, 18, 0, 46, "Start BS",             (168, 111, 42), (204, 139, 57))
+    full_term_btn = Button(0, 18, 0, 46, "Toggle Full Terminal", (57, 70, 89),   (80, 95, 116))
 
     terminal_height = DEFAULT_TERMINAL_HEIGHT
     terminal = IntegratedTerminal(0, STREAM_SIZE[1] - terminal_height, STREAM_SIZE[0], terminal_height)
@@ -2289,12 +2931,34 @@ def run_stream(screen, clock, ip):
 
     dim_surf = pygame.Surface(STREAM_SIZE, pygame.SRCALPHA)
     dim_surf.fill((0, 0, 0, 120))
+    backdrop = build_backdrop(STREAM_SIZE)
 
     # Pre-build overlay fonts (avoids SysFont calls every frame)
-    pin_font        = pygame.font.SysFont("consolas", 20)
-    reboot_title_f  = pygame.font.SysFont("consolas", 19, bold=True)
-    reboot_sub_f    = pygame.font.SysFont("consolas", 17)
-    header_font     = pygame.font.SysFont("consolas", 26, bold=True)
+    pin_font        = ui_font(20, monospace=True)
+    reboot_title_f  = ui_font(19, bold=True)
+    reboot_sub_f    = ui_font(17)
+    header_font     = ui_font(30, bold=True)
+    subheader_font  = ui_font(16)
+
+    def layout_header_buttons():
+        primary = [shell_btn, install_btn, pipeline_btn]
+        secondary = [package_btn, deploy_btn, bs_btn, full_term_btn]
+
+        def position_row(buttons, y, right_margin=18, gap=8):
+            x = STREAM_SIZE[0] - right_margin
+            for button in reversed(buttons):
+                x -= button.rect.w
+                button.rect.x = x
+                button.rect.y = y
+                x -= gap
+
+        full_row = primary + secondary
+        total_width = sum(button.rect.w for button in full_row) + 8 * (len(full_row) - 1)
+        if total_width < STREAM_SIZE[0] - 260:
+            position_row(full_row, 20)
+        else:
+            position_row(secondary, 18)
+            position_row(primary, 68)
 
     def layout_panels():
         nonlocal vid_rect, target_size, separator_rect, terminal_height, active_vid_rect
@@ -2322,16 +2986,10 @@ def run_stream(screen, clock, ip):
             STREAM_SIZE = cur_size
             dim_surf = pygame.Surface(STREAM_SIZE, pygame.SRCALPHA)
             dim_surf.fill((0, 0, 0, 120))
+            backdrop = build_backdrop(STREAM_SIZE)
 
             layout_panels()
-
-            # Right-align buttons — guaranteed no overlap
-            full_term_btn.rect.x = STREAM_SIZE[0] - full_term_btn.rect.w - 12
-            bs_btn.rect.x        = full_term_btn.rect.x - bs_btn.rect.w - 10
-            deploy_btn.rect.x    = bs_btn.rect.x - deploy_btn.rect.w - 10
-            package_btn.rect.x   = deploy_btn.rect.x - package_btn.rect.w - 10
-            install_btn.rect.x   = package_btn.rect.x - install_btn.rect.w - 10
-            shell_btn.rect.x     = install_btn.rect.x - shell_btn.rect.w - 10
+            layout_header_buttons()
 
             terminal._mark_dirty()
             force_resize = False
@@ -2341,11 +2999,15 @@ def run_stream(screen, clock, ip):
             prompting_pin = True; pin_buffer = ""
             terminal.needs_pin_prompt = False
 
+        shell_btn.enabled = not terminal.connected and not terminal.installing and not terminal.package_busy
         install_btn.enabled = terminal.can_install()
+        pipeline_btn.enabled = terminal.can_triangle_pipeline()
         package_btn.enabled = terminal.can_package_appx()
         deploy_btn.enabled = terminal.can_deploy_appx()
         bs_btn.enabled = terminal.can_toggle_bs()
         bs_btn.text = "Stop BS" if terminal.is_bs_running() else "Start BS"
+
+        screen.blit(backdrop, (0, 0))
 
         # ── Video ────────────────────────────────────────────────────────
         if not terminal.fullscreen_mode:
@@ -2369,14 +3031,30 @@ def run_stream(screen, clock, ip):
                     ox = vid_rect[0] + (target_size[0]-nw)//2
                     oy = vid_rect[1] + (target_size[1]-nh)//2
                     active_vid_rect = (ox,oy,nw,nh)
-                    pygame.draw.rect(screen, (0,0,0), vid_rect)
+                    pygame.draw.rect(screen, UI_COLORS["terminal_bg"], vid_rect, border_radius=18)
                     screen.blit(frame_surf, (ox,oy))
+                    pygame.draw.rect(screen, UI_COLORS["panel_border"], vid_rect, width=1, border_radius=18)
 
         # ── Header ───────────────────────────────────────────────────────
-        pygame.draw.rect(screen, (28,28,35), (0,0,STREAM_SIZE[0],HEADER_HEIGHT))
-        screen.blit(header_font.render(f"Xbox Devkit • {ip} • {mode} mode", True, (0,200,255)), (20,20))
+        header_rect = pygame.Rect(14, 14, STREAM_SIZE[0] - 28, HEADER_HEIGHT - 22)
+        draw_panel(screen, header_rect, UI_COLORS["panel"], UI_COLORS["panel_border"], radius=22)
+        screen.blit(header_font.render("Xbox Devkit Control Room", True, UI_COLORS["text"]), (28, 24))
+        screen.blit(subheader_font.render(f"{ip} • {mode} video transport • D:/DevelopmentFiles/Sandbox/Xbax", True, UI_COLORS["muted"]), (30, 59))
+
+        chip_x = 28
+        chip_y = 116
+        for label, color in (
+            ("Dev Shell Ready" if terminal.has_active_ssh() else "Dev Shell Offline", UI_COLORS["success"] if terminal.has_active_ssh() else UI_COLORS["danger"]),
+            ("Relay Running" if terminal.is_bs_running() else "Relay Idle", UI_COLORS["accent"] if terminal.is_bs_running() else UI_COLORS["warning"]),
+            terminal.appx_signing_summary(),
+            ("TriangleCpp Ready" if os.path.isfile(TRIANGLE_CPP_OUTPUT) else "TriangleCpp Pending", UI_COLORS["success"] if os.path.isfile(TRIANGLE_CPP_OUTPUT) else UI_COLORS["panel_border"]),
+        ):
+            chip_rect = draw_status_chip(screen, chip_x, chip_y, label, color)
+            chip_x = chip_rect.right + 10
+
         shell_btn.draw(screen)
         install_btn.draw(screen)
+        pipeline_btn.draw(screen)
         package_btn.draw(screen)
         deploy_btn.draw(screen)
         bs_btn.draw(screen)
@@ -2502,6 +3180,8 @@ def run_stream(screen, clock, ip):
                         threading.Thread(target=auto_connect, args=(ip,), daemon=True).start()
                     elif install_btn.clicked((mx,my)):
                         threading.Thread(target=terminal.install_package, daemon=True).start()
+                    elif pipeline_btn.clicked((mx,my)):
+                        threading.Thread(target=terminal.run_triangle_cpp_pipeline, args=(ip,), daemon=True).start()
                     elif package_btn.clicked((mx,my)):
                         try:
                             source_dir = choose_directory_dialog(
@@ -2622,6 +3302,7 @@ Usage:
   main.py upload <ip> <local> [remote-dir]
                                     # SFTP-upload a single file (default dir: D:/DevelopmentFiles/Sandbox)
   main.py install <ip>              # build the Xbax package and sync it to <ip>
+  main.py trianglecpp <ip>          # install tools, start the relay, build TriangleCpp, then deploy gameos.xvd when available
   main.py reboot <ip>               # POST a reboot to <ip>:11443
   main.py -h | --help               # show this message
 """
@@ -2660,6 +3341,7 @@ class HeadlessTerminal(IntegratedTerminal):
         self.ip = None
         self.pin = None
         self.installing = False
+        self.package_busy = False
         self.bs_running = False
         self.bs_busy = False
         self.bs_stop_requested = False
@@ -2838,12 +3520,37 @@ def _cli_reboot(args):
     except Exception as exc:
         print(f"reboot failed: {exc}", file=sys.stderr); return 1
 
+def _cli_trianglecpp(args):
+    if not args:
+        print("usage: main.py trianglecpp <ip>", file=sys.stderr); return 2
+    ip = args[0]
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    term = HeadlessTerminal()
+    try:
+        term.ssh_client = ssh
+        term.connected = True
+        term.ip = ip
+        term.run_triangle_cpp_pipeline(ip)
+        return 1 if any(line.startswith("[-]") for line in term.history) else 0
+    finally:
+        try:
+            if term.is_bs_running():
+                term.stop_bs()
+        except Exception:
+            pass
+        try: ssh.close()
+        except Exception: pass
+
 CLI_COMMANDS = {
     "scan":    _cli_scan,
     "creds":   _cli_creds,
     "exec":    _cli_exec,
     "upload":  _cli_upload,
     "install": _cli_install,
+    "trianglecpp": _cli_trianglecpp,
     "reboot":  _cli_reboot,
 }
 
