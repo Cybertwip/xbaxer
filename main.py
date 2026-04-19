@@ -1105,10 +1105,44 @@ class IntegratedTerminal:
         pygame.draw.line(surface, (0, 120, 215), (0, 0), (size[0] - 1, size[1] - 1), max(2, min(size) // 22))
         pygame.draw.line(surface, (0, 120, 215), (size[0] - 1, 0), (0, size[1] - 1), max(2, min(size) // 22))
         pygame.image.save(surface, path)
-
+    
     def _normalize_manifest_text(self, manifest_text, exe_rel_path):
         exe_name = os.path.splitext(os.path.basename(exe_rel_path))[0]
-        return manifest_text.lstrip("\ufeff").replace("$targetnametoken$", exe_name)
+        publisher = "C=SE, O=Cybertwip, CN=Cybertwip, E=greentwip@gmail.com"
+
+        manifest_text = manifest_text.lstrip("\ufeff").replace("$targetnametoken$", exe_name)
+
+        manifest_text = re.sub(
+            r'Publisher="[^"]*"',
+            f'Publisher="{publisher}"',
+            manifest_text,
+            count=1,
+        )
+
+        # x-generate is being rejected at registration time, so force a concrete language.
+        manifest_text = re.sub(
+            r'<Resource\s+Language="[^"]*"\s*/>',
+            '<Resource Language="en-US" />',
+            manifest_text,
+            count=1,
+        )
+
+        # If there is no Resources block at all, inject one before Capabilities or Applications.
+        if "<Resources>" not in manifest_text:
+            manifest_text = manifest_text.replace(
+                "<Capabilities>",
+                "  <Resources>\n    <Resource Language=\"en-US\" />\n  </Resources>\n  <Capabilities>",
+                1,
+            )
+            if "<Capabilities>" not in manifest_text:
+                manifest_text = manifest_text.replace(
+                    "<Applications>",
+                    "  <Resources>\n    <Resource Language=\"en-US\" />\n  </Resources>\n  <Applications>",
+                    1,
+                )
+
+        return manifest_text
+
 
     def _generated_manifest_text(self, exe_rel_path, package_name, display_name):
         executable = exe_rel_path.replace("/", "\\")
@@ -1119,39 +1153,41 @@ class IntegratedTerminal:
             .replace('"', "&quot;")
         )
         version = self._default_appx_version()
+        publisher = "C=SE, O=Cybertwip, CN=Cybertwip, E=greentwip@gmail.com"
+
         return f"""<?xml version="1.0" encoding="utf-8"?>
-<Package IgnorableNamespaces="uap uap10 rescap"
-  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
-  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
-  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
-  <Identity Name="{package_name}" Publisher="CN=Xbax" Version="{version}" ProcessorArchitecture="x64" />
-  <Properties>
-    <DisplayName>{display}</DisplayName>
-    <PublisherDisplayName>Xbax</PublisherDisplayName>
-    <Logo>Assets\\StoreLogo.png</Logo>
-  </Properties>
-  <Dependencies>
-    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
-  </Dependencies>
-  <Resources>
-    <Resource Language="x-generate" />
-  </Resources>
-  <Capabilities>
-    <rescap:Capability Name="runFullTrust" />
-    <rescap:Capability Name="unvirtualizedResources" />
-  </Capabilities>
-  <Applications>
-    <Application Id="App" Executable="{executable}" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
-      <uap:VisualElements DisplayName="{display}" Description="{display}" BackgroundColor="transparent"
-        Square150x150Logo="Assets\\Square150x150Logo.png" Square44x44Logo="Assets\\Square44x44Logo.png">
-        <uap:DefaultTile Wide310x150Logo="Assets\\Wide310x150Logo.png" Square310x310Logo="Assets\\Square310x310Logo.png" />
-        <uap:SplashScreen Image="Assets\\SplashScreen.png" />
-      </uap:VisualElements>
-    </Application>
-  </Applications>
-</Package>
-"""
+    <Package IgnorableNamespaces="uap uap10 rescap"
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+    <Identity Name="{package_name}" Publisher="{publisher}" Version="{version}" ProcessorArchitecture="x64" />
+    <Properties>
+        <DisplayName>{display}</DisplayName>
+        <PublisherDisplayName>Cybertwip</PublisherDisplayName>
+        <Logo>Assets\\StoreLogo.png</Logo>
+    </Properties>
+    <Dependencies>
+        <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+    </Dependencies>
+    <Resources>
+        <Resource Language="en-US" />
+    </Resources>
+    <Capabilities>
+        <rescap:Capability Name="runFullTrust" />
+        <rescap:Capability Name="unvirtualizedResources" />
+    </Capabilities>
+    <Applications>
+        <Application Id="App" Executable="{executable}" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+        <uap:VisualElements DisplayName="{display}" Description="{display}" BackgroundColor="transparent"
+            Square150x150Logo="Assets\\Square150x150Logo.png" Square44x44Logo="Assets\\Square44x44Logo.png">
+            <uap:DefaultTile Wide310x150Logo="Assets\\Wide310x150Logo.png" Square310x310Logo="Assets\\Square310x310Logo.png" />
+            <uap:SplashScreen Image="Assets\\SplashScreen.png" />
+        </uap:VisualElements>
+        </Application>
+    </Applications>
+    </Package>
+    """
 
     def _manifest_asset_paths(self, manifest_path):
         asset_paths = set(APPX_DEFAULT_ASSETS.keys())
@@ -1211,7 +1247,7 @@ class IntegratedTerminal:
         else:
             folder_name = os.path.basename(source_dir.rstrip(os.sep)) or "HelloWin"
             display_name = folder_name.replace("_", " ").replace("-", " ").strip() or "HelloWin"
-            package_name = "Xbax." + self._sanitize_package_token(folder_name)
+            package_name = "Cybertwip." + self._sanitize_package_token(folder_name)
             manifest_text = self._generated_manifest_text(exe_rel_path, package_name, display_name)
 
         with open(manifest_target, "w", encoding="utf-8") as manifest_file:
