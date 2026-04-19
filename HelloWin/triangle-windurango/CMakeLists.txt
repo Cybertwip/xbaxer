@@ -32,7 +32,7 @@ add_executable(TriangleWinDurango WIN32
     windurango/kernelx.h
 )
 target_include_directories(TriangleWinDurango PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/windurango")
-target_compile_definitions(TriangleWinDurango PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_definitions(TriangleWinDurango PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _GAMING_DESKTOP)
 target_link_libraries(TriangleWinDurango PRIVATE
     d3d11_x
     kernelx
