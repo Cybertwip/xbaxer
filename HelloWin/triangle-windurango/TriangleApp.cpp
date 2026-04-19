@@ -6,6 +6,8 @@
 #include <memory>
 #include <tuple>
 
+#include "XgameRuntime.h"
+
 class Game
 {
 public:
@@ -120,15 +122,6 @@ void Game::GetDefaultSize(int& width, int& height) const noexcept
 inline bool XMVerifyCPUSupport() noexcept
 {
     return true;
-}
-
-inline HRESULT XGameRuntimeInitialize() noexcept
-{
-    return S_OK;
-}
-
-inline void XGameRuntimeUninitialize() noexcept
-{
 }
 
 namespace
