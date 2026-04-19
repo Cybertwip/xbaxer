@@ -11,6 +11,7 @@
 import contextlib
 import os
 import shutil
+import subprocess
 import tempfile
 
 @contextlib.contextmanager
@@ -32,3 +33,40 @@ def test_dir_path():
 
 def test_key_path():
     return os.path.join(test_dir_path(), 'App_TemporaryKey.pfx')
+
+def openssl_exe():
+    candidates = [
+        os.getenv('OPENSSL'),
+        shutil.which('openssl'),
+        '/opt/homebrew/opt/openssl@3/bin/openssl',
+        '/usr/local/opt/openssl@3/bin/openssl',
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+def password_protected_test_key(output_dir, password):
+    openssl = openssl_exe()
+    if openssl is None:
+        raise RuntimeError('openssl executable was not found')
+
+    pem_path = os.path.join(output_dir, 'App_TemporaryKey.pem')
+    passworded_pfx_path = os.path.join(output_dir, 'App_TemporaryKey.password.pfx')
+    subprocess.check_call([
+        openssl,
+        'pkcs12',
+        '-in', test_key_path(),
+        '-passin', 'pass:',
+        '-nodes',
+        '-out', pem_path,
+    ])
+    subprocess.check_call([
+        openssl,
+        'pkcs12',
+        '-export',
+        '-in', pem_path,
+        '-out', passworded_pfx_path,
+        '-passout', f'pass:{password}',
+    ])
+    return passworded_pfx_path

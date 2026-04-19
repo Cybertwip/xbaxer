@@ -11,6 +11,7 @@
 #include <APPX/APPX.h>
 #include <APPX/File.h>
 #include <cassert>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <fts.h>
@@ -257,6 +258,8 @@ void PrintUsage(const char *programName)
             "\n"
                 "Options:\n"
             "  -c pfx-file     sign the APPX with the private key file\n"
+            "  -p password     PKCS12 password for -c (or use "
+            "XBAX_APPX_PFX_PASSWORD)\n"
             "  -f map-file     specify inputs from a mapping file\n"
             "  -f -            specify a mapping file through standard input\n"
             "  -h              show this usage text and exit\n"
@@ -290,11 +293,12 @@ void PrintUsage(const char *programName)
 int main(int argc, char **argv) try {
     const char *programName = argv[0];
     const char *certPath = NULL;
+    const char *certPassword = std::getenv("XBAX_APPX_PFX_PASSWORD");
     const char *appxPath = NULL;
     int compressionLevel = Z_NO_COMPRESSION;
     bool isBundle = false;
     std::unordered_map<std::string, std::string> fileNames;
-    while (int c = getopt(argc, argv, "0123456789bc:f:ho:")) {
+    while (int c = getopt(argc, argv, "0123456789bc:f:ho:p:")) {
         if (c == -1) {
             break;
         }
@@ -316,6 +320,9 @@ int main(int argc, char **argv) try {
                 break;
             case 'c':
                 certPath = optarg;
+                break;
+            case 'p':
+                certPassword = optarg;
                 break;
             case 'f':
                 if (strcmp(optarg, "-") == 0) {
@@ -376,8 +383,10 @@ int main(int argc, char **argv) try {
         return 1;
     }
     std::string certPathString = certPath ?: "";
+    std::string certPasswordString = certPassword ?: "";
     FilePtr appx = Open(appxPath, "wb");
     WriteAppx(appx, fileNames, certPath ? &certPathString : nullptr,
+              certPath ? &certPasswordString : nullptr,
               compressionLevel, isBundle);
     return 0;
 } catch (std::exception &e) {

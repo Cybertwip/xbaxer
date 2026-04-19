@@ -65,5 +65,37 @@ class TestValidZIP(unittest.TestCase):
             with zipfile.ZipFile(os.path.join(d, 'test.appx')) as zip:
                 self.assertIsNone(zip.testzip())
 
+    def test_signed_zip_with_password_flag(self):
+        with appx.util.temp_dir() as d:
+            if appx.util.openssl_exe() is None:
+                self.skipTest('openssl executable was not found')
+            with open(os.path.join(d, 'README.txt'), 'wb') as readme:
+                readme.write(b'This is a test file.\n')
+            key_path = appx.util.password_protected_test_key(d, 'test-password')
+            subprocess.check_call([appx_exe(),
+                                   '-o', os.path.join(d, 'test.appx'),
+                                   '-c', key_path,
+                                   '-p', 'test-password',
+                                   os.path.join(d, 'README.txt')])
+            with zipfile.ZipFile(os.path.join(d, 'test.appx')) as zip:
+                self.assertIsNone(zip.testzip())
+
+    def test_signed_zip_with_password_env(self):
+        with appx.util.temp_dir() as d:
+            if appx.util.openssl_exe() is None:
+                self.skipTest('openssl executable was not found')
+            with open(os.path.join(d, 'README.txt'), 'wb') as readme:
+                readme.write(b'This is a test file.\n')
+            key_path = appx.util.password_protected_test_key(d, 'test-password')
+            env = os.environ.copy()
+            env['XBAX_APPX_PFX_PASSWORD'] = 'test-password'
+            subprocess.check_call([appx_exe(),
+                                   '-o', os.path.join(d, 'test.appx'),
+                                   '-c', key_path,
+                                   os.path.join(d, 'README.txt')],
+                                  env=env)
+            with zipfile.ZipFile(os.path.join(d, 'test.appx')) as zip:
+                self.assertIsNone(zip.testzip())
+
 if __name__ == '__main__':
     unittest.main()

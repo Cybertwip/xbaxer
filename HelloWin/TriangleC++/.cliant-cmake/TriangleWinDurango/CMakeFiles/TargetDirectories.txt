@@ -1,5 +1,0 @@
-/Users/cybertwip/Projects/xbax-stream/HelloWin/triangle-windurango/.cliant-cmake/TriangleWinDurango/CMakeFiles/kernelx.dir
-/Users/cybertwip/Projects/xbax-stream/HelloWin/triangle-windurango/.cliant-cmake/TriangleWinDurango/CMakeFiles/d3d11_x.dir
-/Users/cybertwip/Projects/xbax-stream/HelloWin/triangle-windurango/.cliant-cmake/TriangleWinDurango/CMakeFiles/TriangleWinDurango.dir
-/Users/cybertwip/Projects/xbax-stream/HelloWin/triangle-windurango/.cliant-cmake/TriangleWinDurango/CMakeFiles/edit_cache.dir
-/Users/cybertwip/Projects/xbax-stream/HelloWin/triangle-windurango/.cliant-cmake/TriangleWinDurango/CMakeFiles/rebuild_cache.dir

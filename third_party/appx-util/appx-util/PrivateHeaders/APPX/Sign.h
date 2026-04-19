@@ -22,6 +22,7 @@ namespace appx {
     // Creates a PKCS7 signature for the given APPX digest using the given
     // certificate.
     OpenSSLPtr<PKCS7, PKCS7_free> Sign(const std::string &certPath,
+                                      const std::string *certPassword,
                                        const APPXDigests &digests);
 
     // A set of digests required when signing APPX files.

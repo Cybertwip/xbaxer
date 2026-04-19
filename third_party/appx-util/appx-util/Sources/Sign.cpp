@@ -329,7 +329,8 @@ namespace appx {
             OpenSSLPtr<X509, X509_free> certificate;
         };
 
-        CertificateFile ReadCertificateFile(const std::string &path)
+        CertificateFile ReadCertificateFile(const std::string &path,
+                                            const std::string *password)
         {
             BIOPtr file(BIO_new_file(path.c_str(), "rb"));
             if (!file) {
@@ -344,7 +345,9 @@ namespace appx {
             {
                 EVP_PKEY *privateKeyRaw;
                 X509 *certificateRaw;
-                if (!PKCS12_parse(data.get(), "", &privateKeyRaw,
+                const char *passwordCString =
+                    (password && !password->empty()) ? password->c_str() : "";
+                if (!PKCS12_parse(data.get(), passwordCString, &privateKeyRaw,
                                   &certificateRaw, nullptr)) {
                     throw OpenSSLException(path);
                 }
@@ -363,12 +366,14 @@ namespace appx {
     }
 
     OpenSSLPtr<PKCS7, PKCS7_free> Sign(const std::string &certPath,
+                                       const std::string *certPassword,
                                        const APPXDigests &digests)
     {
         OpenSSL_add_all_algorithms();
         oid::Register();
 
-        CertificateFile certFile = ReadCertificateFile(certPath);
+        CertificateFile certFile = ReadCertificateFile(certPath,
+                                                       certPassword);
 
         // Create the signature.
         OpenSSLPtr<PKCS7, PKCS7_free> signature(PKCS7_new());

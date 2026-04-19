@@ -1194,18 +1194,6 @@ class IntegratedTerminal:
             return f"Signing {os.path.basename(pfx_path)}", UI_COLORS["success"]
         return f"Signing {os.path.basename(pfx_path)}", UI_COLORS["warning"]
 
-    def _find_openssl_binary(self):
-        candidates = [
-            os.environ.get("OPENSSL", "").strip(),
-            shutil.which("openssl"),
-            "/opt/homebrew/opt/openssl@3/bin/openssl",
-            "/usr/local/opt/openssl@3/bin/openssl",
-        ]
-        for candidate in candidates:
-            if candidate and os.path.isfile(candidate):
-                return candidate
-        return shutil.which("openssl")
-
     def _prepare_appx_signing_pfx(self, require_signing=True):
         pfx_path = self._default_appx_signing_pfx()
         if not pfx_path:
@@ -1217,49 +1205,7 @@ class IntegratedTerminal:
             return None, None
 
         password = self._default_appx_signing_password(pfx_path)
-        if not password:
-            return pfx_path, None
-
-        openssl = self._find_openssl_binary()
-        if not openssl:
-            raise RuntimeError(
-                f"{APPX_SIGNING_PASSWORD_ENV} is set, but openssl was not found to normalize the password-protected PFX"
-            )
-
-        temp_dir = tempfile.mkdtemp(prefix="xbax-appx-sign-")
-        pem_path = os.path.join(temp_dir, "signing.pem")
-        normalized_pfx = os.path.join(temp_dir, "signing-empty-password.pfx")
-
-        self.log(f"[*] Normalizing signing bundle {os.path.basename(pfx_path)} for appx-util...")
-        self._run_local_command(
-            [
-                openssl,
-                "pkcs12",
-                "-in",
-                pfx_path,
-                "-passin",
-                f"pass:{password}",
-                "-nodes",
-                "-out",
-                pem_path,
-            ],
-            REPO_ROOT,
-        )
-        self._run_local_command(
-            [
-                openssl,
-                "pkcs12",
-                "-export",
-                "-in",
-                pem_path,
-                "-out",
-                normalized_pfx,
-                "-passout",
-                "pass:",
-            ],
-            REPO_ROOT,
-        )
-        return normalized_pfx, temp_dir
+        return pfx_path, password
 
     def _sanitize_package_token(self, value, fallback="HelloWin"):
         token = re.sub(r"[^A-Za-z0-9]+", "", value or "")
@@ -1507,19 +1453,21 @@ class IntegratedTerminal:
 
         appx_tool = self._ensure_appx_tool()
         stage_dir = None
-        signing_temp_dir = None
         packaged = False
         try:
             stage_dir = self._prepare_appx_staging(source_dir)
-            signing_pfx, signing_temp_dir = self._prepare_appx_signing_pfx(require_signing=require_signing)
+            signing_pfx, signing_password = self._prepare_appx_signing_pfx(require_signing=require_signing)
             if os.path.exists(output_path):
                 os.remove(output_path)
             self.log(f"[*] Packing {source_dir} into {output_path}...")
             command = [appx_tool, "-o", output_path]
+            command_env = None
             if signing_pfx:
                 command.extend(["-c", signing_pfx])
+                if signing_password is not None:
+                    command_env = {APPX_SIGNING_PASSWORD_ENV: signing_password}
             command.append(stage_dir)
-            self._run_local_command(command, REPO_ROOT)
+            self._run_local_command(command, REPO_ROOT, env=command_env)
             if not os.path.isfile(output_path):
                 raise RuntimeError(f"appx output was not created: {output_path}")
             packaged = True
@@ -1529,8 +1477,6 @@ class IntegratedTerminal:
                 shutil.rmtree(stage_dir, ignore_errors=True)
             elif stage_dir and not packaged:
                 self.log(f"[*] Appx staging folder kept at {stage_dir}")
-            if signing_temp_dir:
-                shutil.rmtree(signing_temp_dir, ignore_errors=True)
 
     def _device_portal_auth_candidates(self, ip):
         username, password = fetch_dev_credentials(ip)

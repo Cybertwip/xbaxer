@@ -23,7 +23,7 @@ namespace appx {
     //
     // certPath, if specified, causes the APPX to be signed. certPath points to
     // the path to the PKCS12 certificate file containing the private signing
-    // key.
+    // key. certPassword optionally provides the PKCS12 password.
     //
     // compressionLevel indicates how much to compress individual files.
     // Z_DEFAULT_COMPRESSION and any value between Z_NO_COMPRESSION and
@@ -31,6 +31,7 @@ namespace appx {
     void WriteAppx(
         const FilePtr &zip,
         const std::unordered_map<std::string, std::string> &fileNames,
-        const std::string *certPath, int compressionLevel, bool bundle);
+        const std::string *certPath, const std::string *certPassword,
+        int compressionLevel, bool bundle);
 }
 }

@@ -46,6 +46,7 @@ namespace appx {
         // Creates the AppxSignature.p7x file and inserts it into the ZIP.
         template <typename TSink>
         ZIPFileEntry WriteSignature(TSink &sink, const std::string &certPath,
+                                    const std::string *certPassword,
                                     const APPXDigests &digests, off_t offset)
         {
             // AppxSignature.p7x *must* be DEFLATEd.
@@ -54,7 +55,7 @@ namespace appx {
             off_t uncompressedSize;
             {
                 OpenSSLPtr<PKCS7, PKCS7_free> signature =
-                    Sign(certPath, digests);
+                    Sign(certPath, certPassword, digests);
                 std::vector<std::uint8_t> signatureData =
                     GetSignatureBytes(signature.get());
 
@@ -88,7 +89,8 @@ namespace appx {
     void WriteAppx(
         const FilePtr &zip,
         const std::unordered_map<std::string, std::string> &fileNames,
-        const std::string *certPath, int compressionLevel, bool isBundle)
+        const std::string *certPath, const std::string *certPassword,
+        int compressionLevel, bool isBundle)
     {
         FileSink zipRawSink(zip.get());
         OffsetSink zipOffsetSink;
@@ -159,7 +161,8 @@ namespace appx {
         // Sign and write the signature.
         if (certPath) {
             zipFileEntries.emplace_back(WriteSignature(
-                zipSink, *certPath, digests, zipOffsetSink.Offset()));
+                zipSink, *certPath, certPassword, digests,
+                zipOffsetSink.Offset()));
         }
 
         // Write the directory.
