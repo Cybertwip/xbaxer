@@ -339,11 +339,26 @@ def get_local_ip():
         s.close()
     return ip
 
-def check_xbox(ip):
+def _tcp_probe(ip, port=11443, timeout=0.4):
+    """Quick TCP connect to prime the ARP cache and weed out unreachable
+    hosts before the more expensive HTTPS probe. Returns True if the port
+    accepted a connection."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try: s.close()
+        except Exception: pass
+
+def check_xbox(ip, timeout=1.5):
     try:
         res = requests.get(f"https://{ip}:11443/ext/screenshot",
                            params={'download': 'false'},
-                           verify=False, timeout=0.6)
+                           verify=False, timeout=timeout)
         if res.status_code == 200:
             try:
                 hostname = socket.gethostbyaddr(ip)[0].split('.')[0]
@@ -358,9 +373,23 @@ def scan_network_async(result_list, callback):
     local_ip = get_local_ip()
     base = '.'.join(local_ip.split('.')[:-1])
     ips = [f"{base}.{i}" for i in range(1, 255)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as exe:
-        for res in exe.map(check_xbox, ips):
-            if res:
+
+    # Pass 1: cheap TCP probe on port 11443 to warm ARP and cut the HTTPS
+    # candidate set down to hosts that are actually listening. This is what
+    # makes the *first* discovery as reliable as a "Refresh" — the original
+    # 0.6s HTTPS-only probe regularly timed out on cold ARP caches.
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=120) as exe:
+        for ip, alive in zip(ips, exe.map(_tcp_probe, ips)):
+            if alive:
+                candidates.append(ip)
+
+    # Pass 2: real HTTPS probe with a generous timeout on the survivors.
+    seen = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as exe:
+        for res in exe.map(check_xbox, candidates):
+            if res and res[0] not in seen:
+                seen.add(res[0])
                 result_list.append(res)
     callback()
 

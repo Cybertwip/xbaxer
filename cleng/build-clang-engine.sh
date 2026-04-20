@@ -161,22 +161,40 @@ if ! has_cross_linker; then
 fi
 
 if [[ "$NEED_CROSS_BUILD" -eq 1 ]]; then
-  echo "[clang-engine] stage 2: cross-compile clang static libs for windows/amd64"
   rm -f "$CROSS_STAMP"
-  cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \
-    "${LLVM_COMMON_FLAGS[@]}" \
-    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-    -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
-    -DLLVM_TABLEGEN="$NATIVE_LLVM_TBLGEN" \
-    -DCLANG_TABLEGEN="$NATIVE_CLANG_TBLGEN" \
-    -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32 \
-    -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-w64-mingw32 \
-    -DLLVM_BUILD_TOOLS=ON \
-    -DLLVM_BUILD_UTILS=OFF \
-    -DLLVM_INCLUDE_TOOLS=ON \
-    -DLLD_BUILD_TOOLS=ON \
-    -DCLANG_BUILD_TOOLS=OFF \
-    -DLLVM_ENABLE_PIC=OFF
+  if [[ "$NATIVE_EXE_SUFFIX" == ".exe" ]]; then
+    # Host is already Windows/amd64 — skip the MinGW cross toolchain entirely
+    # and let CMake pick up the host's MSVC / clang-cl. This avoids needing
+    # x86_64-w64-mingw32-{gcc,g++,ar,ranlib} on Windows hosts.
+    echo "[clang-engine] stage 2: native build for windows/amd64 (host == target)"
+    cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \
+      "${LLVM_COMMON_FLAGS[@]}" \
+      -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
+      -DLLVM_TABLEGEN="$NATIVE_LLVM_TBLGEN" \
+      -DCLANG_TABLEGEN="$NATIVE_CLANG_TBLGEN" \
+      -DLLVM_BUILD_TOOLS=ON \
+      -DLLVM_BUILD_UTILS=OFF \
+      -DLLVM_INCLUDE_TOOLS=ON \
+      -DLLD_BUILD_TOOLS=ON \
+      -DCLANG_BUILD_TOOLS=OFF \
+      -DLLVM_ENABLE_PIC=OFF
+  else
+    echo "[clang-engine] stage 2: cross-compile clang static libs for windows/amd64"
+    cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \
+      "${LLVM_COMMON_FLAGS[@]}" \
+      -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
+      -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
+      -DLLVM_TABLEGEN="$NATIVE_LLVM_TBLGEN" \
+      -DCLANG_TABLEGEN="$NATIVE_CLANG_TBLGEN" \
+      -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32 \
+      -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-w64-mingw32 \
+      -DLLVM_BUILD_TOOLS=ON \
+      -DLLVM_BUILD_UTILS=OFF \
+      -DLLVM_INCLUDE_TOOLS=ON \
+      -DLLD_BUILD_TOOLS=ON \
+      -DCLANG_BUILD_TOOLS=OFF \
+      -DLLVM_ENABLE_PIC=OFF
+  fi
   # install-clang-resource-headers ships clang's compiler-builtin headers
   # (stddef.h, stdarg.h, stdint.h, intrinsic wrappers, etc.) into
   # ${OUTPUT_DIR}/lib/clang/<major>/include. These are NOT platform SDK

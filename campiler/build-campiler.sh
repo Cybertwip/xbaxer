@@ -13,7 +13,41 @@ OUTPUT_DIR="$4"
 TARGET_GOOS="windows"
 TARGET_GOARCH="amd64"
 
-rm -rf "$WORK_DIR" "$OUTPUT_DIR"
+# Pick the right Go bootstrap entry point for the host. Go's make.bash
+# refuses to run on Windows ("Do not use make.bash to build on Windows");
+# the equivalent batch file is src/make.bat.
+HOST_IS_WINDOWS=0
+case "${OS:-}${OSTYPE:-}" in
+  *Windows_NT*|*msys*|*cygwin*|*mingw*) HOST_IS_WINDOWS=1 ;;
+esac
+
+# Robust recursive delete that copes with Windows quirks: Go's build cache
+# stamps files read-only, antivirus / Defender briefly holds open handles,
+# and Git Bash's `rm -rf` then trips on "Permission denied" / spurious
+# "Is a directory" errors. Strip the read-only attribute, retry a few
+# times, and as a last resort delegate to cmd /c rmdir.
+robust_rmrf() {
+  local path
+  for path in "$@"; do
+    [[ -e "$path" ]] || continue
+    chmod -R u+w "$path" 2>/dev/null || true
+    if [[ "$HOST_IS_WINDOWS" -eq 1 ]] && command -v cygpath >/dev/null 2>&1; then
+      attrib -r -h -s "$(cygpath -w "$path")\\*" /s /d 2>/dev/null || true
+    fi
+    local attempt
+    for attempt in 1 2 3 4 5; do
+      if rm -rf -- "$path" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if [[ -e "$path" && "$HOST_IS_WINDOWS" -eq 1 ]]; then
+      cmd //c "rmdir /s /q \"$(cygpath -w "$path")\"" 2>/dev/null || true
+    fi
+  done
+}
+
+robust_rmrf "$WORK_DIR" "$OUTPUT_DIR"
 mkdir -p "$(dirname "$WORK_DIR")" "$(dirname "$OUTPUT_DIR")"
 
 cp -Rp "$GO_SOURCE_DIR" "$WORK_DIR"
@@ -24,7 +58,20 @@ chmod +x \
   "$WORK_DIR/src/bootstrap.bash"
 
 pushd "$WORK_DIR/src" >/dev/null
-GOROOT_BOOTSTRAP="$BOOTSTRAP_GOROOT" GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" bash ./make.bash --no-banner
+if [[ "$HOST_IS_WINDOWS" -eq 1 ]]; then
+  # cmd.exe doesn't grok POSIX paths, so translate the bootstrap GOROOT
+  # back to a Windows path before exporting it for make.bat.
+  if command -v cygpath >/dev/null 2>&1; then
+    BOOTSTRAP_GOROOT_WIN="$(cygpath -w "$BOOTSTRAP_GOROOT")"
+  else
+    BOOTSTRAP_GOROOT_WIN="$BOOTSTRAP_GOROOT"
+  fi
+  GOROOT_BOOTSTRAP="$BOOTSTRAP_GOROOT_WIN" GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" \
+    cmd //c "make.bat --no-banner"
+else
+  GOROOT_BOOTSTRAP="$BOOTSTRAP_GOROOT" GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" \
+    bash ./make.bash --no-banner
+fi
 
 gohostos="$(../bin/go env GOHOSTOS)"
 gohostarch="$(../bin/go env GOHOSTARCH)"
@@ -39,10 +86,10 @@ if [[ "$TARGET_GOOS" != "$gohostos" || "$TARGET_GOARCH" != "$gohostarch" ]]; the
     mv "$WORK_DIR/bin/${TARGET_GOOS}_${TARGET_GOARCH}"/* "$WORK_DIR/bin/"
     rmdir "$WORK_DIR/bin/${TARGET_GOOS}_${TARGET_GOARCH}"
   fi
-  rm -rf "$WORK_DIR/pkg/${gohostos}_${gohostarch}" "$WORK_DIR/pkg/tool/${gohostos}_${gohostarch}"
+  robust_rmrf "$WORK_DIR/pkg/${gohostos}_${gohostarch}" "$WORK_DIR/pkg/tool/${gohostos}_${gohostarch}"
 fi
 
-rm -rf "$WORK_DIR/pkg/bootstrap" "$WORK_DIR/pkg/obj" "$WORK_DIR/.git"
+robust_rmrf "$WORK_DIR/pkg/bootstrap" "$WORK_DIR/pkg/obj" "$WORK_DIR/.git"
 
 cp -Rp "$WORK_DIR" "$OUTPUT_DIR"
-rm -rf "$WORK_DIR"
+robust_rmrf "$WORK_DIR"
