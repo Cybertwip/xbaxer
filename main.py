@@ -705,6 +705,15 @@ class IntegratedTerminal:
         return cliant_path
 
     def _ensure_remote_sarver_installed(self):
+        local_sarver = self._local_bootstrap_tool_path("sarver")
+        if not os.path.isfile(local_sarver):
+            self._ensure_root_build_targets(
+                ["sarver"],
+                build_label="[*] Building the remote sarver worker...",
+            )
+
+        if self.has_active_ssh():
+            self._stop_remote_process("sarver.exe")
         return self._ensure_remote_bootstrap_tool(REMOTE_INSTALL_DIR, "sarver").replace("/", "\\")
 
     def _watch_bs_process(self, process):
@@ -2137,23 +2146,28 @@ class IntegratedTerminal:
         if not os.path.isdir(TRIANGLE_CPP_SOURCE_DIR):
             raise RuntimeError(f"TriangleC++ source directory not found: {TRIANGLE_CPP_SOURCE_DIR}")
 
+        if self.is_bs_running():
+            self.log("[*] Restarting BS for TriangleCpp...")
+            self.stop_bs()
+        else:
+            self._stop_remote_process("sarver.exe")
+
         self._ensure_root_build_targets(
-            ["host-tools"],
-            build_label="[*] Building host-side distributed compilation tools...",
+            ["host-tools", "sarver"],
+            build_label="[*] Building host-side distributed compilation tools plus the remote sarver worker...",
         )
 
         try:
             self._ensure_remote_sarver_installed()
-        except RuntimeError:
+        except RuntimeError as exc:
+            if "not found" not in str(exc).lower():
+                raise
             self.log("[*] Remote build worker is missing; running Install first...")
             self.install_package()
             self._ensure_remote_sarver_installed()
 
         self._ensure_remote_cleng_bundle()
 
-        if self.is_bs_running():
-            self.log("[*] Restarting BS for TriangleCpp...")
-            self.stop_bs()
         self.start_bs()
         if not self.is_bs_running():
             raise RuntimeError("BS relay did not start successfully")
@@ -2651,6 +2665,8 @@ class IntegratedTerminal:
             )
         remote_tool = self._remote_bootstrap_tool_path(remote_dir, tool_name)
         remote_bootstrap_dir = self._remote_bootstrap_dir(remote_dir)
+        should_upload = False
+        temp_remote_tool = remote_tool + ".tmp"
         sftp = self.ssh_client.open_sftp()
         try:
             self._remote_mkdirs(sftp, remote_bootstrap_dir)
@@ -2664,9 +2680,29 @@ class IntegratedTerminal:
                 should_upload = True
             if should_upload:
                 self.log(f"[*] Bootstrapping {tool_name}.exe on the remote machine...")
-                sftp.put(local_tool, remote_tool)
+                try:
+                    sftp.remove(temp_remote_tool)
+                except IOError:
+                    pass
+                try:
+                    sftp.put(local_tool, temp_remote_tool)
+                except Exception as exc:
+                    raise RuntimeError(f"upload {tool_name}.exe temp file failed: {exc}") from exc
         finally:
             sftp.close()
+
+        if should_upload:
+            remote_tool_windows = remote_tool.replace("/", "\\")
+            temp_remote_tool_windows = temp_remote_tool.replace("/", "\\")
+            swap_command = (
+                f'cmd /c copy /Y {self._cmd_quote(temp_remote_tool_windows)} '
+                f'{self._cmd_quote(remote_tool_windows)} >NUL '
+                f'&& del /Q {self._cmd_quote(temp_remote_tool_windows)} >NUL'
+            )
+            exit_status, output, error = self._run_remote_command(swap_command)
+            if exit_status != 0:
+                raise RuntimeError((error or output or f"activate {tool_name}.exe failed").strip())
+
         return remote_tool
 
     def _ensure_remote_anzipper(self, remote_dir):
