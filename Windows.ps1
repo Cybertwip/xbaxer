@@ -149,6 +149,30 @@ function Install-Winget {
 Invoke-SelfElevate
 Require-Command winget "Install 'App Installer' from the Microsoft Store on Windows 10."
 
+function Set-GitBashFirstOnPath {
+    # CMake custom commands in CMakeLists.txt invoke `bash <script>.sh`. On
+    # Windows that needs to resolve to Git Bash (which understands C:\... paths)
+    # and NOT to C:\Windows\System32\bash.exe (the WSL launcher, which treats
+    # Windows paths as literal Linux paths and prints "No such file or directory").
+    $gitBashDirs = @(
+        'C:\Program Files\Git\bin',
+        'C:\Program Files\Git\usr\bin',
+        'C:\Program Files (x86)\Git\bin'
+    ) | Where-Object { Test-Path (Join-Path $_ 'bash.exe') }
+    if (-not $gitBashDirs) { return }
+
+    foreach ($scope in 'Process','User') {
+        $cur = [Environment]::GetEnvironmentVariable('Path', $scope)
+        if (-not $cur) { $cur = '' }
+        $parts = $cur -split ';' | Where-Object { $_ -and ($gitBashDirs -notcontains $_) }
+        $new = (@($gitBashDirs) + $parts) -join ';'
+        if ($new -ne $cur) {
+            [Environment]::SetEnvironmentVariable('Path', $new, $scope)
+        }
+    }
+    Write-Host "==> Prepended Git Bash to PATH so CMake's `bash <script>.sh` calls work" -ForegroundColor Cyan
+}
+
 # --- Build system ------------------------------------------------------------
 Install-Winget -Id 'Kitware.CMake'           -Comment 'CMake'
 Install-Winget -Id 'Ninja-build.Ninja'       -Comment 'Ninja generator'
@@ -156,6 +180,7 @@ Install-Winget -Id 'Ninja-build.Ninja'       -Comment 'Ninja generator'
 # fully suppress its UI on some versions, so pass the real Inno flags too.
 Install-Winget -Id 'Git.Git'                 -Comment 'Git' `
     -Override '/VERYSILENT /NORESTART /SUPPRESSMSGBOXES /NOCANCEL /NOICONS'
+Set-GitBashFirstOnPath
 # pkg-config equivalent on Windows; pulled in via the MSYS2 base install below
 # (provides `pkgconf`, used by some llvm-project subprojects).
 

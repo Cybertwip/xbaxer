@@ -27,6 +27,30 @@ import xml.etree.ElementTree as ET
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+def _ensure_git_bash_on_path():
+    """On Windows, CMake custom commands invoke `bash <script>.sh`. Make sure
+    Git Bash wins the PATH lookup over C:\\Windows\\System32\\bash.exe (the
+    WSL launcher), which treats Windows paths as literal Linux paths and
+    fails with "No such file or directory" for our build scripts."""
+    if os.name != "nt":
+        return
+    candidates = [
+        r"C:\Program Files\Git\bin",
+        r"C:\Program Files\Git\usr\bin",
+        r"C:\Program Files (x86)\Git\bin",
+    ]
+    git_bash_dirs = [d for d in candidates if os.path.isfile(os.path.join(d, "bash.exe"))]
+    if not git_bash_dirs:
+        return
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p not in git_bash_dirs]
+    # Strip System32 bash.exe (WSL) by demoting System32 below Git Bash —
+    # we don't remove System32 itself, just put Git's bin ahead of it.
+    os.environ["PATH"] = os.pathsep.join(git_bash_dirs + parts)
+
+
+_ensure_git_bash_on_path()
+
 # ================== CONFIG ==================
 MENU_SIZE = (1280, 720)
 STREAM_SIZE = (1280, 920)
