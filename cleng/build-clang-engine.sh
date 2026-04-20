@@ -38,6 +38,15 @@ CROSS_BUILD="$WORK_DIR/cross"
 NATIVE_STAMP="$NATIVE_BUILD/.tblgen-built"
 CROSS_STAMP="$OUTPUT_DIR/.clang-engine-installed"
 
+# Native binaries get a .exe suffix when this script runs under Git Bash /
+# MSYS on a Windows host (the native stage uses MSVC or clang-cl). Detect
+# that up front so the cross stage's LLVM_TABLEGEN / CLANG_TABLEGEN cache
+# entries point at files that actually exist.
+NATIVE_EXE_SUFFIX=""
+case "${OS:-}${OSTYPE:-}" in
+  *Windows_NT*|*msys*|*cygwin*|*mingw*) NATIVE_EXE_SUFFIX=".exe" ;;
+esac
+
 mkdir -p "$NATIVE_BUILD" "$CROSS_BUILD" "$OUTPUT_DIR"
 
 cross_cache_var_equals() {
@@ -115,11 +124,12 @@ if [[ ! -f "$NATIVE_STAMP" ]]; then
   : > "$NATIVE_STAMP"
 fi
 
-NATIVE_LLVM_TBLGEN="$NATIVE_BUILD/bin/llvm-tblgen"
-NATIVE_CLANG_TBLGEN="$NATIVE_BUILD/bin/clang-tblgen"
+NATIVE_LLVM_TBLGEN="$NATIVE_BUILD/bin/llvm-tblgen$NATIVE_EXE_SUFFIX"
+NATIVE_CLANG_TBLGEN="$NATIVE_BUILD/bin/clang-tblgen$NATIVE_EXE_SUFFIX"
 
 if [[ ! -x "$NATIVE_LLVM_TBLGEN" || ! -x "$NATIVE_CLANG_TBLGEN" ]]; then
   echo "[clang-engine] stage 1 failed: tblgen binaries missing under $NATIVE_BUILD/bin" >&2
+  ls -la "$NATIVE_BUILD/bin" >&2 || true
   exit 1
 fi
 
