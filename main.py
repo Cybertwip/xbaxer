@@ -1074,8 +1074,27 @@ class IntegratedTerminal:
             with self.lock:
                 visible_lines = self._visible_lines_locked()
 
-            y = 10
+            # Wrap long lines to the body width so output isn't clipped on
+            # the right edge. The font is monospace, so a single char-width
+            # measurement is sufficient.
+            char_w = max(1, self.font.size("M")[0])
+            wrap_cols = max(1, (self.rect.width - 24) // char_w)
+            wrapped = []
             for line in visible_lines:
+                if not line:
+                    wrapped.append("")
+                    continue
+                # Split into wrap_cols-wide chunks. Keep order so the most
+                # recent text stays at the bottom after the trim below.
+                for i in range(0, len(line), wrap_cols):
+                    wrapped.append(line[i:i + wrap_cols])
+
+            # Only as many wrapped rows as fit in the visible body.
+            max_rows = max(1, (body_h - 20) // self.line_h)
+            wrapped = wrapped[-max_rows:]
+
+            y = 10
+            for line in wrapped:
                 if line:
                     surf.blit(self.font.render(line, True, UI_COLORS["terminal_text"]), (12, y))
                 y += self.line_h
