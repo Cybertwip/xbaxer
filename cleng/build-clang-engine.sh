@@ -163,13 +163,19 @@ fi
 if [[ "$NEED_CROSS_BUILD" -eq 1 ]]; then
   rm -f "$CROSS_STAMP"
   if [[ "$NATIVE_EXE_SUFFIX" == ".exe" ]]; then
-    # Host is already Windows/amd64 — skip the MinGW cross toolchain entirely
-    # and let CMake pick up the host's MSVC / clang-cl. This avoids needing
-    # x86_64-w64-mingw32-{gcc,g++,ar,ranlib} on Windows hosts.
-    echo "[clang-engine] stage 2: native build for windows/amd64 (host == target)"
+    # Host is already Windows/amd64 — build natively with the host clang and
+    # lld-link instead of requiring a separate MinGW toolchain.
+    echo "[clang-engine] stage 2: native clang build for windows/amd64 (host == target)"
+    if [[ -f "$CROSS_BUILD/CMakeCache.txt" ]] && grep -Eq '^CMAKE_TOOLCHAIN_FILE:' "$CROSS_BUILD/CMakeCache.txt"; then
+      rm -rf "$CROSS_BUILD"
+      mkdir -p "$CROSS_BUILD"
+    fi
     cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \
       "${LLVM_COMMON_FLAGS[@]}" \
+      -DCMAKE_C_COMPILER="$HOST_CC" \
+      -DCMAKE_CXX_COMPILER="$HOST_CXX" \
       -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
+      -DLIBCLANG_BUILD_STATIC=ON \
       -DLLVM_TABLEGEN="$NATIVE_LLVM_TBLGEN" \
       -DCLANG_TABLEGEN="$NATIVE_CLANG_TBLGEN" \
       -DLLVM_BUILD_TOOLS=ON \
@@ -177,7 +183,8 @@ if [[ "$NEED_CROSS_BUILD" -eq 1 ]]; then
       -DLLVM_INCLUDE_TOOLS=ON \
       -DLLD_BUILD_TOOLS=ON \
       -DCLANG_BUILD_TOOLS=OFF \
-      -DLLVM_ENABLE_PIC=OFF
+      -DLLVM_ENABLE_PIC=OFF \
+      -DLLVM_ENABLE_UNIXDOMAINSOCKETS=OFF
   else
     echo "[clang-engine] stage 2: cross-compile clang static libs for windows/amd64"
     cmake -S "$LLVM_SRC/llvm" -B "$CROSS_BUILD" \

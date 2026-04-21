@@ -17,6 +17,8 @@ import paramiko
 import io
 import re
 import json
+import shlex
+import stat
 import subprocess
 import tempfile
 import shutil
@@ -643,6 +645,46 @@ class IntegratedTerminal:
         self._mark_dirty()
         return True
 
+    def _split_command_line(self, command):
+        try:
+            parts = shlex.split(command, posix=False)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid command syntax: {exc}") from exc
+
+        cleaned = []
+        for part in parts:
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in ('"', "'"):
+                part = part[1:-1]
+            cleaned.append(part)
+        return cleaned
+
+    def _handle_local_terminal_command(self, command):
+        stripped = command.strip()
+        if not stripped:
+            return False
+        if stripped.split(None, 1)[0].lower() != "dump":
+            return False
+
+        try:
+            parts = self._split_command_line(stripped)
+        except RuntimeError as exc:
+            self.log(f"[-] Dump failed: {exc}")
+            return True
+
+        if not parts or parts[0].lower() != "dump":
+            return False
+
+        if len(parts) < 2 or len(parts) > 3:
+            self.log("[-] Usage: dump <remote-path> [local-path]")
+            return True
+
+        threading.Thread(
+            target=self.dump_remote_path,
+            args=(parts[1], parts[2] if len(parts) == 3 else None),
+            daemon=True,
+        ).start()
+        return True
+
     def log(self, message):
         with self.lock:
             self.history.append(message)
@@ -1067,8 +1109,14 @@ class IntegratedTerminal:
             return True
 
         if event.key == pygame.K_RETURN:
-            self._remember_command(self.input_buffer)
-            cmd = (self.input_buffer + "\r\n").encode('utf-8')
+            command = self.input_buffer
+            self._remember_command(command)
+            if self._handle_local_terminal_command(command):
+                self.input_buffer = ""
+                self._mark_dirty()
+                return True
+
+            cmd = (command + "\r\n").encode('utf-8')
             try: self.sock.sendall(cmd)
             except: pass
             self.input_buffer = ""
@@ -1207,6 +1255,669 @@ class IntegratedTerminal:
             if match:
                 return match.group(1).replace("\\", "/")
         return None
+
+    def _normalize_remote_path(self, remote_path, base_dir=None):
+        remote_path = (remote_path or "").strip()
+        if not remote_path:
+            raise RuntimeError("dump requires a remote path")
+
+        normalized = remote_path.replace("\\", "/")
+        if re.fullmatch(r"[A-Za-z]:/?", normalized):
+            return normalized[0].upper() + ":/"
+        if re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("/"):
+            return normalized
+
+        base_dir = (base_dir or self._current_remote_directory() or "D:/DevelopmentFiles/Sandbox")
+        base_dir = base_dir.replace("\\", "/").rstrip("/")
+        normalized = normalized[2:] if normalized.startswith("./") else normalized
+        return base_dir + "/" + normalized.lstrip("/")
+
+    def _default_local_dump_name(self, remote_path):
+        normalized = remote_path.replace("\\", "/").rstrip("/")
+        if re.fullmatch(r"[A-Za-z]:", normalized):
+            return normalized[0].upper() + "-drive"
+        return os.path.basename(normalized) or "remote-root"
+
+    def _resolve_local_dump_path(self, remote_path, local_path, is_dir):
+        default_name = self._default_local_dump_name(remote_path)
+        if not local_path:
+            return os.path.abspath(default_name)
+
+        expanded = os.path.expanduser(local_path)
+        ends_with_sep = expanded.endswith(os.sep) or (os.altsep and expanded.endswith(os.altsep))
+        resolved = os.path.abspath(expanded)
+
+        if ends_with_sep:
+            return os.path.join(resolved, default_name)
+
+        if is_dir and os.path.isfile(resolved):
+            raise RuntimeError(f"local destination is a file: {resolved}")
+
+        if is_dir:
+            return resolved
+
+        if os.path.isdir(resolved):
+            return os.path.join(resolved, default_name)
+
+        return resolved
+
+    def _native_local_path(self, local_path):
+        resolved = os.path.abspath(local_path)
+        if os.name != "nt":
+            return resolved
+        if resolved.startswith("\\\\?\\"):
+            return resolved
+        if resolved.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + resolved[2:]
+        return "\\\\?\\" + resolved
+
+    def _remote_path_variants(self, remote_path):
+        normalized = remote_path.replace("\\", "/")
+        if re.fullmatch(r"[A-Za-z]:/?", normalized):
+            drive = normalized[0].upper()
+            return [drive + ":/", drive + ":\\"]
+
+        candidates = []
+        for candidate in (
+            normalized,
+            normalized.rstrip("/"),
+            normalized.replace("/", "\\"),
+            normalized.replace("/", "\\").rstrip("\\"),
+        ):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates or [normalized]
+
+    def _remote_stat(self, sftp, remote_path):
+        last_error = None
+        for candidate in self._remote_path_variants(remote_path):
+            try:
+                return sftp.stat(candidate)
+            except IOError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise IOError(f"could not stat remote path: {remote_path}")
+
+    def _remote_listdir_entries_via_shell(self, remote_dir):
+        remote_dir_windows = remote_dir.replace("/", "\\")
+        list_command = f"cmd /c dir /b /a {self._cmd_quote(remote_dir_windows)}"
+        exit_status, output, error = self._run_remote_command(list_command)
+        combined = (output or error or "").strip()
+        if exit_status != 0 and combined.lower() != "file not found":
+            raise IOError(combined or f"could not list remote directory: {remote_dir}")
+
+        names = []
+        for line in output.splitlines():
+            entry_name = line.strip()
+            if entry_name and entry_name.lower() != "file not found" and entry_name not in (".", ".."):
+                names.append(entry_name)
+
+        dir_command = f"cmd /c dir /b /ad {self._cmd_quote(remote_dir_windows)}"
+        dir_status, dir_output, dir_error = self._run_remote_command(dir_command)
+        dir_combined = (dir_output or dir_error or "").strip()
+        dir_names = set()
+        if dir_status == 0 or dir_combined.lower() == "file not found":
+            for line in dir_output.splitlines():
+                entry_name = line.strip()
+                if entry_name and entry_name.lower() != "file not found":
+                    dir_names.add(entry_name)
+
+        return [
+            {"filename": entry_name, "is_dir": entry_name in dir_names, "attr": None}
+            for entry_name in names
+        ]
+
+    def _remote_listdir_entries(self, sftp, remote_dir):
+        last_error = None
+        for candidate in self._remote_path_variants(remote_dir):
+            try:
+                return [
+                    {
+                        "filename": entry.filename,
+                        "is_dir": stat.S_ISDIR(entry.st_mode),
+                        "attr": entry,
+                    }
+                    for entry in sftp.listdir_attr(candidate)
+                    if entry.filename not in (".", "..")
+                ]
+            except IOError as exc:
+                last_error = exc
+
+        self.log(f"[*] SFTP listing failed for '{remote_dir}'; retrying via cmd.exe.")
+        try:
+            return self._remote_listdir_entries_via_shell(remote_dir)
+        except Exception:
+            if last_error is not None:
+                raise last_error
+            raise
+
+    def _download_remote_file(self, sftp, remote_path, local_path, remote_attr=None):
+        native_local_path = self._native_local_path(local_path)
+        local_parent = os.path.dirname(native_local_path)
+        if local_parent:
+            os.makedirs(local_parent, exist_ok=True)
+
+        last_error = None
+        for candidate in self._remote_path_variants(remote_path):
+            try:
+                sftp.get(candidate, native_local_path)
+                break
+            except (IOError, OSError) as exc:
+                last_error = exc
+        else:
+            raise last_error or IOError(f"could not download remote file: {remote_path}")
+
+        remote_attr = remote_attr or self._remote_path_exists(sftp, remote_path)
+        if remote_attr is not None:
+            atime = int(getattr(remote_attr, "st_atime", getattr(remote_attr, "st_mtime", time.time())))
+            mtime = int(getattr(remote_attr, "st_mtime", atime))
+            try:
+                os.utime(native_local_path, (atime, mtime))
+            except OSError:
+                pass
+
+    def _download_remote_directory(self, sftp, remote_dir, local_dir):
+        os.makedirs(self._native_local_path(local_dir), exist_ok=True)
+
+        file_count = 0
+        dir_count = 0
+        skipped_count = 0
+        for entry in self._remote_listdir_entries(sftp, remote_dir):
+            entry_name = entry["filename"]
+            remote_child = remote_dir.rstrip("/") + "/" + entry_name
+            local_child = os.path.join(local_dir, entry_name)
+
+            if entry["is_dir"]:
+                dir_count += 1
+                try:
+                    child_files, child_dirs, child_skipped = self._download_remote_directory(
+                        sftp,
+                        remote_child,
+                        local_child,
+                    )
+                except Exception as exc:
+                    skipped_count += 1
+                    self.log(f"[!] Skipping directory '{remote_child}': {exc}")
+                    continue
+                file_count += child_files
+                dir_count += child_dirs
+                skipped_count += child_skipped
+                continue
+
+            try:
+                self._download_remote_file(sftp, remote_child, local_child, entry["attr"])
+                file_count += 1
+            except Exception as exc:
+                skipped_count += 1
+                self.log(f"[!] Skipping file '{remote_child}': {exc}")
+
+        return file_count, dir_count, skipped_count
+
+    def dump_remote_path(self, remote_path, local_path=None):
+        if not self.has_active_ssh():
+            self.log("[-] Dump failed: Dev Shell SSH is disconnected.")
+            return False
+
+        try:
+            resolved_remote_path = self._normalize_remote_path(remote_path)
+        except RuntimeError as exc:
+            self.log(f"[-] Dump failed: {exc}")
+            return False
+
+        try:
+            sftp = self.ssh_client.open_sftp()
+        except Exception as exc:
+            self.log(f"[-] Dump failed: {exc}")
+            return False
+
+        try:
+            remote_attr = self._remote_stat(sftp, resolved_remote_path)
+            is_dir = stat.S_ISDIR(remote_attr.st_mode)
+            resolved_local_path = self._resolve_local_dump_path(resolved_remote_path, local_path, is_dir)
+
+            if is_dir:
+                self.log(f"[*] Dumping directory '{resolved_remote_path}' to {resolved_local_path}...")
+                file_count, dir_count, skipped_count = self._download_remote_directory(
+                    sftp,
+                    resolved_remote_path,
+                    resolved_local_path,
+                )
+                skip_summary = (
+                    f", {skipped_count} skipped entr{'y' if skipped_count == 1 else 'ies'}"
+                    if skipped_count
+                    else ""
+                )
+                self.log(
+                    f"[+] Dumped directory '{resolved_remote_path}' to {resolved_local_path} "
+                    f"({file_count} file(s), {dir_count} subdirector{'y' if dir_count == 1 else 'ies'}{skip_summary})."
+                )
+            else:
+                self.log(f"[*] Dumping file '{resolved_remote_path}' to {resolved_local_path}...")
+                self._download_remote_file(sftp, resolved_remote_path, resolved_local_path, remote_attr)
+                self.log(f"[+] Dumped file '{resolved_remote_path}' to {resolved_local_path}.")
+            return True
+        except IOError as exc:
+            self.log(f"[-] Dump failed: {exc}")
+            return False
+        except Exception as exc:
+            self.log(f"[-] Dump failed: {exc}")
+            return False
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    # ---------- SMB (DevelopmentFiles share) dump ----------
+    #
+    # The devkit's Dev Mode HostOS exports D:\DevelopmentFiles over SMB on
+    # port 445 with auto-generated DevToolsUser credentials (the same ones
+    # fetch_dev_credentials() already pulls from /ext/smb/developerfolder).
+    # Anything xvdd.sys mounts on the console under that tree — including
+    # XVDs attached via xbmount/xbcp — is then visible to this PC as a
+    # plain SMB path. This lets us walk the *console-decrypted* file tree
+    # without needing any of the Xbox-only kernel pieces on the desktop.
+
+    _SMB_UNC_RE = re.compile(r"^\\\\([^\\]+)\\([^\\]+)(?:\\(.*))?$")
+
+    def _parse_smb_unc(self, unc):
+        r"""Return (host, share, subpath) for a //host/share/sub or \\host\share\sub UNC."""
+        if not unc:
+            raise RuntimeError("smbdump requires a UNC path like \\\\<ip>\\DevelopmentFiles\\...")
+        normalized = "\\\\" + unc.lstrip("\\/").replace("/", "\\")
+        m = self._SMB_UNC_RE.match(normalized)
+        if not m:
+            raise RuntimeError(f"not a valid UNC path: {unc}")
+        host, share, sub = m.group(1), m.group(2), (m.group(3) or "").rstrip("\\")
+        return host, share, sub
+
+    def _smb_unc_root(self, host, share):
+        return f"\\\\{host}\\{share}"
+
+    def _smb_join(self, root, sub):
+        return root if not sub else root + "\\" + sub
+
+    def _smb_authenticate(self, host, share, username, password):
+        """`net use` the share so subsequent FS calls in this process use the creds.
+        Returns the UNC root that was authenticated, or None if no auth was performed."""
+        if os.name != "nt":
+            # On non-Windows, callers must pre-mount the share themselves
+            # (e.g. mount.cifs) and pass a local mount path; SMB auth via
+            # net use is Windows-only.
+            return None
+        if not username or not password:
+            return None
+        target = self._smb_unc_root(host, share)
+        # Drop any stale connection first; ignore failures (none may exist).
+        subprocess.run(["net", "use", target, "/delete", "/y"],
+                       capture_output=True, text=True)
+        result = subprocess.run(
+            ["net", "use", target, password, "/user:" + username, "/persistent:no"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"net use {target} failed: {err}")
+        self.log(f"[+] SMB auth ok: {target}")
+        return target
+
+    def _smb_disconnect(self, target):
+        if not target or os.name != "nt":
+            return
+        subprocess.run(["net", "use", target, "/delete", "/y"],
+                       capture_output=True, text=True)
+
+    def _default_local_smb_dump_name(self, host, share, sub):
+        if sub:
+            tail = sub.rstrip("\\").split("\\")[-1]
+            return tail or share
+        return share or host
+
+    def _resolve_local_smb_dump_path(self, host, share, sub, local_path, is_dir):
+        default_name = self._default_local_smb_dump_name(host, share, sub)
+        if not local_path:
+            return os.path.abspath(default_name)
+        expanded = os.path.expanduser(local_path)
+        ends_with_sep = expanded.endswith(os.sep) or (os.altsep and expanded.endswith(os.altsep))
+        resolved = os.path.abspath(expanded)
+        if ends_with_sep:
+            return os.path.join(resolved, default_name)
+        if is_dir and os.path.isfile(resolved):
+            raise RuntimeError(f"local destination is a file: {resolved}")
+        if is_dir:
+            return resolved
+        if os.path.isdir(resolved):
+            return os.path.join(resolved, default_name)
+        return resolved
+
+    def _smb_native_path(self, unc):
+        r"""Apply the \\?\UNC\ extended-length prefix so deep trees from the
+        console (which routinely exceed MAX_PATH once mirrored locally) and
+        the SMB source itself both work."""
+        if os.name != "nt":
+            return unc
+        if unc.startswith("\\\\?\\"):
+            return unc
+        if unc.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + unc[2:]
+        return unc
+
+    def _copy_smb_file(self, src_unc, dst_local):
+        native_src = self._smb_native_path(src_unc)
+        native_dst = self._native_local_path(dst_local)
+        parent = os.path.dirname(native_dst)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(native_src, "rb") as fsrc, open(native_dst, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst, length=1024 * 1024)
+        try:
+            st = os.stat(native_src)
+            os.utime(native_dst, (st.st_atime, st.st_mtime))
+        except OSError:
+            pass
+
+    def _walk_smb_directory(self, src_unc, dst_local):
+        os.makedirs(self._native_local_path(dst_local), exist_ok=True)
+        file_count = 0
+        dir_count = 0
+        skipped_count = 0
+        native_src = self._smb_native_path(src_unc)
+        try:
+            entries = list(os.scandir(native_src))
+        except OSError as exc:
+            self.log(f"[!] Could not list '{src_unc}': {exc}")
+            return 0, 0, 1
+        for entry in entries:
+            child_src = src_unc.rstrip("\\") + "\\" + entry.name
+            child_dst = os.path.join(dst_local, entry.name)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                skipped_count += 1
+                self.log(f"[!] Skipping '{child_src}': {exc}")
+                continue
+            if is_dir:
+                dir_count += 1
+                try:
+                    cf, cd, cs = self._walk_smb_directory(child_src, child_dst)
+                except Exception as exc:
+                    skipped_count += 1
+                    self.log(f"[!] Skipping directory '{child_src}': {exc}")
+                    continue
+                file_count += cf
+                dir_count += cd
+                skipped_count += cs
+            else:
+                try:
+                    self._copy_smb_file(child_src, child_dst)
+                    file_count += 1
+                except Exception as exc:
+                    skipped_count += 1
+                    self.log(f"[!] Skipping file '{child_src}': {exc}")
+        return file_count, dir_count, skipped_count
+
+    def dump_smb_path(self, unc_path, local_path=None, username=None, password=None):
+        r"""Mirror an SMB tree (typically an XVD mounted on the console under
+        D:\DevelopmentFiles) to a local directory. Authenticates with the
+        provided creds (or fetched DevToolsUser creds) when needed."""
+        try:
+            host, share, sub = self._parse_smb_unc(unc_path)
+        except RuntimeError as exc:
+            self.log(f"[-] SMB dump failed: {exc}")
+            return False
+
+        # Auto-fetch DevToolsUser creds if none were supplied; mirrors the
+        # /ext/smb/developerfolder workflow used elsewhere in the file.
+        if (username is None or password is None) and os.name == "nt":
+            fetched_user, fetched_pwd = fetch_dev_credentials(host)
+            username = username or fetched_user
+            password = password or fetched_pwd
+
+        try:
+            authenticated_target = self._smb_authenticate(host, share, username, password)
+        except RuntimeError as exc:
+            self.log(f"[-] SMB dump failed: {exc}")
+            return False
+
+        try:
+            root = self._smb_unc_root(host, share)
+            full_src = self._smb_join(root, sub)
+            native_src = self._smb_native_path(full_src)
+            try:
+                is_dir = os.path.isdir(native_src)
+                if not is_dir and not os.path.isfile(native_src):
+                    raise IOError(f"path not found on share: {full_src}")
+            except OSError as exc:
+                self.log(f"[-] SMB dump failed: {exc}")
+                return False
+
+            resolved_local = self._resolve_local_smb_dump_path(host, share, sub, local_path, is_dir)
+
+            if is_dir:
+                self.log(f"[*] Dumping SMB directory '{full_src}' to {resolved_local}...")
+                fc, dc, sc = self._walk_smb_directory(full_src, resolved_local)
+                skip_summary = (
+                    f", {sc} skipped entr{'y' if sc == 1 else 'ies'}" if sc else ""
+                )
+                self.log(
+                    f"[+] Dumped SMB directory '{full_src}' to {resolved_local} "
+                    f"({fc} file(s), {dc} subdirector{'y' if dc == 1 else 'ies'}{skip_summary})."
+                )
+            else:
+                self.log(f"[*] Dumping SMB file '{full_src}' to {resolved_local}...")
+                self._copy_smb_file(full_src, resolved_local)
+                self.log(f"[+] Dumped SMB file '{full_src}' to {resolved_local}.")
+            return True
+        finally:
+            self._smb_disconnect(authenticated_target)
+
+    # ---------- Console-side XVD mount via xcrdutil ----------
+    #
+    # On the Dev Mode HostOS, `xcrdutil.exe` is the user-mode front-end to
+    # the XCRD device exposed by xvdd.sys. Issuing `xcrdutil mount <xvd>
+    # <mountpoint>` makes the kernel decrypt + attach the XVD and project
+    # its FATX volume into the HostOS namespace. Once the mountpoint sits
+    # under D:\DevelopmentFiles, the SMB share immediately reflects it,
+    # which is exactly what `smbdump` consumes from this side.
+
+    REMOTE_XVD_STAGING_DIR = "D:/DevelopmentFiles/Sandbox/xvd"
+    REMOTE_XVD_MOUNT_ROOT = "D:/DevelopmentFiles/Mounts"
+    REMOTE_XCRDUTIL = "xcrdutil.exe"  # on PATH inside the Dev Shell
+
+    # Common locations xcrdutil.exe ships in on Dev Mode HostOS / devkits.
+    # The SSH/telnetd session inherits a much smaller PATH than the
+    # interactive Dev Shell, so we probe these explicitly when `where`
+    # comes up empty.
+    REMOTE_XCRDUTIL_CANDIDATES = (
+        r"C:\Windows\System32\xcrdutil.exe",
+        r"C:\Windows\xcrdutil.exe",
+        r"D:\Windows\System32\xcrdutil.exe",
+        r"D:\Windows\xcrdutil.exe",
+        r"J:\tools\xcrdutil.exe",
+        r"D:\DevelopmentFiles\xcrdutil.exe",
+    )
+
+    def _resolve_remote_xcrdutil(self):
+        """Return the absolute Windows path to xcrdutil.exe on the console,
+        or None if it can't be located. Caches the result on the instance."""
+        cached = getattr(self, "_xcrdutil_path", None)
+        if cached is not None:
+            return cached or None
+
+        # 1. Ask cmd's `where`.
+        status, output, _ = self._run_remote_command("cmd /c where xcrdutil.exe")
+        if status == 0:
+            for line in output.splitlines():
+                line = line.strip()
+                if line.lower().endswith("xcrdutil.exe"):
+                    self._xcrdutil_path = line
+                    return line
+
+        # 2. Probe known locations.
+        for candidate in self.REMOTE_XCRDUTIL_CANDIDATES:
+            check = f"cmd /c if exist {self._cmd_quote(candidate)} (echo FOUND) else (echo MISS)"
+            try:
+                _, out, _ = self._run_remote_command(check)
+            except Exception:
+                continue
+            if "FOUND" in out:
+                self._xcrdutil_path = candidate
+                return candidate
+
+        self._xcrdutil_path = ""  # remember the miss
+        self.log(
+            "[-] Could not locate xcrdutil.exe on the console. "
+            "Use `main.py exec <ip> \"where xcrdutil.exe\"` to find it, "
+            "then pass --xcrdutil <path> to xvdmount."
+        )
+        return None
+
+    def remote_xcrdutil_help(self):
+        """Best-effort: print xcrdutil's own help so we can confirm syntax."""
+        path = self._resolve_remote_xcrdutil()
+        if not path:
+            return False
+        cmd = f"cmd /c {self._cmd_quote(path)} /?"
+        status, output, error = self._run_remote_command(cmd)
+        combined = (output + error).strip() or "(no output)"
+        for line in combined.splitlines():
+            self.log(f"    {line.rstrip()}")
+        self.log(f"[*] xcrdutil at: {path} (exit {status})")
+        return status == 0
+
+    def _remote_join(self, base, *parts):
+        out = base.rstrip("/").rstrip("\\")
+        for part in parts:
+            if not part:
+                continue
+            out = out + "/" + part.strip("/").strip("\\")
+        return out
+
+    def _sftp_upload_file(self, local_file, remote_path):
+        """Upload a single local file to an absolute remote path, creating
+        the parent directory tree as needed. Returns True on success."""
+        if not self.has_active_ssh():
+            self.log("[-] Upload failed: Dev Shell SSH is disconnected.")
+            return False
+        try:
+            sftp = self.ssh_client.open_sftp()
+        except Exception as exc:
+            self.log(f"[-] Upload failed: {exc}")
+            return False
+        try:
+            remote_dir = remote_path.rsplit("/", 1)[0]
+            self._remote_mkdirs(sftp, remote_dir)
+            size = os.path.getsize(local_file)
+            self.log(
+                f"[*] Uploading '{os.path.basename(local_file)}' "
+                f"({self._format_size(size)}) to {remote_path}..."
+            )
+            sftp.put(local_file, remote_path)
+            self.log(f"[+] Uploaded to {remote_path}.")
+            return True
+        except Exception as exc:
+            self.log(f"[-] Upload failed: {exc}")
+            return False
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _remote_xvd_mount(self, remote_xvd, mountpoint):
+        """Run xcrdutil mount on the console. The exact CLI is:
+            xcrdutil.exe mount  <xvd-path>  <mountpoint>
+            xcrdutil.exe unmount <mountpoint-or-xvd-path>
+        Both paths must be Windows-style backslashes."""
+        xvd_win = remote_xvd.replace("/", "\\")
+        mp_win = mountpoint.replace("/", "\\")
+
+        xcrdutil = self._resolve_remote_xcrdutil()
+        if not xcrdutil:
+            return False
+
+        # Ensure the mountpoint parent exists (xcrdutil won't create it).
+        try:
+            sftp = self.ssh_client.open_sftp()
+            try:
+                self._remote_mkdirs(sftp, mountpoint.rsplit("/", 1)[0])
+            finally:
+                sftp.close()
+        except Exception as exc:
+            self.log(f"[!] Could not pre-create mountpoint parent: {exc}")
+
+        cmd = (
+            f"cmd /c {self._cmd_quote(xcrdutil)} mount "
+            f"{self._cmd_quote(xvd_win)} {self._cmd_quote(mp_win)}"
+        )
+        self.log(f"[*] Mounting on console: {xvd_win} -> {mp_win}")
+        status, output, error = self._run_remote_command(cmd)
+        combined = (output + error).strip()
+        if combined:
+            for line in combined.splitlines():
+                self.log(f"    {line.rstrip()}")
+        if status != 0:
+            self.log(f"[-] xcrdutil mount failed (exit {status}).")
+            self.log("[*] Dumping `xcrdutil /?` for reference:")
+            self.remote_xcrdutil_help()
+            return False
+        self.log(f"[+] Mounted: {mp_win}")
+        return True
+
+    def _remote_xvd_unmount(self, target):
+        target_win = target.replace("/", "\\")
+        xcrdutil = self._resolve_remote_xcrdutil()
+        if not xcrdutil:
+            return False
+        cmd = (
+            f"cmd /c {self._cmd_quote(xcrdutil)} unmount "
+            f"{self._cmd_quote(target_win)}"
+        )
+        self.log(f"[*] Unmounting on console: {target_win}")
+        status, output, error = self._run_remote_command(cmd)
+        combined = (output + error).strip()
+        if combined:
+            for line in combined.splitlines():
+                self.log(f"    {line.rstrip()}")
+        if status != 0:
+            self.log(f"[-] xcrdutil unmount failed (exit {status}).")
+            return False
+        self.log(f"[+] Unmounted: {target_win}")
+        return True
+
+    def upload_and_mount_xvd(self, local_xvd, mount_name=None,
+                              remote_staging_path=None, mountpoint=None,
+                              skip_upload=False):
+        """End-to-end: SFTP-upload <local_xvd> to the console, then ask
+        xcrdutil to mount it under D:\\DevelopmentFiles\\Mounts\\<name>.
+        After this returns successfully the mount tree is reachable as
+        \\<console-ip>\\DevelopmentFiles\\Mounts\\<name> for `smbdump`."""
+        if not self.has_active_ssh():
+            self.log("[-] Mount failed: Dev Shell SSH is disconnected.")
+            return None
+        if not os.path.isfile(local_xvd):
+            self.log(f"[-] Mount failed: local XVD not found: {local_xvd}")
+            return None
+
+        base = mount_name or os.path.splitext(os.path.basename(local_xvd))[0]
+        # Sanitize: console paths get unhappy with anything exotic.
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_", base) or "xvd"
+
+        remote_xvd = remote_staging_path or self._remote_join(
+            self.REMOTE_XVD_STAGING_DIR, base + ".xvd"
+        )
+        mp = mountpoint or self._remote_join(self.REMOTE_XVD_MOUNT_ROOT, base)
+
+        if not skip_upload:
+            if not self._sftp_upload_file(local_xvd, remote_xvd):
+                return None
+        else:
+            self.log(f"[*] Skipping upload; expecting {remote_xvd} to exist on the console.")
+
+        if not self._remote_xvd_mount(remote_xvd, mp):
+            return None
+        return {"xvd": remote_xvd, "mountpoint": mp, "name": base}
 
     def _run_local_command(self, cmd, cwd, env=None):
         self.log(f"[*] Running: {' '.join(cmd)}")
@@ -3717,11 +4428,25 @@ def run_stream(screen, clock, ip):
 # subclassing it with a headless variant that skips pygame and prints log
 # lines straight to stdout.
 
-CLI_USAGE = """\
+CLI_USAGE = r"""\
 Usage:
   main.py                           # launch the GUI (default)
   main.py scan [--timeout S]        # scan the LAN and print discovered devkits
   main.py creds <ip>                # fetch DevToolsUser credentials from <ip>
+    main.py dump <ip> <remote> [local]
+                                                                        # SFTP-download a remote file or directory
+  main.py smbdump <\\host\share\sub> [local] [--user U --pass P]
+                                    # mirror an SMB tree (e.g. an XVD mounted on the console under
+                                    # D:\DevelopmentFiles\Mounts\<xvd>) to a local directory.
+                                    # Auto-fetches DevToolsUser creds from <host> when omitted.
+  main.py xvdmount <ip> <local-xvd> [--name N] [--remote-xvd P] [--mountpoint M]
+                                    [--no-upload] [--also-dump <local-dir>]
+                                    # SFTP-upload an XVD to the console, then run xcrdutil to mount it under
+                                    # D:\DevelopmentFiles\Mounts\<name>. Prints the resulting UNC.
+                                    # With --also-dump, immediately smbdump the mount to <local-dir>.
+  main.py xvdunmount <ip> <mountpoint-or-xvd-path>
+                                    # run xcrdutil unmount on the console.
+  main.py xvdprobe <ip>             # locate xcrdutil.exe on the console and print its `/?` help.
   main.py exec  <ip> <cmd> [args..] # run a command on <ip> via SSH and print output
   main.py upload <ip> <local> [remote-dir]
                                     # SFTP-upload a single file (default dir: D:/DevelopmentFiles/Sandbox)
@@ -3882,6 +4607,172 @@ def _cli_exec(args):
         try: ssh.close()
         except Exception: pass
 
+def _cli_dump(args):
+    if len(args) < 2 or len(args) > 3:
+        print("usage: main.py dump <ip> <remote-path> [local-path]", file=sys.stderr); return 2
+    ip = args[0]
+    remote_path = args[1]
+    local_path = args[2] if len(args) == 3 else None
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    try:
+        term = HeadlessTerminal()
+        term.ssh_client = ssh
+        term.connected = True
+        return 0 if term.dump_remote_path(remote_path, local_path) else 1
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+def _cli_smbdump(args):
+    # smbdump <unc> [local]                          → auto-fetch DevToolsUser creds from <host>
+    # smbdump <unc> [local] --user <u> --pass <p>    → explicit creds (e.g. for non-devkit shares)
+    if not args:
+        print("usage: main.py smbdump <\\\\host\\share\\sub> [local-path] "
+              "[--user <u>] [--pass <p>]", file=sys.stderr)
+        return 2
+    unc = args[0]
+    local_path = None
+    username = None
+    password = None
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--user" and i + 1 < len(args):
+            username = args[i + 1]; i += 2; continue
+        if a == "--pass" and i + 1 < len(args):
+            password = args[i + 1]; i += 2; continue
+        if local_path is None and not a.startswith("--"):
+            local_path = a; i += 1; continue
+        print(f"unexpected argument: {a}", file=sys.stderr); return 2
+    term = HeadlessTerminal()
+    return 0 if term.dump_smb_path(unc, local_path, username, password) else 1
+
+
+def _cli_xvdmount(args):
+    # xvdmount <ip> <local-xvd> [--name N] [--remote-xvd P] [--mountpoint M]
+    #                           [--no-upload] [--also-dump <local-dir>]
+    #                           [--xcrdutil <remote-path>]
+    if len(args) < 2:
+        print(
+            "usage: main.py xvdmount <ip> <local-xvd> "
+            "[--name N] [--remote-xvd P] [--mountpoint M] "
+            "[--no-upload] [--also-dump <local-dir>] [--xcrdutil <remote-path>]",
+            file=sys.stderr,
+        )
+        return 2
+    ip = args[0]
+    local_xvd = args[1]
+    name = None
+    remote_xvd = None
+    mountpoint = None
+    skip_upload = False
+    also_dump = None
+    xcrdutil_override = None
+    i = 2
+    while i < len(args):
+        a = args[i]
+        if a == "--name" and i + 1 < len(args):
+            name = args[i + 1]; i += 2; continue
+        if a == "--remote-xvd" and i + 1 < len(args):
+            remote_xvd = args[i + 1]; i += 2; continue
+        if a == "--mountpoint" and i + 1 < len(args):
+            mountpoint = args[i + 1]; i += 2; continue
+        if a == "--no-upload":
+            skip_upload = True; i += 1; continue
+        if a == "--also-dump" and i + 1 < len(args):
+            also_dump = args[i + 1]; i += 2; continue
+        if a == "--xcrdutil" and i + 1 < len(args):
+            xcrdutil_override = args[i + 1]; i += 2; continue
+        print(f"unexpected argument: {a}", file=sys.stderr); return 2
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    term = HeadlessTerminal()
+    try:
+        term.ssh_client = ssh
+        term.connected = True
+        term.ip = ip
+        if xcrdutil_override:
+            term._xcrdutil_path = xcrdutil_override
+        result = term.upload_and_mount_xvd(
+            local_xvd,
+            mount_name=name,
+            remote_staging_path=remote_xvd,
+            mountpoint=mountpoint,
+            skip_upload=skip_upload,
+        )
+        if not result:
+            return 1
+        # Print the resulting UNC so the caller can pipe it straight into smbdump.
+        mp = result["mountpoint"].replace("/", "\\")
+        # Strip the leading "D:\" → "DevelopmentFiles\Mounts\<name>" lives under
+        # the DevelopmentFiles share, so the UNC is \\<ip>\<rest-after-D:\>.
+        m = re.match(r"^[A-Za-z]:\\(.+)$", mp)
+        if m:
+            unc = f"\\\\{ip}\\{m.group(1)}"
+        else:
+            unc = mp
+        print(unc)
+        if also_dump:
+            ok = term.dump_smb_path(unc, also_dump)
+            return 0 if ok else 1
+        return 0
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+
+def _cli_xvdunmount(args):
+    # xvdunmount <ip> <mountpoint-or-xvd-path>
+    if len(args) < 2:
+        print("usage: main.py xvdunmount <ip> <mountpoint-or-xvd-path>", file=sys.stderr)
+        return 2
+    ip = args[0]
+    target = args[1]
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    term = HeadlessTerminal()
+    try:
+        term.ssh_client = ssh
+        term.connected = True
+        term.ip = ip
+        return 0 if term._remote_xvd_unmount(target) else 1
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+
+def _cli_xvdprobe(args):
+    # xvdprobe <ip>  → locate xcrdutil.exe and dump its `/?` help.
+    if not args:
+        print("usage: main.py xvdprobe <ip>", file=sys.stderr); return 2
+    ip = args[0]
+    try:
+        ssh, _ = _cli_connect_ssh(ip)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 1
+    term = HeadlessTerminal()
+    try:
+        term.ssh_client = ssh
+        term.connected = True
+        term.ip = ip
+        path = term._resolve_remote_xcrdutil()
+        if not path:
+            return 1
+        print(f"xcrdutil: {path}")
+        term.remote_xcrdutil_help()
+        return 0
+    finally:
+        try: ssh.close()
+        except Exception: pass
+
+
 def _cli_upload(args):
     if len(args) < 2:
         print("usage: main.py upload <ip> <local-file> [remote-dir]", file=sys.stderr); return 2
@@ -3971,6 +4862,11 @@ def _cli_trianglecpp(args):
 CLI_COMMANDS = {
     "scan":    _cli_scan,
     "creds":   _cli_creds,
+    "dump":    _cli_dump,
+    "smbdump": _cli_smbdump,
+    "xvdmount":   _cli_xvdmount,
+    "xvdunmount": _cli_xvdunmount,
+    "xvdprobe":   _cli_xvdprobe,
     "exec":    _cli_exec,
     "upload":  _cli_upload,
     "install": _cli_install,

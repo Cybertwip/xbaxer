@@ -52,6 +52,10 @@ mkdir -p "$(dirname "$WORK_DIR")" "$(dirname "$OUTPUT_DIR")"
 
 cp -Rp "$GO_SOURCE_DIR" "$WORK_DIR"
 chmod -R u+w "$WORK_DIR"
+if [[ -f "$WORK_DIR/go.env" ]]; then
+  tr -d '\r' < "$WORK_DIR/go.env" > "$WORK_DIR/go.env.tmp"
+  mv "$WORK_DIR/go.env.tmp" "$WORK_DIR/go.env"
+fi
 chmod +x \
   "$WORK_DIR/src/make.bash" \
   "$WORK_DIR/src/all.bash" \
@@ -66,7 +70,7 @@ if [[ "$HOST_IS_WINDOWS" -eq 1 ]]; then
   else
     BOOTSTRAP_GOROOT_WIN="$BOOTSTRAP_GOROOT"
   fi
-  GOROOT_BOOTSTRAP="$BOOTSTRAP_GOROOT_WIN" GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" \
+  GOTOOLCHAIN=local GOROOT_BOOTSTRAP="$BOOTSTRAP_GOROOT_WIN" GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" \
     cmd //c "make.bat --no-banner"
 else
   GOROOT_BOOTSTRAP="$BOOTSTRAP_GOROOT" GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" \
@@ -91,5 +95,24 @@ fi
 
 robust_rmrf "$WORK_DIR/pkg/bootstrap" "$WORK_DIR/pkg/obj" "$WORK_DIR/.git"
 
-cp -Rp "$WORK_DIR" "$OUTPUT_DIR"
+# Copy the built tree to the output directory. On Windows, `cp -Rp` can
+# choke on read-only files and long paths. Use robocopy which handles
+# both natively.
+if [[ "$HOST_IS_WINDOWS" -eq 1 ]]; then
+  local_work_dir="$WORK_DIR"
+  local_output_dir="$OUTPUT_DIR"
+  if command -v cygpath >/dev/null 2>&1; then
+    local_work_dir="$(cygpath -w "$WORK_DIR")"
+    local_output_dir="$(cygpath -w "$OUTPUT_DIR")"
+  fi
+  mkdir -p "$OUTPUT_DIR"
+  MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+    robocopy.exe "$local_work_dir" "$local_output_dir" /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP || true
+  # robocopy exit codes 0-7 are success/informational; >=8 is failure.
+  # The `|| true` absorbs the non-zero exit from informational codes
+  # (bash + set -e would otherwise treat exit code 1 = "some files copied"
+  # as failure).
+else
+  cp -Rp "$WORK_DIR" "$OUTPUT_DIR"
+fi
 robust_rmrf "$WORK_DIR"

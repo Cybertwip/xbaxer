@@ -695,6 +695,10 @@ func (ctxt *Link) loadlib() {
 // -lmingwex -lmingw32 ...". To accommodate this behavior, we make two
 // passes over the host archives below.
 func loadWindowsHostArchives(ctxt *Link) {
+	if isWindowsClangCompiler(ctxt.extld()) {
+		return
+	}
+
 	any := true
 	for i := 0; any && i < 2; i++ {
 		// Link crt2.o (if present) to resolve "atexit" when
@@ -1394,6 +1398,27 @@ func shouldUseWindowsGDBLinkerScript(extld []string) bool {
 	return !bytes.Contains(out, []byte("LLD ")) && !bytes.Contains(lowerOut, []byte("clang"))
 }
 
+func isWindowsClangCompiler(extld []string) bool {
+	if len(extld) == 0 {
+		return false
+	}
+
+	name, args := extld[0], extld[1:]
+	base := strings.ToLower(filepath.Base(name))
+	if strings.Contains(base, "clang") || strings.Contains(base, "cleng") {
+		return true
+	}
+
+	versionArgs := append(slices.Clone(args), "--version")
+	cmd := exec.Command(name, versionArgs...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+
+	return bytes.Contains(bytes.ToLower(out), []byte("clang"))
+}
+
 type machoUpdateFunc func(ctxt *Link, exef *os.File, exem *macho.File, outexe string) error
 
 // archive builds a .a archive from the hostobj object files.
@@ -1939,9 +1964,11 @@ func (ctxt *Link) hostlink() {
 				argv = append(argv, "-lsynchronization")
 			}
 		}
-		// libmingw32 and libmingwex have some inter-dependencies,
-		// so must use linker groups.
-		argv = append(argv, "-Wl,--start-group", "-lmingwex", "-lmingw32", "-Wl,--end-group")
+		// MinGW-based toolchains need the support archives explicitly.
+		// Native Windows clang/lld-link uses the MSVC runtime import libs instead.
+		if !isWindowsClangCompiler(ctxt.extld()) {
+			argv = append(argv, "-Wl,--start-group", "-lmingwex", "-lmingw32", "-Wl,--end-group")
+		}
 		argv = append(argv, peimporteddlls()...)
 	}
 

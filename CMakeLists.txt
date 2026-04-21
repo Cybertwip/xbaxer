@@ -47,6 +47,30 @@ if(CMAKE_HOST_WIN32)
   set(HOST_GO_EXECUTABLE_SUFFIX ".exe")
 endif()
 
+if(CMAKE_HOST_WIN32)
+  find_program(XBAX_BASH_EXECUTABLE
+    NAMES bash.exe bash
+    PATHS
+      "C:/Program Files/Git/bin"
+      "C:/Program Files/Git/usr/bin"
+      "C:/Program Files (x86)/Git/bin"
+      "C:/msys64/usr/bin"
+    NO_DEFAULT_PATH)
+  if(NOT XBAX_BASH_EXECUTABLE)
+    find_program(XBAX_BASH_EXECUTABLE NAMES bash.exe bash)
+  endif()
+  if(NOT XBAX_BASH_EXECUTABLE)
+    message(FATAL_ERROR "xbax: Git Bash or MSYS2 bash is required on Windows to run the build scripts")
+  endif()
+  string(TOLOWER "${XBAX_BASH_EXECUTABLE}" _xbax_bash_executable_lower)
+  if(_xbax_bash_executable_lower MATCHES "[/\\]windows[/\\]system32[/\\]bash(\\.exe)?$")
+    message(FATAL_ERROR "xbax: resolved bash to the WSL launcher (${XBAX_BASH_EXECUTABLE}); install Git Bash or MSYS2 and ensure it is found first")
+  endif()
+  unset(_xbax_bash_executable_lower)
+else()
+  find_program(XBAX_BASH_EXECUTABLE NAMES bash REQUIRED)
+endif()
+
 function(xbax_collect_go_module_sources out_var source_dir)
   file(GLOB_RECURSE _sources CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${source_dir}/*.go"
@@ -80,7 +104,7 @@ list(APPEND CAMPILER_SOURCE_DEPS
 add_custom_command(
   OUTPUT "${CAMPILER_OUTPUT}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${XBAX_PACKAGE_DIR}"
-  COMMAND bash "${CAMPILER_SCRIPT}"
+  COMMAND "${XBAX_BASH_EXECUTABLE}" "${CAMPILER_SCRIPT}"
           "${CMAKE_SOURCE_DIR}/go"
           "${GO_ROOT_DIR}"
           "${CAMPILER_TEMP_DIR}"
@@ -326,7 +350,9 @@ if(NOT DEFINED CLENG_MINGW_SYSROOT)
   endif()
 endif()
 if(DEFINED CLENG_MINGW_SYSROOT)
-  message(STATUS "cleng sysroot (mingw-w64): ${CLENG_MINGW_SYSROOT}")
+  message(STATUS "cleng sysroot (mingw-w64 bundle): ${CLENG_MINGW_SYSROOT}")
+elseif(CMAKE_HOST_WIN32)
+  message(STATUS "cleng sysroot (windows bundle): not detected; the Windows build uses native clang/lld-link and will skip bundling the optional mingw-w64 headers/runtime libs")
 else()
   message(WARNING "cleng: no mingw-w64 sysroot detected; cleng.exe will ship without bundled Windows headers/runtime libs. Set -DCLENG_MINGW_SYSROOT=/path/to/x86_64-w64-mingw32 to override.")
 endif()
@@ -490,10 +516,48 @@ if(NOT CLENG_HOST_CLANG OR NOT CLENG_HOST_CLANGXX)
   endif()
 endif()
 
+if(CMAKE_HOST_WIN32)
+  file(TO_NATIVE_PATH "${CLENG_HOST_CLANG}" CLENG_HOST_CLANG_NATIVE)
+  file(TO_NATIVE_PATH "${CLENG_HOST_CLANGXX}" CLENG_HOST_CLANGXX_NATIVE)
+  set(CLENG_CGO_CC_WRAPPER "${CMAKE_BINARY_DIR}/cleng-cgo-cc.bat")
+  set(CLENG_CGO_CXX_WRAPPER "${CMAKE_BINARY_DIR}/cleng-cgo-cxx.bat")
+  # Force the dynamic MSVC runtime for every clang invocation that cgo
+  # makes. This matches the runtime that LLVM/Clang's static libs were
+  # compiled against (CMake defaults to /MD in Release mode), so the cgo
+  # internal stubs (_cgo_*.o, 000000.o..NNN.o) and the libclang*.lib /
+  # libLLVM*.lib archives agree at link time. Without this, lld-link
+  # rejects the link with:
+  #   /failifmismatch: mismatch detected for 'RuntimeLibrary':
+  #     >>> ...<cgo stub>.o has value MT_StaticRelease
+  #     >>> clangBasic.lib(Diagnostic.cpp.obj) has value MD_DynamicRelease
+  # CGO_CFLAGS / CGO_CXXFLAGS are not propagated to all of cgo's
+  # internally-generated translation units, so we inject the runtime
+  # selector at the wrapper layer where every invocation sees it.
+  # NOTE: clang's GCC-style driver treats -MD as "emit dependency file",
+  # not as MSVC's dynamic-CRT switch. The portable spelling for the
+  # GCC-style driver is -fms-runtime-lib=dll, which makes clang embed
+  # /DEFAULTLIB:msvcrt and the matching /failifmismatch: directives.
+  file(CONFIGURE
+    OUTPUT "${CLENG_CGO_CC_WRAPPER}"
+    CONTENT "@echo off\n\"${CLENG_HOST_CLANG_NATIVE}\" -fms-runtime-lib=dll %*\n"
+    NEWLINE_STYLE WIN32)
+  file(CONFIGURE
+    OUTPUT "${CLENG_CGO_CXX_WRAPPER}"
+    CONTENT "@echo off\n\"${CLENG_HOST_CLANGXX_NATIVE}\" -fms-runtime-lib=dll %*\n"
+    NEWLINE_STYLE WIN32)
+  set(CLENG_CGO_CC "${CLENG_CGO_CC_WRAPPER}")
+  set(CLENG_CGO_CXX "${CLENG_CGO_CXX_WRAPPER}")
+  unset(CLENG_HOST_CLANG_NATIVE)
+  unset(CLENG_HOST_CLANGXX_NATIVE)
+else()
+  set(CLENG_CGO_CC "${MINGW_CC}")
+  set(CLENG_CGO_CXX "${MINGW_CXX}")
+endif()
+
 add_custom_command(
   OUTPUT "${CLANG_ENGINE_STAMP}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CLENG_CLANG_PREFIX}"
-  COMMAND bash "${CLANG_ENGINE_SCRIPT}"
+  COMMAND "${XBAX_BASH_EXECUTABLE}" "${CLANG_ENGINE_SCRIPT}"
           "${CMAKE_SOURCE_DIR}/llvm-project"
           "${CLANG_ENGINE_WORK_DIR}"
           "${CLENG_CLANG_PREFIX}"
@@ -533,13 +597,32 @@ add_custom_command(
 set(XBAX_CLENG_BUILD_ENV
   ${XBAX_GO_BUILD_ENV}
   "CGO_ENABLED=1"
-  "CC=${MINGW_CC}"
-  "CXX=${MINGW_CXX}"
+  "CC=${CLENG_CGO_CC}"
+  "CXX=${CLENG_CGO_CXX}"
 )
+if(CMAKE_HOST_WIN32)
+  # See the wrapper-bat comment above: clang's GCC-style driver maps -MD
+  # to dependency-file emission, not the MSVC dynamic-CRT switch.
+  list(APPEND XBAX_CLENG_BUILD_ENV
+    "CGO_CFLAGS=-fms-runtime-lib=dll"
+    "CGO_CXXFLAGS=-fms-runtime-lib=dll"
+  )
+endif()
 # CXXFLAGS / LDFLAGS for the LLVM prefix come from bridge_link_generated.go;
 # anything extra goes through the #cgo directives in bridge_link.go.
 # CGO_ENABLED=1 must override the CGO_ENABLED=0 that XBAX_GO_BUILD_ENV
 # sets, so it appears later in the list above (CMake env wins on last value).
+
+set(XBAX_HOST_CLENG_BUILD_ENV ${XBAX_HOST_GO_BUILD_ENV})
+if(CMAKE_HOST_WIN32)
+  list(APPEND XBAX_HOST_CLENG_BUILD_ENV
+    "CGO_ENABLED=1"
+    "CC=${CLENG_CGO_CC}"
+    "CXX=${CLENG_CGO_CXX}"
+    "CGO_CFLAGS=-fms-runtime-lib=dll"
+    "CGO_CXXFLAGS=-fms-runtime-lib=dll"
+  )
+endif()
 
 add_custom_command(
   OUTPUT "${LED_OUTPUT}"
@@ -670,7 +753,7 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-mod-cache"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/host-go-path"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${HOST_CLENG_OUTPUT_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E env ${XBAX_HOST_GO_BUILD_ENV}
+  COMMAND ${CMAKE_COMMAND} -E env ${XBAX_HOST_CLENG_BUILD_ENV}
           "${GO_EXECUTABLE}" build -buildvcs=false -trimpath
           -o "${HOST_CLENG_OUTPUT}" .
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HOST_CLENG_OUTPUT}" "${HOST_CLENG_CXX_ALIAS}"

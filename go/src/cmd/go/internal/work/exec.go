@@ -2302,6 +2302,7 @@ func (b *Builder) fcExe() []string {
 // variable and using the default command when the variable is empty.
 func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []string {
 	a := append(compiler, "-I", incdir)
+	supportsQunusedArguments := b.gccSupportsFlag(compiler, "-Qunused-arguments")
 
 	// Definitely want -fPIC but on Windows gcc complains
 	// "-fPIC ignored for target (all code is position independent)"
@@ -2314,7 +2315,9 @@ func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []strin
 	if cfg.BuildContext.CgoEnabled {
 		switch cfg.Goos {
 		case "windows":
-			a = append(a, "-mthreads")
+			if !supportsQunusedArguments {
+				a = append(a, "-mthreads")
+			}
 		default:
 			a = append(a, "-pthread")
 		}
@@ -2330,7 +2333,7 @@ func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []strin
 		a = append(a, "-fno-caret-diagnostics")
 	}
 	// clang is too smart about command-line arguments
-	if b.gccSupportsFlag(compiler, "-Qunused-arguments") {
+	if supportsQunusedArguments {
 		a = append(a, "-Qunused-arguments")
 	}
 

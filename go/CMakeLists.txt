@@ -21,6 +21,14 @@ project(BuildGo LANGUAGES NONE)
 function(setup_go_target)
   set(GO_SRC_DIR   "${CMAKE_CURRENT_FUNCTION_LIST_DIR}")   # vendored source
   set(GO_BUILD_DIR "${CMAKE_BINARY_DIR}/engine/go-toolchain") # out-of-tree copy
+  file(GLOB_RECURSE GO_TOOLCHAIN_SOURCE_DEPS CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${GO_SRC_DIR}/src/*"
+    "${GO_SRC_DIR}/lib/*"
+  )
+  list(APPEND GO_TOOLCHAIN_SOURCE_DEPS
+    "${GO_SRC_DIR}/VERSION"
+    "${GO_SRC_DIR}/go.env"
+  )
 
   if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
     set(GO_EXE "${GO_BUILD_DIR}/bin/go.exe")
@@ -64,6 +72,16 @@ function(setup_go_target)
     message(FATAL_ERROR "BuildGo: Failed to refresh source tree in ${GO_BUILD_DIR}")
   endif()
 
+  set(_GO_ENV_FILE "${GO_BUILD_DIR}/go.env")
+  if(EXISTS "${_GO_ENV_FILE}")
+    file(READ "${_GO_ENV_FILE}" _go_env_contents)
+    string(REPLACE "\r\n" "\n" _go_env_contents "${_go_env_contents}")
+    string(REPLACE "\r" "\n" _go_env_contents "${_go_env_contents}")
+    file(WRITE "${_GO_ENV_FILE}" "${_go_env_contents}")
+    unset(_go_env_contents)
+  endif()
+  unset(_GO_ENV_FILE)
+
   # ---- locate a bootstrap Go (configure time) ---------------------------
   if(NOT DEFINED GOROOT_BOOTSTRAP)
     find_program(_GO_BOOTSTRAP_EXE go)
@@ -101,10 +119,6 @@ function(setup_go_target)
     set(GO_BUILD_STAMP "${GO_BUILD_DIR}/.go-toolchain-built")
     set(GO_BUILD_WRAPPER "${GO_BUILD_DIR}/build-go-toolchain.bat")
     set(_wrapper_lines "@echo off\n")
-    string(APPEND _wrapper_lines "if exist \"${GO_BUILD_STAMP}\" (\n")
-    string(APPEND _wrapper_lines "  echo BuildGo: Toolchain already built, skipping.\n")
-    string(APPEND _wrapper_lines "  exit /b 0\n")
-    string(APPEND _wrapper_lines ")\n")
     if(DEFINED GOROOT_BOOTSTRAP)
       string(APPEND _wrapper_lines "set \"GOROOT_BOOTSTRAP=${GOROOT_BOOTSTRAP}\"\n")
     endif()
@@ -136,7 +150,9 @@ function(setup_go_target)
     OUTPUT  "${GO_EXE}"
     COMMAND ${GO_BUILD_COMMAND}
     ${GO_BUILD_STAMP_COMMAND}
-    DEPENDS "${GO_BUILD_DIR}/src/make.bash"
+    DEPENDS
+      ${GO_TOOLCHAIN_SOURCE_DEPS}
+      "${GO_BUILD_DIR}/src/make.bash"
     WORKING_DIRECTORY "${GO_BUILD_DIR}/src"
     COMMENT "BuildGo: Compiling Go toolchain from source ..."
     VERBATIM
